@@ -34,6 +34,11 @@ from vipe.utils.viser import run_viser
     help="Directory containing image frames",
 )
 @click.option(
+    "--image-dir-fps",
+    type=float,
+    help="Frame rate for --image-dir input",
+)
+@click.option(
     "--output",
     "-o",
     type=click.Path(path_type=Path),
@@ -42,7 +47,7 @@ from vipe.utils.viser import run_viser
 )
 @click.option("--pipeline", "-p", default="default", help="Pipeline configuration to use (default: 'default')")
 @click.option("--visualize", "-v", is_flag=True, help="Enable visualization of intermediate results")
-def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: bool):
+def infer(video: Path, image_dir: Path, image_dir_fps: float | None, output: Path, pipeline: str, visualize: bool):
     """Run inference on a video file or directory of images."""
 
     logger = configure_logging()
@@ -54,6 +59,10 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
     
     if video and image_dir:
         click.echo("Error: Cannot provide both video file and --image-dir", err=True)
+        raise click.Abort()
+
+    if image_dir and image_dir_fps is None:
+        click.echo("Error: Must provide --image-dir-fps when using --image-dir", err=True)
         raise click.Abort()
 
     overrides = [f"pipeline={pipeline}", f"pipeline.output.path={output}", "pipeline.output.save_artifacts=true"]
@@ -83,7 +92,10 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
 
     if image_dir:
         # Use frame directory stream
-        video_stream = ProcessedVideoStream(FrameDirStream(image_dir), []).cache(desc="Reading image frames")
+        video_stream = ProcessedVideoStream(
+            FrameDirStream(image_dir, fps=image_dir_fps),  # type: ignore[arg-type]
+            [],
+        )
     else:
         # Some input videos can be malformed, so we need to cache the videos to obtain correct number of frames.
         video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
@@ -95,8 +107,10 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
 @click.command()
 @click.argument("data_path", type=click.Path(exists=True, path_type=Path), default=Path.cwd() / "vipe_results")
 @click.option("--port", "-p", default=20540, type=int, help="Port for the visualization server (default: 20540)")
-def visualize(data_path: Path, port: int):
-    run_viser(data_path, port)
+@click.option("--host", default="0.0.0.0", type=str, help="Host interface to bind the visualization server to")
+@click.option("--share/--no-share", default=False, help="Request a public share URL from viser")
+def visualize(data_path: Path, port: int, host: str, share: bool):
+    run_viser(data_path, port, host, share)
 
 
 @click.group()

@@ -16,7 +16,6 @@
 import argparse
 import asyncio
 import logging
-import socket
 import time
 
 from dataclasses import dataclass
@@ -385,18 +384,7 @@ class ClientClosures:
         return _global_context
 
 
-def get_host_ip() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        try:
-            # Doesn't even have to be reachable
-            s.connect(("8.8.8.8", 1))
-            internal_ip = s.getsockname()[0]
-        except Exception:
-            internal_ip = "127.0.0.1"
-    return internal_ip
-
-
-def run_viser(base_path: Path, port: int = 20540):
+def run_viser(base_path: Path, port: int = 20540, host: str = "0.0.0.0", share: bool = False):
     # Get list of artifacts.
     logger.info(f"Loading artifacts from {base_path}")
     artifacts: list[ArtifactPath] = list(ArtifactPath.glob_artifacts(base_path, use_video=True))
@@ -407,7 +395,13 @@ def run_viser(base_path: Path, port: int = 20540):
     global _global_context
     _global_context = GlobalContext(artifacts=sorted(artifacts, key=lambda x: x.artifact_name))
 
-    server = viser.ViserServer(host=get_host_ip(), port=port, verbose=False)
+    server = viser.ViserServer(host=host, port=port, verbose=False)
+    if share:
+        share_url = server.request_share_url(verbose=True)
+        if share_url is None:
+            logger.warning("Failed to create a public viser share URL.")
+        else:
+            logger.info(f"Public share URL: {share_url}")
     client_closures: dict[int, ClientClosures] = {}
 
     @server.on_client_connect
@@ -439,9 +433,20 @@ def main():
         default=20540,
         help="Port number for the viser server.",
     )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host interface to bind the viser server to.",
+    )
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Request a public share URL from viser.",
+    )
     args = parser.parse_args()
 
-    run_viser(args.base_path, args.port)
+    run_viser(args.base_path, args.port, args.host, args.share)
 
 
 if __name__ == "__main__":

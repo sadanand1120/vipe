@@ -19,6 +19,7 @@ import cv2
 import torch
 
 from vipe.streams.base import ProcessedVideoStream, StreamList, VideoFrame, VideoStream
+from vipe.utils.misc import natural_path_key
 
 
 class FrameDirStream(VideoStream):
@@ -27,7 +28,13 @@ class FrameDirStream(VideoStream):
     This does not support nested iterations.
     """
 
-    def __init__(self, path: Path, seek_range: range | None = None, name: str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        fps: float,
+        seek_range: range | None = None,
+        name: str | None = None,
+    ) -> None:
         super().__init__()
         if seek_range is None:
             seek_range = range(-1)
@@ -39,10 +46,10 @@ class FrameDirStream(VideoStream):
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
         self.frame_files = []
         for ext in image_extensions:
-            self.frame_files.extend(sorted(path.glob(f'*{ext}')))
-            self.frame_files.extend(sorted(path.glob(f'*{ext.upper()}')))
+            self.frame_files.extend(path.glob(f'*{ext}'))
+            self.frame_files.extend(path.glob(f'*{ext.upper()}'))
         
-        self.frame_files = sorted(list(set(self.frame_files)))
+        self.frame_files = sorted(set(self.frame_files), key=natural_path_key)
         
         if not self.frame_files:
             raise ValueError(f"No image files found in directory: {path}")
@@ -54,8 +61,7 @@ class FrameDirStream(VideoStream):
         
         self._height, self._width = first_frame.shape[:2]
         
-        # Assume 30 fps for frame directories (this is just for compatibility)
-        self._fps = 30.0
+        self._fps = fps
         _n_frames = len(self.frame_files)
 
         self.start = seek_range.start
@@ -107,7 +113,15 @@ class FrameDirStream(VideoStream):
 
 
 class FrameDirStreamList(StreamList):
-    def __init__(self, base_path: str, frame_start: int, frame_end: int, frame_skip: int, cached: bool = False) -> None:
+    def __init__(
+        self,
+        base_path: str,
+        fps: float,
+        frame_start: int,
+        frame_end: int,
+        frame_skip: int,
+        cached: bool = False,
+    ) -> None:
         super().__init__()
         base_path_obj = Path(base_path)
         
@@ -123,7 +137,8 @@ class FrameDirStreamList(StreamList):
                 
         if not self.frame_directories:
             raise ValueError(f"No frame directories found at: {base_path}")
-            
+
+        self.fps_value = fps
         self.frame_range = range(frame_start, frame_end, frame_skip)
         self.cached = cached
 
@@ -131,11 +146,14 @@ class FrameDirStreamList(StreamList):
         return len(self.frame_directories)
 
     def __getitem__(self, index: int) -> VideoStream:
-        stream: VideoStream = FrameDirStream(self.frame_directories[index], seek_range=self.frame_range)
+        stream: VideoStream = FrameDirStream(
+            self.frame_directories[index],
+            fps=self.fps_value,
+            seek_range=self.frame_range,
+        )
         if self.cached:
             stream = ProcessedVideoStream(stream, []).cache(desc="Loading frames", online=False)
         return stream
 
     def stream_name(self, index: int) -> str:
         return self.frame_directories[index].name
-

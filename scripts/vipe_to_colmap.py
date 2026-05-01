@@ -23,6 +23,7 @@ from vipe.utils.io import (
     read_pose_artifacts,
     read_rgb_artifacts,
 )
+from vipe.utils.misc import natural_path_key
 
 
 # Configure logging
@@ -138,7 +139,7 @@ def write_points3d_txt_from_depth(
     points3d_file = output_dir / "points3D.txt"
 
     image_dir = output_dir / "images"
-    images = sorted(list(image_dir.glob("*.jpg")))
+    images = sorted(image_dir.glob("*.jpg"), key=natural_path_key)
     # Collect all 3D points first
     all_points = []
     point_id = 1

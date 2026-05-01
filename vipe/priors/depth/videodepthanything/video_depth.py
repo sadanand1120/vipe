@@ -21,8 +21,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchvision.transforms import Compose
-from tqdm import tqdm
-
 from vipe.priors.depth.dav2.dinov2 import DINOv2
 from vipe.priors.depth.dav2.util.transform import NormalizeImage, PrepareForNet, Resize
 
@@ -110,7 +108,7 @@ class VideoDepthAnything(nn.Module):
 
         depth_list = []
         pre_input = None
-        for frame_id in tqdm(range(0, org_video_len, frame_step)):
+        for frame_id in range(0, org_video_len, frame_step):
             cur_list = []
             for i in range(INFER_LEN):
                 # cur_list.append(torch.from_numpy(transform({'image': frame_list[frame_id+i].astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0))

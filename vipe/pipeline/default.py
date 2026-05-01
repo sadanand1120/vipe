@@ -16,6 +16,7 @@
 
 import logging
 import pickle
+import gc
 
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from omegaconf import DictConfig
 from vipe.slam.system import SLAMOutput, SLAMSystem
 from vipe.streams.base import (
     AssignAttributesProcessor,
+    CachedVideoStream,
     FrameAttribute,
     MultiviewVideoList,
     ProcessedVideoStream,
@@ -46,6 +48,25 @@ from .processors import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class AssignCachedInitProcessor(StreamProcessor):
+    def __init__(
+        self,
+        stream_attributes: dict[FrameAttribute, list],
+        instance_phrases: list[dict[int, str] | None],
+    ) -> None:
+        self.stream_attributes = stream_attributes
+        self.instance_phrases = instance_phrases
+
+    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
+        return previous_attributes.union(self.stream_attributes.keys())
+
+    def __call__(self, frame_idx: int, frame):
+        for attribute, attribute_values in self.stream_attributes.items():
+            frame.set_attribute(attribute, attribute_values[frame_idx])
+        frame.instance_phrases = self.instance_phrases[frame_idx]
+        return frame
 
 
 class DefaultAnnotationPipeline(Pipeline):
@@ -98,6 +119,41 @@ class DefaultAnnotationPipeline(Pipeline):
                 post_processors.append(AdaptiveDepthProcessor(slam_output, view_idx, depth_align_model))
         return ProcessedVideoStream(video_stream, post_processors)
 
+    def _rebuild_init_streams(
+        self,
+        video_streams: list[VideoStream],
+        slam_streams: list[VideoStream],
+    ) -> list[VideoStream]:
+        rebuilt_streams = []
+        cached_attributes = [
+            FrameAttribute.INTRINSICS,
+            FrameAttribute.CAMERA_TYPE,
+            FrameAttribute.INSTANCE,
+            FrameAttribute.MASK,
+        ]
+
+        for video_stream, slam_stream in zip(video_streams, slam_streams):
+            assert isinstance(slam_stream, CachedVideoStream)
+            cached_frames = slam_stream.data
+            stream_attributes = {}
+            for attribute in cached_attributes:
+                attribute_values = [frame.get_attribute(attribute) for frame in cached_frames]
+                if any(value is not None for value in attribute_values):
+                    stream_attributes[attribute] = attribute_values
+            instance_phrases = [frame.instance_phrases for frame in cached_frames]
+            rebuilt_streams.append(
+                ProcessedVideoStream(
+                    video_stream,
+                    [AssignCachedInitProcessor(stream_attributes, instance_phrases)],
+                )
+            )
+            slam_stream.data = []
+            slam_stream.iterator = None
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return rebuilt_streams
+
     def run(self, video_data: VideoStream | MultiviewVideoList) -> AnnotationPipelineOutput:
         if isinstance(video_data, MultiviewVideoList):
             video_streams = [video_data[view_idx] for view_idx in range(len(video_data))]
@@ -127,9 +183,12 @@ class DefaultAnnotationPipeline(Pipeline):
             annotate_output.payload = slam_output
             return annotate_output
 
+        output_input_streams = self._rebuild_init_streams(video_streams, slam_streams)
+        del slam_streams
+
         output_streams = [
-            self._add_post_processors(view_idx, slam_stream, slam_output).cache("depth", online=True)
-            for view_idx, slam_stream in enumerate(slam_streams)
+            self._add_post_processors(view_idx, init_stream, slam_output)
+            for view_idx, init_stream in enumerate(output_input_streams)
         ]
 
         # Dumping artifacts for all views in the streams
@@ -142,9 +201,10 @@ class DefaultAnnotationPipeline(Pipeline):
                     pickle.dump({"ba_residual": slam_output.ba_residual}, f)
 
             if self.out_cfg.save_viz:
+                viz_stream = io.ArtifactVideoStream(artifact_path) if self.out_cfg.save_artifacts else output_stream
                 save_projection_video(
                     artifact_path.meta_vis_path,
-                    output_stream,
+                    viz_stream,
                     slam_output,
                     self.out_cfg.viz_downsample,
                     self.out_cfg.viz_attributes,

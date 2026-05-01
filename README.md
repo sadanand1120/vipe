@@ -29,6 +29,23 @@ pip install -r envs/requirements.txt --extra-index-url https://download.pytorch.
 pip install --no-build-isolation -e .
 ```
 
+Manual setup alternative:
+
+```bash
+conda create -n vipe-manual -c nvidia/label/cuda-12.8.0 -c conda-forge python=3.10 pip cuda-nvcc eigen zlib libcusparse-dev libcublas-dev libcusolver-dev -y
+conda activate vipe-manual
+pip3 install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+pip3 install -r envs/requirements.txt
+pip3 install --no-build-isolation -e .
+```
+
+Optional Depth-Anything-3 / `da3_streaming` support:
+
+```bash
+pip3 install faiss-gpu pandas prettytable numba pypose
+pip3 install -e /robodata/smodak/repos/Depth-Anything-3
+```
+
 ## Usage
 
 ### Using the ViPE CLI

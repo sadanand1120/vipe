@@ -26,7 +26,7 @@ from pycg import image
 
 from vipe.ext.lietorch import SE3
 from vipe.slam.interface import SLAMOutput
-from vipe.streams.base import CachedVideoStream, VideoFrame, VideoStream
+from vipe.streams.base import VideoFrame, VideoStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
@@ -293,8 +293,6 @@ def save_projection_video(
     subsample_factor: int,
     attributes: list[list[str]],
 ):
-    assert isinstance(video_stream, CachedVideoStream)
-
     img_h, img_w = video_stream.frame_size()
     img_h //= subsample_factor
     img_w //= subsample_factor
@@ -309,167 +307,149 @@ def save_projection_video(
     )
     na_img = (na_img[..., :3] * 255).astype(np.uint8)
 
-    def get_depth_imgs():
-        depth_range = [np.inf, -np.inf]
+    slam_map = unpack_optional(slam_output.slam_map) if slam_output is not None and slam_output.slam_map is not None else None
+    if slam_map is not None:
+        pcd_xyz = slam_map.dense_disp_xyz.cpu().numpy()
+        pcd_rgb = slam_map.dense_disp_rgb.cpu().numpy()
+    else:
+        pcd_xyz = None
+        pcd_rgb = None
 
-        # Run first to obtain depth range
-        for frame_data in video_stream:
-            assert isinstance(frame_data, VideoFrame)
+    depth_range = [np.inf, -np.inf]
+    rectified_coords_norm = None
 
-            if (depth_data := frame_data.metric_depth) is None:
-                continue
-            depth_data = depth_data.reciprocal()
+    def get_rgb_img(frame_data: VideoFrame) -> np.ndarray:
+        rgb_img = frame_data.rgb.cpu().numpy().astype(float)
+        rgb_img = (rgb_img * 255).astype(np.uint8)
+        return cv2.resize(rgb_img, (img_w, img_h))
 
-            # Remove sky regions if any
-            depth_data = depth_data[~frame_data.sky_mask & torch.isfinite(depth_data)]
+    def get_depth_img(frame_data: VideoFrame) -> np.ndarray:
+        if frame_data.metric_depth is None:
+            return na_img
 
-            depth_min_q, depth_max_q = torch.quantile(depth_data, torch.tensor([0.05, 0.95], device=depth_data.device))
-            depth_range[0] = min(depth_range[0], depth_min_q.item())
-            depth_range[1] = max(depth_range[1], depth_max_q.item())
+        depth_data = frame_data.metric_depth.reciprocal()
+        valid_depth = depth_data[~frame_data.sky_mask & torch.isfinite(depth_data)]
+        if valid_depth.numel() == 0:
+            return na_img
+
+        depth_min_q, depth_max_q = torch.quantile(valid_depth, torch.tensor([0.05, 0.95], device=valid_depth.device))
+        depth_range[0] = min(depth_range[0], depth_min_q.item())
+        depth_range[1] = max(depth_range[1], depth_max_q.item())
         depth_middle = (depth_range[0] + depth_range[1]) / 2
-        depth_scale = depth_range[1] - depth_range[0]
+        depth_scale = max(depth_range[1] - depth_range[0], 1e-6)
         depth_min = depth_middle - depth_scale / 2 * 1.3
         depth_max = depth_middle + depth_scale / 2 * 1.3
 
-        # Then output normalized depth
-        for frame_data in video_stream:
-            if (depth_data := frame_data.metric_depth) is None:
-                yield na_img
-                continue
+        depth_data = depth_data.clone()
+        depth_data[frame_data.sky_mask] = depth_min
+        depth_data[~torch.isfinite(depth_data)] = depth_min
+        depth_data = depth_data[::subsample_factor, ::subsample_factor]
+        depth_img = depth_data.cpu().numpy().astype(float)
+        depth_img = (depth_img - depth_min) / (depth_max - depth_min)
+        return colorize_depth(np.clip(depth_img, 0, 1))
 
-            depth_data = depth_data.reciprocal()
-            depth_data[frame_data.sky_mask] = depth_min
-            depth_data[~torch.isfinite(depth_data)] = depth_min
+    def get_pcd_img(frame_data: VideoFrame, rgb_img: np.ndarray) -> np.ndarray:
+        if slam_map is None:
+            return na_img
 
-            depth_data = depth_data[::subsample_factor, ::subsample_factor]
-            depth_img = depth_data.cpu().numpy().astype(float)
-            depth_img = (depth_img - depth_min) / (depth_max - depth_min)
-            depth_img = np.clip(depth_img, 0, 1)
-            yield colorize_depth(depth_img)
-
-    def get_pcd_imgs():
-        assert slam_output is not None, "SLAM output is required!"
-        slam_map = unpack_optional(slam_output.slam_map)
-        pcd_xyz = slam_map.dense_disp_xyz.cpu().numpy()
-        pcd_rgb = slam_map.dense_disp_rgb.cpu().numpy()
-        for frame_data in video_stream:
-            assert isinstance(frame_data, VideoFrame)
-            rgb_img = frame_data.rgb.cpu().numpy().astype(float)
-            rgb_img = (rgb_img * 255).astype(np.uint8)
-            rgb_img = cv2.resize(rgb_img, (img_w, img_h))
-            intrinsics = unpack_optional(frame_data.intrinsics)
-            if torch.sum(intrinsics) < 1e-6:
-                pcd_img = project_points_panorama(
-                    pcd_xyz,
-                    frame_data.pose,
-                    frame_size=(img_h, img_w),
-                    color=pcd_rgb,
-                )
-            else:
-                pcd_img = project_points(
-                    pcd_xyz,
-                    frame_data.intrinsics.cpu().numpy(),
-                    camera_type=frame_data.camera_type,
-                    pose=frame_data.pose,
-                    frame_size=(img_h, img_w),
-                    subsample_factor=subsample_factor,
-                    color=pcd_rgb,
-                )
-            yield cv2.addWeighted(rgb_img, 0.2, pcd_img, 0.8, 0)
-
-    def get_rectified_imgs():
-        # Obtain rectification map
-        for frame_data in video_stream:
-            original_intr = frame_data.camera_type.build_camera_model(frame_data.intrinsics).scaled(
-                1 / subsample_factor
+        intrinsics = unpack_optional(frame_data.intrinsics)
+        if torch.sum(intrinsics) < 1e-6:
+            pcd_img = project_points_panorama(
+                unpack_optional(pcd_xyz),
+                frame_data.pose,
+                frame_size=(img_h, img_w),
+                color=pcd_rgb,
             )
+        else:
+            pcd_img = project_points(
+                unpack_optional(pcd_xyz),
+                frame_data.intrinsics.cpu().numpy(),
+                camera_type=frame_data.camera_type,
+                pose=frame_data.pose,
+                frame_size=(img_h, img_w),
+                subsample_factor=subsample_factor,
+                color=pcd_rgb,
+            )
+        return cv2.addWeighted(rgb_img, 0.2, pcd_img, 0.8, 0)
+
+    def get_rectified_img(frame_data: VideoFrame) -> np.ndarray:
+        nonlocal rectified_coords_norm
+        if frame_data.intrinsics is None or frame_data.camera_type is None:
+            return na_img
+
+        if rectified_coords_norm is None:
+            original_intr = frame_data.camera_type.build_camera_model(frame_data.intrinsics).scaled(1 / subsample_factor)
             pinhole_intr = original_intr.pinhole()
             device = pinhole_intr.intrinsics.device
             y, x = torch.meshgrid(torch.arange(img_h).float(), torch.arange(img_w).float(), indexing="ij")
             y, x = y.to(device), x.to(device)
             pts, _, _ = pinhole_intr.iproj_disp(torch.ones_like(x), x, y)
             coords, _, _ = original_intr.proj_points(pts)
-            coords_norm = 2.0 * coords / torch.tensor([img_w, img_h], device=coords.device) - 1.0
-            coords_norm = coords_norm.reshape(1, img_h, img_w, 2)
-            break
-        for frame_data in video_stream:
-            assert isinstance(frame_data, VideoFrame)
-            img = frame_data.rgb.permute(2, 0, 1).unsqueeze(0)
-            img = torch.nn.functional.grid_sample(
-                img,
-                coords_norm,
-                mode="bilinear",
-                align_corners=False,
-            )[0].float()
-            img = img.permute(1, 2, 0).cpu().numpy()
-            yield (img * 255).astype(np.uint8)
+            rectified_coords_norm = (2.0 * coords / torch.tensor([img_w, img_h], device=coords.device) - 1.0).reshape(
+                1, img_h, img_w, 2
+            )
 
-    def get_rgb_imgs():
-        for frame_data in video_stream:
-            rgb_img = frame_data.rgb.cpu().numpy().astype(float)
-            rgb_img = (rgb_img * 255).astype(np.uint8)
-            rgb_img = cv2.resize(rgb_img, (img_w, img_h))
-            yield rgb_img
+        img = frame_data.rgb.permute(2, 0, 1).unsqueeze(0)
+        img = torch.nn.functional.grid_sample(
+            img,
+            rectified_coords_norm,
+            mode="bilinear",
+            align_corners=False,
+        )[0].float()
+        return (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-    def get_instance_imgs():
-        for frame_data, rgb_img in zip(video_stream, get_rgb_imgs()):
-            assert isinstance(frame_data, VideoFrame)
-            if frame_data.instance is None:
-                yield na_img
-                continue
-            instance_img = (inst_np := frame_data.instance.cpu().numpy()).astype(float)
-            instance_img = colorize_mask(instance_img)
+    def get_instance_img(frame_data: VideoFrame, rgb_img: np.ndarray) -> np.ndarray:
+        if frame_data.instance is None:
+            return na_img
 
-            if frame_data.instance_phrases is not None:
-                for instance_id, instance_phrase in frame_data.instance_phrases.items():
-                    if instance_id <= 0:
-                        continue
-                    text_img = image.text(instance_phrase)
-                    inst_mask = inst_np == instance_id
-                    try:
-                        h_min, h_max = np.where(np.any(inst_mask, axis=1))[0][[0, -1]]
-                        w_min, w_max = np.where(np.any(inst_mask, axis=0))[0][[0, -1]]
-                        instance_img = image.place_image(
-                            text_img,
-                            instance_img,
-                            (w_min + w_max) // 2,
-                            (h_min + h_max) // 2,
-                        )
-                    except IndexError:
-                        pass
+        instance_np = frame_data.instance.cpu().numpy()
+        instance_img = colorize_mask(instance_np.astype(float))
+        if frame_data.instance_phrases is not None:
+            for instance_id, instance_phrase in frame_data.instance_phrases.items():
+                if instance_id <= 0:
+                    continue
+                text_img = image.text(instance_phrase)
+                inst_mask = instance_np == instance_id
+                try:
+                    h_min, h_max = np.where(np.any(inst_mask, axis=1))[0][[0, -1]]
+                    w_min, w_max = np.where(np.any(inst_mask, axis=0))[0][[0, -1]]
+                    instance_img = image.place_image(
+                        text_img,
+                        instance_img,
+                        (w_min + w_max) // 2,
+                        (h_min + h_max) // 2,
+                    )
+                except IndexError:
+                    pass
 
-            if instance_img.dtype == np.float64:
-                instance_img = (instance_img[..., :3] * 255).astype(np.uint8)
-            instance_img = cv2.resize(instance_img, (img_w, img_h))
-            yield cv2.addWeighted(rgb_img, 0.5, instance_img, 0.5, 0)
+        if instance_img.dtype == np.float64:
+            instance_img = (instance_img[..., :3] * 255).astype(np.uint8)
+        instance_img = cv2.resize(instance_img, (img_w, img_h))
+        return cv2.addWeighted(rgb_img, 0.5, instance_img, 0.5, 0)
 
-    def get_empty_imgs():
-        for _ in range(len(video_stream)):
-            yield na_img
-
-    img_iterators = [
-        [
-            {
-                "rgb": get_rgb_imgs(),
-                "depth": get_depth_imgs(),
-                "pcd": get_pcd_imgs(),
-                "instance": get_instance_imgs(),
-                "rectified": get_rectified_imgs(),
-                "empty": get_empty_imgs(),
-            }[t]
-            for t in t_arr
-        ]
-        for t_arr in attributes
-    ]
     with VideoWriter(video_path, video_stream.fps()) as vw:
         trajectory_length = 0.0
-        last_pose = video_stream[0].pose
+        last_pose = None
         for frame_idx, frame_data in pbar(enumerate(video_stream), total=len(video_stream), desc="Writing viz video"):
+            rgb_img = get_rgb_img(frame_data)
             img_rows = []
-            for img_iterator in img_iterators:
+            for attr_row in attributes:
                 img_row = []
-                for img in img_iterator:
-                    img_row.append(next(img))
+                for attr_name in attr_row:
+                    if attr_name == "rgb":
+                        img_row.append(rgb_img)
+                    elif attr_name == "depth":
+                        img_row.append(get_depth_img(frame_data))
+                    elif attr_name == "pcd":
+                        img_row.append(get_pcd_img(frame_data, rgb_img))
+                    elif attr_name == "instance":
+                        img_row.append(get_instance_img(frame_data, rgb_img))
+                    elif attr_name == "rectified":
+                        img_row.append(get_rectified_img(frame_data))
+                    elif attr_name == "empty":
+                        img_row.append(na_img)
+                    else:
+                        raise ValueError(f"Unknown visualization attribute: {attr_name}")
                 img_rows.append(np.concatenate(img_row, axis=1))
             img_final = np.concatenate(img_rows, axis=0)
             text_desc = f"Frame {frame_idx:03d}"
@@ -481,8 +461,10 @@ def save_projection_video(
                     fov_y = np.rad2deg(fov_y)
                     text_desc += f" | fovY {fov_y:.2f}"
             current_pose = frame_data.pose
-            trajectory_length += np.linalg.norm((last_pose.inv() * current_pose).translation()[:3].cpu().numpy())
-            last_pose = current_pose
+            if current_pose is not None:
+                if last_pose is not None:
+                    trajectory_length += np.linalg.norm((last_pose.inv() * current_pose).translation()[:3].cpu().numpy())
+                last_pose = current_pose
             text_desc += f" | Traj {trajectory_length:.4f}"
             if len(frame_data.information) > 0:
                 text_desc += f" | {frame_data.information}"
