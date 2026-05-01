@@ -39,6 +39,7 @@ class FrameAttribute(Enum):
     INSTANCE = "instance"
     MASK = "mask"
     METRIC_DEPTH = "metric_depth"
+    DEPTH_CONFIDENCE = "depth_confidence"
 
 
 @dataclass(kw_only=True, slots=True)
@@ -56,6 +57,7 @@ class VideoFrame:
     - instance_phrases: A dictionary of instance id to phrase mapping.
     - mask: Binary mask of the frame. The shape is (H, W), with 0 for invalid pixels.
     - metric_depth: The depth map of the frame. The shape is (H, W). Value is in metric scale.
+    - depth_confidence: The depth confidence map of the frame. The shape is (H, W).
     - information: Additional information about the frame
     """
 
@@ -70,6 +72,7 @@ class VideoFrame:
     instance_phrases: dict[int, str] | None = None
     mask: torch.Tensor | None = None
     metric_depth: torch.Tensor | None = None
+    depth_confidence: torch.Tensor | None = None
     information: str = ""
 
     def size(self) -> tuple[int, int]:
@@ -93,6 +96,8 @@ class VideoFrame:
             attributes.add(FrameAttribute.MASK)
         if self.metric_depth is not None:
             attributes.add(FrameAttribute.METRIC_DEPTH)
+        if self.depth_confidence is not None:
+            attributes.add(FrameAttribute.DEPTH_CONFIDENCE)
 
         return attributes
 
@@ -109,6 +114,8 @@ class VideoFrame:
             return self.mask
         if attribute == FrameAttribute.METRIC_DEPTH:
             return self.metric_depth
+        if attribute == FrameAttribute.DEPTH_CONFIDENCE:
+            return self.depth_confidence
         raise ValueError(f"Attribute {attribute} is not available in the frame.")
 
     def set_attribute(self, attribute: FrameAttribute, value: Any) -> None:
@@ -124,6 +131,8 @@ class VideoFrame:
             self.mask = value
         elif attribute == FrameAttribute.METRIC_DEPTH:
             self.metric_depth = value
+        elif attribute == FrameAttribute.DEPTH_CONFIDENCE:
+            self.depth_confidence = value
         else:
             raise ValueError(f"Attribute {attribute} is not available in the frame.")
 
@@ -137,6 +146,7 @@ class VideoFrame:
             instance=map_cpu(self.instance),
             instance_phrases=self.instance_phrases,
             metric_depth=map_cpu(self.metric_depth),
+            depth_confidence=map_cpu(self.depth_confidence),
             pose=map_cpu(self.pose),
             intrinsics=map_cpu(self.intrinsics),
             camera_type=self.camera_type,
@@ -153,6 +163,7 @@ class VideoFrame:
             instance=map_cuda(self.instance),
             instance_phrases=self.instance_phrases,
             metric_depth=map_cuda(self.metric_depth),
+            depth_confidence=map_cuda(self.depth_confidence),
             pose=map_cuda(self.pose),
             intrinsics=map_cuda(self.intrinsics),
             camera_type=self.camera_type,
@@ -188,6 +199,12 @@ class VideoFrame:
                 0, 0
             ]
 
+        new_depth_confidence = None
+        if self.depth_confidence is not None:
+            new_depth_confidence = torch.nn.functional.interpolate(
+                self.depth_confidence[None, None], size, mode="bilinear"
+            )[0, 0]
+
         new_intrinsics = None
         if self.intrinsics is not None:
             new_intrinsics = self.intrinsics.clone()
@@ -203,6 +220,7 @@ class VideoFrame:
             instance=new_instance,
             instance_phrases=self.instance_phrases,
             metric_depth=new_metric_depth,
+            depth_confidence=new_depth_confidence,
             pose=self.pose,
             intrinsics=new_intrinsics,
             camera_type=new_camera_type,
@@ -230,6 +248,10 @@ class VideoFrame:
         if self.metric_depth is not None:
             new_metric_depth = self.metric_depth[top:bottom, left:right]
 
+        new_depth_confidence = None
+        if self.depth_confidence is not None:
+            new_depth_confidence = self.depth_confidence[top:bottom, left:right]
+
         new_intrinsics = None
         if self.intrinsics is not None:
             new_intrinsics = self.intrinsics.clone()
@@ -245,6 +267,7 @@ class VideoFrame:
             instance=new_instance,
             instance_phrases=self.instance_phrases,
             metric_depth=new_metric_depth,
+            depth_confidence=new_depth_confidence,
             pose=self.pose,
             intrinsics=new_intrinsics,
             camera_type=new_camera_type,

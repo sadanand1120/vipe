@@ -15,27 +15,13 @@ We use ViPE to annotate a large-scale collection of videos. This collection incl
 
 ## Installation
 
-To ensure the reproducibility, we recommend creating the runtime environment using [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/getting-started.html).
-
-```bash
-# Create a new conda environment and install 3rd-party dependencies
-conda env create -f envs/base.yml
-conda activate vipe
-# You can switch to your own PyPI index if you want.
-pip install -r envs/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
-
-# Build the project and install it into the current environment
-# Omit the -e flag to install the project as a regular package
-pip install --no-build-isolation -e .
-```
-
-Manual setup alternative:
+Manual setup:
 
 ```bash
 conda create -n vipe-manual -c nvidia/label/cuda-12.8.0 -c conda-forge python=3.10 pip cuda-nvcc eigen zlib libcusparse-dev libcublas-dev libcusolver-dev -y
 conda activate vipe-manual
 pip3 install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-pip3 install -r envs/requirements.txt
+pip3 install -r requirements.txt
 pip3 install --no-build-isolation -e .
 ```
 

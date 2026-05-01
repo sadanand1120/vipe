@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alignment",
         type=str,
-        choices=["sim3", "se3"],
+        choices=["sim3", "se3", "first"],
         default="sim3",
         help="Alignment used to overlay prediction onto GT",
     )
@@ -100,12 +100,13 @@ def load_pred_pose_npz(pose_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndar
     return frame_ids, pose_mats, xyz
 
 
-def load_gt_pose_dir(gt_pose_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+def load_gt_pose_dir(gt_pose_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     pose_files = sorted(gt_pose_dir.glob("*.txt"), key=lambda p: int(p.stem))
     if len(pose_files) == 0:
         raise FileNotFoundError(f"No GT pose txt files found under {gt_pose_dir}")
 
     frame_ids = []
+    pose_mats = []
     xyz = []
     for pose_file in pbar(pose_files, desc="Loading GT poses"):
         pose = np.loadtxt(pose_file, dtype=np.float64)
@@ -114,12 +115,17 @@ def load_gt_pose_dir(gt_pose_dir: Path) -> tuple[np.ndarray, np.ndarray]:
         if not np.isfinite(pose).all():
             continue
         frame_ids.append(int(pose_file.stem))
+        pose_mats.append(pose)
         xyz.append(pose[:3, 3])
 
     if len(frame_ids) == 0:
         raise ValueError(f"No valid GT poses found under {gt_pose_dir}")
 
-    return np.asarray(frame_ids, dtype=np.int64), np.asarray(xyz, dtype=np.float64)
+    return (
+        np.asarray(frame_ids, dtype=np.int64),
+        np.asarray(pose_mats, dtype=np.float64),
+        np.asarray(xyz, dtype=np.float64),
+    )
 
 
 def umeyama_alignment(src_xyz: np.ndarray, dst_xyz: np.ndarray, estimate_scale: bool) -> tuple[float, np.ndarray, np.ndarray]:
@@ -163,6 +169,17 @@ def apply_alignment_to_pose_mats(
     aligned_pose_mats = pose_mats.copy()
     aligned_pose_mats[:, :3, :3] = rotation[None] @ aligned_pose_mats[:, :3, :3]
     aligned_pose_mats[:, :3, 3] = apply_alignment(aligned_pose_mats[:, :3, 3], scale, rotation, translation)
+    aligned_pose_mats[:, 3, :] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return aligned_pose_mats
+
+
+def apply_first_pose_alignment(
+    pred_pose_mats: np.ndarray,
+    pred_first_pose: np.ndarray,
+    gt_first_pose: np.ndarray,
+) -> np.ndarray:
+    first_to_gt = gt_first_pose @ np.linalg.inv(pred_first_pose)
+    aligned_pose_mats = first_to_gt[None] @ pred_pose_mats
     aligned_pose_mats[:, 3, :] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
     return aligned_pose_mats
 
@@ -254,24 +271,35 @@ def main() -> None:
 
     sequence, pred_pose_path = discover_pred_pose(args.vipe_output_dir, args.sequence)
     pred_inds, pred_pose_mats, pred_xyz = load_pred_pose_npz(pred_pose_path)
-    gt_inds, gt_xyz = load_gt_pose_dir(args.gt_pose_dir)
+    gt_inds, gt_pose_mats, gt_xyz = load_gt_pose_dir(args.gt_pose_dir)
 
     pred_map = {int(idx): xyz for idx, xyz in zip(pred_inds.tolist(), pred_xyz)}
     gt_map = {int(idx): xyz for idx, xyz in zip(gt_inds.tolist(), gt_xyz)}
+    pred_pose_map = {int(idx): pose for idx, pose in zip(pred_inds.tolist(), pred_pose_mats)}
+    gt_pose_map = {int(idx): pose for idx, pose in zip(gt_inds.tolist(), gt_pose_mats)}
     overlap_ids = np.asarray(sorted(set(pred_map) & set(gt_map)), dtype=np.int64)
-    if overlap_ids.size < 2:
+    min_overlap = 1 if args.alignment == "first" else 2
+    if overlap_ids.size < min_overlap:
         raise ValueError("Not enough overlapping GT/pred frames to align trajectories")
 
-    pred_overlap = np.stack([pred_map[int(idx)] for idx in overlap_ids], axis=0)
-    gt_overlap = np.stack([gt_map[int(idx)] for idx in overlap_ids], axis=0)
-    scale, rotation, translation = umeyama_alignment(
-        pred_overlap,
-        gt_overlap,
-        estimate_scale=args.alignment == "sim3",
-    )
-
-    pred_xyz_aligned = apply_alignment(pred_xyz, scale, rotation, translation)
-    pred_pose_mats_aligned = apply_alignment_to_pose_mats(pred_pose_mats, scale, rotation, translation)
+    if args.alignment == "first":
+        first_id = int(overlap_ids[0])
+        pred_pose_mats_aligned = apply_first_pose_alignment(
+            pred_pose_mats,
+            pred_pose_map[first_id],
+            gt_pose_map[first_id],
+        )
+        pred_xyz_aligned = pred_pose_mats_aligned[:, :3, 3]
+    else:
+        pred_overlap = np.stack([pred_map[int(idx)] for idx in overlap_ids], axis=0)
+        gt_overlap = np.stack([gt_map[int(idx)] for idx in overlap_ids], axis=0)
+        scale, rotation, translation = umeyama_alignment(
+            pred_overlap,
+            gt_overlap,
+            estimate_scale=args.alignment == "sim3",
+        )
+        pred_xyz_aligned = apply_alignment(pred_xyz, scale, rotation, translation)
+        pred_pose_mats_aligned = apply_alignment_to_pose_mats(pred_pose_mats, scale, rotation, translation)
 
     ax0, ax1 = plane_indices(args.plane)
     gt_xy_all = gt_xyz[:, [ax0, ax1]]

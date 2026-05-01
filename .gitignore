@@ -170,3 +170,6 @@ JIAHUI.md
 csrc/include/
 
 .vscode
+
+outputs/
+workspace/

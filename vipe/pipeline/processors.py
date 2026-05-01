@@ -359,7 +359,7 @@ class MultiviewDepthProcessor(StreamProcessor):
             self.dav3_api = self.dav3_api.cuda().eval()
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes | {FrameAttribute.METRIC_DEPTH}
+        return previous_attributes | {FrameAttribute.METRIC_DEPTH, FrameAttribute.DEPTH_CONFIDENCE}
 
     def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
         raise NotImplementedError("MultiviewDepthProcessor should not be called directly.")
@@ -390,6 +390,7 @@ class MultiviewDepthProcessor(StreamProcessor):
         current_sliding_window: list[VideoFrame] = []
         current_sliding_window_idx: list[int] = []
         trailing_depth: torch.Tensor | None = None
+        trailing_confidence: torch.Tensor | None = None
         for frame_idx, frame in pbar(enumerate(previous_iterator), desc="Estimating multi-view depth"):
             current_sliding_window.append(frame)
             current_sliding_window_idx.append(frame_idx)
@@ -421,6 +422,12 @@ class MultiviewDepthProcessor(StreamProcessor):
                 )
                 sw_depth = torch.from_numpy(dav3_inference_result.depth[: len(sw_images)]).float().cuda()
                 sw_depth = torch.nn.functional.interpolate(sw_depth[:, None], frame.size(), mode="bilinear")[:, 0]
+                sw_confidence = None
+                if dav3_inference_result.conf is not None:
+                    sw_confidence = torch.from_numpy(dav3_inference_result.conf[: len(sw_images)]).float().cuda()
+                    sw_confidence = torch.nn.functional.interpolate(
+                        sw_confidence[:, None], frame.size(), mode="bilinear"
+                    )[:, 0]
 
                 n_frames_to_yield = (
                     self.window_size - self.overlap_size if not is_last_frame else len(current_sliding_window)
@@ -431,12 +438,18 @@ class MultiviewDepthProcessor(StreamProcessor):
                     n_interp_frames = len(trailing_depth)
                     alpha = torch.linspace(0, 1, n_interp_frames + 2)[1:-1].float().cuda()[:, None, None]
                     sw_depth[:n_interp_frames] = trailing_depth * (1 - alpha) + sw_depth[:n_interp_frames] * alpha
+                    if trailing_confidence is not None and sw_confidence is not None:
+                        sw_confidence[:n_interp_frames] = (
+                            trailing_confidence * (1 - alpha) + sw_confidence[:n_interp_frames] * alpha
+                        )
 
                 for sw_idx, frame in enumerate(current_sliding_window[:n_frames_to_yield]):
                     frame.metric_depth = sw_depth[sw_idx]
+                    frame.depth_confidence = None if sw_confidence is None else sw_confidence[sw_idx]
                     yield frame
 
                 trailing_depth = sw_depth[n_frames_to_yield:]
+                trailing_confidence = None if sw_confidence is None else sw_confidence[n_frames_to_yield:]
                 current_sliding_window = current_sliding_window[n_frames_to_yield:]
                 current_sliding_window_idx = current_sliding_window_idx[n_frames_to_yield:]
 

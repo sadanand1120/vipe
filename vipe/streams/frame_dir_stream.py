@@ -19,7 +19,7 @@ import cv2
 import torch
 
 from vipe.streams.base import ProcessedVideoStream, StreamList, VideoFrame, VideoStream
-from vipe.utils.misc import natural_path_key
+from vipe.utils.misc import sort_image_sequence
 
 
 class FrameDirStream(VideoStream):
@@ -42,25 +42,24 @@ class FrameDirStream(VideoStream):
         self.path = path
         self._name = name if name is not None else path.name
 
-        # Find all image files in the directory
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+        if not path.is_dir():
+            raise ValueError(f"Frame directory not found: {path}")
+
+        image_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
         self.frame_files = []
         for ext in image_extensions:
-            self.frame_files.extend(path.glob(f'*{ext}'))
-            self.frame_files.extend(path.glob(f'*{ext.upper()}'))
-        
-        self.frame_files = sorted(set(self.frame_files), key=natural_path_key)
-        
+            self.frame_files.extend(path.glob(f"*{ext}"))
+            self.frame_files.extend(path.glob(f"*{ext.upper()}"))
+
+        self.frame_files = sort_image_sequence(set(self.frame_files))
         if not self.frame_files:
             raise ValueError(f"No image files found in directory: {path}")
 
-        # Read metadata from first frame
         first_frame = cv2.imread(str(self.frame_files[0]))
         if first_frame is None:
             raise ValueError(f"Could not read first frame: {self.frame_files[0]}")
-        
+
         self._height, self._width = first_frame.shape[:2]
-        
         self._fps = fps
         _n_frames = len(self.frame_files)
 
@@ -87,21 +86,15 @@ class FrameDirStream(VideoStream):
         return self
 
     def __next__(self) -> VideoFrame:
-        self.current_frame_idx += 1
-        
-        if self.current_frame_idx >= self.end:
-            raise StopIteration
+        while True:
+            self.current_frame_idx += 1
+            if self.current_frame_idx >= self.end:
+                raise StopIteration
+            if self.current_frame_idx >= self.start and (self.current_frame_idx - self.start) % self.step == 0:
+                break
 
-        if self.current_frame_idx < self.start:
-            return self.__next__()
-
-        if (self.current_frame_idx - self.start) % self.step != 0:
-            return self.__next__()
-
-        # Load the frame
         frame_path = self.frame_files[self.current_frame_idx]
         frame = cv2.imread(str(frame_path))
-        
         if frame is None:
             raise ValueError(f"Could not read frame: {frame_path}")
 
@@ -123,31 +116,23 @@ class FrameDirStreamList(StreamList):
         cached: bool = False,
     ) -> None:
         super().__init__()
-        base_path_obj = Path(base_path)
-        
-        if base_path_obj.is_dir():
-            # Single directory of frames
-            self.frame_directories = [base_path_obj]
-        else:
-            # Look for subdirectories that might contain frames
-            if base_path_obj.parent.exists():
-                self.frame_directories = [d for d in base_path_obj.parent.iterdir() if d.is_dir() and d.name == base_path_obj.name]
-            else:
-                raise ValueError(f"Directory not found: {base_path}")
-                
-        if not self.frame_directories:
-            raise ValueError(f"No frame directories found at: {base_path}")
+        frame_dir = Path(base_path)
+        if not frame_dir.is_dir():
+            raise ValueError(f"Frame directory not found: {base_path}")
 
+        self.frame_directory = frame_dir
         self.fps_value = fps
         self.frame_range = range(frame_start, frame_end, frame_skip)
         self.cached = cached
 
     def __len__(self) -> int:
-        return len(self.frame_directories)
+        return 1
 
     def __getitem__(self, index: int) -> VideoStream:
+        if index != 0:
+            raise IndexError(index)
         stream: VideoStream = FrameDirStream(
-            self.frame_directories[index],
+            self.frame_directory,
             fps=self.fps_value,
             seek_range=self.frame_range,
         )
@@ -156,4 +141,6 @@ class FrameDirStreamList(StreamList):
         return stream
 
     def stream_name(self, index: int) -> str:
-        return self.frame_directories[index].name
+        if index != 0:
+            raise IndexError(index)
+        return self.frame_directory.name

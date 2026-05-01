@@ -196,7 +196,13 @@ class DefaultAnnotationPipeline(Pipeline):
             artifact_path.meta_info_path.parent.mkdir(exist_ok=True, parents=True)
             if self.out_cfg.save_artifacts:
                 logger.info(f"Saving artifacts to {artifact_path}")
-                io.save_artifacts(artifact_path, output_stream)
+                io.save_artifacts(
+                    artifact_path,
+                    output_stream,
+                    max_pcd_points=self.out_cfg.backproject_pcd_max_points,
+                    pcd_conf_threshold_coef=self.out_cfg.backproject_pcd_conf_threshold_coef,
+                    pcd_sample_ratio=self.out_cfg.backproject_pcd_sample_ratio,
+                )
                 with artifact_path.meta_info_path.open("wb") as f:
                     pickle.dump({"ba_residual": slam_output.ba_residual}, f)
 

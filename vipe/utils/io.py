@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import logging
+import math
+import shutil
 import tempfile
 import zipfile
 
@@ -55,6 +57,10 @@ class ArtifactPath:
     @property
     def depth_path(self) -> Path:
         return self.base_path / "depth" / f"{self.artifact_name}.zip"
+
+    @property
+    def backproject_pcd_path(self) -> Path:
+        return self.base_path / "pcd" / f"{self.artifact_name}_backproject.ply"
 
     @property
     def intrinsics_path(self) -> Path:
@@ -442,7 +448,114 @@ class ArtifactVideoStream(VideoStream):
             )
 
 
-def save_artifacts(out_path: ArtifactPath, final_stream: VideoStream) -> None:
+def _backproject_vertices(
+    frame_data: VideoFrame,
+    max_points_per_frame: int,
+    conf_threshold_coef: float,
+    sample_ratio: float,
+) -> np.ndarray | None:
+    if (
+        frame_data.metric_depth is None
+        or frame_data.pose is None
+        or frame_data.intrinsics is None
+        or max_points_per_frame <= 0
+    ):
+        return None
+
+    depth = frame_data.metric_depth.detach().cpu().numpy()
+    valid = np.isfinite(depth) & (depth > 0.0)
+    confidence = None
+    if frame_data.depth_confidence is not None:
+        confidence = frame_data.depth_confidence.detach().cpu().numpy()
+        assert confidence.shape == depth.shape
+        valid &= (confidence >= float(np.mean(confidence)) * conf_threshold_coef) & (confidence > 1e-5)
+
+    valid_flat = np.flatnonzero(valid.ravel())
+    if len(valid_flat) == 0:
+        return None
+
+    if confidence is not None and sample_ratio < 1.0:
+        sample_count = int(len(valid_flat) * sample_ratio)
+    else:
+        sample_count = len(valid_flat)
+    sample_count = min(sample_count, max_points_per_frame)
+    if sample_count <= 0:
+        return None
+
+    if sample_count < len(valid_flat):
+        if confidence is not None:
+            rng = np.random.default_rng(frame_data.raw_frame_idx)
+            valid_flat = rng.choice(valid_flat, sample_count, replace=False)
+        else:
+            stride = max(1, math.ceil(len(valid_flat) / sample_count))
+            valid_flat = valid_flat[::stride][:sample_count]
+
+    height, width = depth.shape
+    ys, xs = np.divmod(valid_flat, width)
+    zs = depth.ravel()[valid_flat].astype(np.float32)
+    fx, fy, cx, cy = frame_data.intrinsics[:4].detach().cpu().numpy().astype(np.float32)
+
+    points_cam = np.empty((len(valid_flat), 4), dtype=np.float32)
+    points_cam[:, 0] = (xs.astype(np.float32) - cx) * zs / fx
+    points_cam[:, 1] = (ys.astype(np.float32) - cy) * zs / fy
+    points_cam[:, 2] = zs
+    points_cam[:, 3] = 1.0
+
+    pose_c2w = frame_data.pose.matrix().detach().cpu().numpy().astype(np.float32)
+    points_world = (pose_c2w @ points_cam.T).T[:, :3]
+    colors = (frame_data.rgb.detach().cpu().numpy().reshape(-1, 3)[valid_flat] * 255.0).clip(0, 255).astype(np.uint8)
+
+    vertex_dtype = np.dtype(
+        [
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+        ]
+    )
+    vertices = np.empty(len(points_world), dtype=vertex_dtype)
+    vertices["x"] = points_world[:, 0]
+    vertices["y"] = points_world[:, 1]
+    vertices["z"] = points_world[:, 2]
+    vertices["red"] = colors[:, 0]
+    vertices["green"] = colors[:, 1]
+    vertices["blue"] = colors[:, 2]
+    return vertices
+
+
+def _write_backproject_pcd(out_path: ArtifactPath, body_file, vertex_count: int) -> None:
+    if vertex_count == 0:
+        return
+
+    out_path.backproject_pcd_path.parent.mkdir(exist_ok=True, parents=True)
+    body_file.seek(0)
+    with out_path.backproject_pcd_path.open("wb") as ply_file:
+        ply_file.write(
+            (
+                "ply\n"
+                "format binary_little_endian 1.0\n"
+                f"element vertex {vertex_count}\n"
+                "property float x\n"
+                "property float y\n"
+                "property float z\n"
+                "property uchar red\n"
+                "property uchar green\n"
+                "property uchar blue\n"
+                "end_header\n"
+            ).encode("ascii")
+        )
+        shutil.copyfileobj(body_file, ply_file)
+
+
+def save_artifacts(
+    out_path: ArtifactPath,
+    final_stream: VideoStream,
+    max_pcd_points: int = 8_000_000,
+    pcd_conf_threshold_coef: float = 0.75,
+    pcd_sample_ratio: float = 0.015,
+) -> None:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
     """
@@ -454,6 +567,9 @@ def save_artifacts(out_path: ArtifactPath, final_stream: VideoStream) -> None:
 
     depth_zip: zipfile.ZipFile | None = None
     mask_zip: zipfile.ZipFile | None = None
+    pcd_body_file = tempfile.TemporaryFile()
+    pcd_vertex_count = 0
+    max_points_per_frame = math.ceil(max_pcd_points / max(len(final_stream), 1))
 
     try:
         with VideoWriter(out_path.rgb_path, final_stream.fps()) as rgb_writer:
@@ -500,6 +616,21 @@ def save_artifacts(out_path: ArtifactPath, final_stream: VideoStream) -> None:
 
                 if frame_data.instance_phrases is not None:
                     instance_phrases_combined.update(frame_data.instance_phrases)
+
+                remaining_points = max_pcd_points - pcd_vertex_count
+                if remaining_points > 0:
+                    vertices = _backproject_vertices(
+                        frame_data,
+                        min(max_points_per_frame, remaining_points),
+                        pcd_conf_threshold_coef,
+                        pcd_sample_ratio,
+                    )
+                    if vertices is not None:
+                        vertices.tofile(pcd_body_file)
+                        pcd_vertex_count += len(vertices)
+    except Exception:
+        pcd_body_file.close()
+        raise
     finally:
         if depth_zip is not None:
             depth_zip.close()
@@ -529,3 +660,8 @@ def save_artifacts(out_path: ArtifactPath, final_stream: VideoStream) -> None:
         with out_path.mask_phrase_path.open("w") as f:
             for idx, phrase in instance_phrases_combined.items():
                 f.write(f"{idx}: {phrase}\n")
+
+    try:
+        _write_backproject_pcd(out_path, pcd_body_file, pcd_vertex_count)
+    finally:
+        pcd_body_file.close()

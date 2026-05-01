@@ -6,13 +6,13 @@ from omegaconf import DictConfig
 def run(args: DictConfig) -> None:
     from vipe.streams.base import StreamList
 
-    # Gather all video streams
+    # Gather frame-directory streams.
     stream_list = StreamList.make(args.streams)
 
     from vipe.pipeline import make_pipeline
     from vipe.utils.logging import configure_logging
 
-    # Process each video stream
+    # Process each stream.
     logger = configure_logging()
     for stream_idx in range(len(stream_list)):
         video_stream = stream_list[stream_idx]

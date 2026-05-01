@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-
 from pathlib import Path
 from typing import Optional, TypeVar
 
@@ -30,15 +28,9 @@ def unpack_optional(maybe_value: Optional[T]) -> T:
     return maybe_value
 
 
-def natural_path_key(path: Path) -> tuple:
-    # TODO: IMPORTANT - make sure this is robust to different general naming conventions
-    """Numeric-aware path sorting for names like 1.jpg, 2.jpg, 10.jpg."""
-    key = []
-    for part in re.split(r"(\d+)", path.stem.lower()):
-        if len(part) == 0:
-            continue
-        if part.isdigit():
-            key.append((0, int(part)))
-        else:
-            key.append((1, part))
-    return tuple(key), path.suffix.lower()
+def sort_image_sequence(paths):
+    """Sort pure numeric frame names numerically; otherwise use plain lexicographic order."""
+    paths = list(paths)
+    if paths and all(Path(path).stem.isdigit() for path in paths):
+        return sorted(paths, key=lambda path: (int(Path(path).stem), str(path)))
+    return sorted(paths, key=str)

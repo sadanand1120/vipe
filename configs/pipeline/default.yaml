@@ -37,11 +37,14 @@ output:
 
   # Save artifacts and a info file
   save_artifacts: false
+  backproject_pcd_max_points: 8000000
+  backproject_pcd_conf_threshold_coef: 0.75
+  backproject_pcd_sample_ratio: 0.015
 
   # Save reconstruction from SLAM
   save_slam_map: false
 
   # Visualization videos to BASE_PATH/vipe/xxx.mp4
-  save_viz: true
+  save_viz: false
   viz_downsample: 2
   viz_attributes: [['rgb', 'instance'], ['depth', 'pcd']]

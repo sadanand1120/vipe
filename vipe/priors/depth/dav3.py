@@ -84,7 +84,16 @@ class DepthAnything3Model(DepthEstimationModel):
         dav3_metric_depth = torch.from_numpy(dav3_metric_depth).cuda()[None]
         dav3_metric_depth = torch.nn.functional.interpolate(dav3_metric_depth, rgb.shape[1:3], mode="nearest")[:, 0]
 
+        dav3_confidence = None
+        if dav3_inference_result.conf is not None:
+            dav3_confidence = torch.from_numpy(dav3_inference_result.conf).float().cuda()[None]
+            dav3_confidence = torch.nn.functional.interpolate(
+                dav3_confidence, rgb.shape[1:3], mode="bilinear"
+            )[:, 0]
+
         if not batch_dim:
             dav3_metric_depth = dav3_metric_depth.squeeze(0)
+            if dav3_confidence is not None:
+                dav3_confidence = dav3_confidence.squeeze(0)
 
-        return DepthEstimationResult(metric_depth=dav3_metric_depth)
+        return DepthEstimationResult(metric_depth=dav3_metric_depth, confidence=dav3_confidence)
