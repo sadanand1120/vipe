@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import OpenEXR
+from tqdm import tqdm
 
 from vipe.utils.misc import sort_image_sequence
 
@@ -175,7 +176,8 @@ def run_vipe(overrides: list[str]) -> None:
 def _read_depth_zip(depth_path: Path) -> dict[int, np.ndarray]:
     depths = {}
     with zipfile.ZipFile(depth_path, "r") as zf:
-        for name in sorted(zf.namelist()):
+        names = sorted(zf.namelist())
+        for name in tqdm(names, desc=f"[ViPE export] read depths {depth_path.name}", unit="frame"):
             frame_idx = int(Path(name).stem)
             with zf.open(name) as fh:
                 exr = OpenEXR.InputFile(fh)
@@ -246,7 +248,9 @@ def _export_vipe_scene(
 
     frame_files = _image_files(frame_dir)
     frame_index_by_path = {str(path.resolve()): idx for idx, path in enumerate(frame_files)}
+    print(f"[INFO] Loading ViPE artifacts | {scene} | {vipe_output_dir}", flush=True)
     poses_c2w, intrinsics, depths = _load_vipe_artifacts(vipe_output_dir, artifact_name)
+    print(f"[INFO] Packing ViPE benchmark export | {scene} | frames={len(scene_data.image_files)}", flush=True)
 
     depths_out = []
     conf_out = []
@@ -256,7 +260,7 @@ def _export_vipe_scene(
     missing = []
 
     full_index_by_image = {str(Path(path).resolve()): idx for idx, path in enumerate(full_scene_data.image_files)}
-    for image_file in scene_data.image_files:
+    for image_file in tqdm(scene_data.image_files, desc=f"[ViPE export] pack {scene}", unit="frame"):
         image_key = str(Path(image_file).resolve())
         if image_key not in frame_index_by_path:
             missing.append(f"{image_file}: not found in ViPE frame dir")
@@ -279,6 +283,7 @@ def _export_vipe_scene(
 
     result_tmp = args.work_dir / "model_results" / "scannet" / scene / "_vipe_results.npz"
     result_tmp.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Writing compressed ViPE NPZ | {scene} | {result_tmp}", flush=True)
     np.savez_compressed(
         result_tmp,
         depth=np.round(np.stack(depths_out), 8),
@@ -298,7 +303,9 @@ def _export_vipe_scene(
         export_dir = Path(evaluator._export_dir("scannet", scene, posed=posed))
         result_path = export_dir / "exports" / "mini_npz" / "results.npz"
         result_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Copying export NPZ | {scene} | posed={posed} | {result_path}", flush=True)
         shutil.copy2(result_tmp, result_path)
+        print(f"[INFO] Writing GT metadata | {scene} | posed={posed}", flush=True)
         evaluator._save_gt_meta(str(export_dir), exported_scene_data)
 
     print(f"[INFO] Exported ViPE artifacts for {scene} to DA3 benchmark layout under {args.work_dir}")

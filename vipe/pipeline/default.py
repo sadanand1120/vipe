@@ -199,9 +199,13 @@ class DefaultAnnotationPipeline(Pipeline):
                 io.save_artifacts(
                     artifact_path,
                     output_stream,
+                    pcd_fusion_mode=self.out_cfg.pcd_fusion_mode,
                     max_pcd_points=self.out_cfg.backproject_pcd_max_points,
                     pcd_conf_threshold_coef=self.out_cfg.backproject_pcd_conf_threshold_coef,
                     pcd_sample_ratio=self.out_cfg.backproject_pcd_sample_ratio,
+                    pcd_tsdf_voxel_length=self.out_cfg.pcd_tsdf_voxel_length,
+                    pcd_tsdf_sdf_trunc=self.out_cfg.pcd_tsdf_sdf_trunc,
+                    pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
                 )
                 with artifact_path.meta_info_path.open("wb") as f:
                     pickle.dump({"ba_residual": slam_output.ba_residual}, f)

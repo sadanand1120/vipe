@@ -15,7 +15,7 @@
 
 import numpy as np
 import torch
-import vslam
+import cuvslam
 
 from vipe.streams.base import VideoFrame
 from vipe.utils.misc import unpack_optional
@@ -36,30 +36,29 @@ class CuVSLAMSparseTracks(SparseTracks):
             "Only single-camera supported for now. Mainly due to rig transformations not properly set."
         )
 
-        vslam_cameras = []
+        cuvslam_cameras = []
         for frame_data in frame_data_list:
             frame_height, frame_width = frame_data.size()
             fx, fy, cx, cy = unpack_optional(frame_data.intrinsics)
 
-            cam = vslam.Camera()
-            cam.distortion = vslam.Distortion()
-            cam.distortion.model = vslam.DistortionModel.Pinhole
+            cam = cuvslam.Camera()
+            cam.distortion = cuvslam.Distortion()
+            cam.distortion.model = cuvslam.Distortion.Model.Pinhole
             cam.focal = [float(fx), float(fy)]
             cam.principal = [float(cx), float(cy)]
             cam.size = [int(frame_width), int(frame_height)]
-            cam.rig_from_camera = vslam.Pose()
+            cam.rig_from_camera = cuvslam.Pose()
             cam.rig_from_camera.rotation = np.array([0, 0, 0, 1])
             cam.rig_from_camera.translation = np.array([0, 0, 0])
-            vslam_cameras.append(cam)
+            cuvslam_cameras.append(cam)
 
-        rig = vslam.Rig()
-        rig.cameras = vslam_cameras
-        rig.imus = []
+        rig = cuvslam.Rig(cuvslam_cameras)
 
-        cfg = vslam.TrackerConfig()
-        cfg.odometry_mode = vslam.TrackerOdometryMode.Mono
-        cfg.enable_observations_export = True
-        tracker = vslam.Tracker(rig, cfg)
+        cfg = cuvslam.Tracker.OdometryConfig(
+            odometry_mode=cuvslam.Tracker.OdometryMode.Mono,
+            enable_observations_export=True,
+        )
+        tracker = cuvslam.Tracker(rig, cfg)
 
         self.tracker = tracker
         self.frame_idx = 0
@@ -77,11 +76,12 @@ class CuVSLAMSparseTracks(SparseTracks):
             )
             for frame in frame_data_list
         ]
-        self.tracker.track(
-            self.frame_idx,
-            [(frame.rgb * 255).byte().contiguous() for frame in frame_data_list],
-            invalid_masks,
-        )
+        images = [
+            (frame.rgb.detach().mul(255.0).clamp(0, 255).byte().contiguous().cpu().numpy())
+            for frame in frame_data_list
+        ]
+        masks = [mask.detach().byte().contiguous().cpu().numpy() for mask in invalid_masks]
+        self.tracker.track(int(self.frame_idx), images, masks=masks)
 
         for camera_idx, observation in enumerate(self.observations):
             # Add new frame info

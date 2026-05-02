@@ -32,6 +32,12 @@ pip3 install faiss-gpu pandas prettytable numba pypose
 pip3 install -e /robodata/smodak/repos/Depth-Anything-3
 ```
 
+Optional cuvslam (for slam sparse tracks = cuvslam instead of default dummy)
+
+```bash
+pip3 install "https://github.com/nvidia-isaac/cuVSLAM/releases/download/v15.0.0/cuvslam-15.0.0%2Bcu12-cp310-cp310-manylinux_2_35_x86_64.whl"
+```
+
 ## Usage
 
 ### Using the ViPE CLI

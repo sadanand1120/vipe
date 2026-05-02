@@ -37,9 +37,13 @@ output:
 
   # Save artifacts and a info file
   save_artifacts: false
+  pcd_fusion_mode: backproject
   backproject_pcd_max_points: 8000000
   backproject_pcd_conf_threshold_coef: 0.75
   backproject_pcd_sample_ratio: 0.015
+  pcd_tsdf_voxel_length: 0.02
+  pcd_tsdf_sdf_trunc: 0.15
+  pcd_tsdf_depth_trunc: 5.0
 
   # Save reconstruction from SLAM
   save_slam_map: false

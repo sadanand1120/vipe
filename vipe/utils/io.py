@@ -63,6 +63,10 @@ class ArtifactPath:
         return self.base_path / "pcd" / f"{self.artifact_name}_backproject.ply"
 
     @property
+    def tsdf_pcd_path(self) -> Path:
+        return self.base_path / "pcd" / f"{self.artifact_name}_tsdf.ply"
+
+    @property
     def intrinsics_path(self) -> Path:
         return self.base_path / "intrinsics" / f"{self.artifact_name}.npz"
 
@@ -549,12 +553,73 @@ def _write_backproject_pcd(out_path: ArtifactPath, body_file, vertex_count: int)
         shutil.copyfileobj(body_file, ply_file)
 
 
+def _make_tsdf_volume(voxel_length: float, sdf_trunc: float):
+    import open3d as o3d
+
+    return o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=voxel_length,
+        sdf_trunc=sdf_trunc,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+    )
+
+
+def _integrate_tsdf_frame(volume, frame_data: VideoFrame, depth_trunc: float) -> None:
+    if frame_data.metric_depth is None or frame_data.pose is None or frame_data.intrinsics is None:
+        return
+
+    import open3d as o3d
+
+    depth = frame_data.metric_depth.detach().cpu().numpy().astype(np.float32)
+    depth[~np.isfinite(depth)] = 0.0
+    depth[depth <= 0.0] = 0.0
+
+    color = (frame_data.rgb.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    height, width = depth.shape
+    fx, fy, cx, cy = frame_data.intrinsics[:4].detach().cpu().numpy().astype(np.float32)
+    intrinsics = o3d.camera.PinholeCameraIntrinsic(
+        width,
+        height,
+        float(fx),
+        float(fy),
+        float(cx),
+        float(cy),
+    )
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        o3d.geometry.Image(np.ascontiguousarray(color)),
+        o3d.geometry.Image(np.ascontiguousarray(depth)),
+        depth_scale=1.0,
+        depth_trunc=depth_trunc,
+        convert_rgb_to_intensity=False,
+    )
+    w2c = frame_data.pose.inv().matrix().detach().cpu().numpy().astype(np.float64)
+    volume.integrate(rgbd, intrinsics, w2c)
+
+
+def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
+    import open3d as o3d
+
+    mesh = volume.extract_triangle_mesh()
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        return
+
+    out_path.tsdf_pcd_path.parent.mkdir(exist_ok=True, parents=True)
+    pcd = mesh.sample_points_uniformly(number_of_points=max_points)
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
+    o3d.io.write_point_cloud(str(out_path.tsdf_pcd_path), pcd, write_ascii=False)
+
+
 def save_artifacts(
     out_path: ArtifactPath,
     final_stream: VideoStream,
+    pcd_fusion_mode: str = "backproject",
     max_pcd_points: int = 8_000_000,
     pcd_conf_threshold_coef: float = 0.75,
     pcd_sample_ratio: float = 0.015,
+    pcd_tsdf_voxel_length: float = 0.02,
+    pcd_tsdf_sdf_trunc: float = 0.15,
+    pcd_tsdf_depth_trunc: float = 5.0,
 ) -> None:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
@@ -567,9 +632,15 @@ def save_artifacts(
 
     depth_zip: zipfile.ZipFile | None = None
     mask_zip: zipfile.ZipFile | None = None
-    pcd_body_file = tempfile.TemporaryFile()
+    if pcd_fusion_mode not in {"backproject", "tsdf"}:
+        raise ValueError(f"Invalid pcd_fusion_mode: {pcd_fusion_mode}")
+
+    pcd_body_file = tempfile.TemporaryFile() if pcd_fusion_mode == "backproject" else None
     pcd_vertex_count = 0
     max_points_per_frame = math.ceil(max_pcd_points / max(len(final_stream), 1))
+    tsdf_volume = (
+        _make_tsdf_volume(pcd_tsdf_voxel_length, pcd_tsdf_sdf_trunc) if pcd_fusion_mode == "tsdf" else None
+    )
 
     try:
         with VideoWriter(out_path.rgb_path, final_stream.fps()) as rgb_writer:
@@ -618,7 +689,8 @@ def save_artifacts(
                     instance_phrases_combined.update(frame_data.instance_phrases)
 
                 remaining_points = max_pcd_points - pcd_vertex_count
-                if remaining_points > 0:
+                if pcd_fusion_mode == "backproject" and remaining_points > 0:
+                    assert pcd_body_file is not None
                     vertices = _backproject_vertices(
                         frame_data,
                         min(max_points_per_frame, remaining_points),
@@ -628,8 +700,11 @@ def save_artifacts(
                     if vertices is not None:
                         vertices.tofile(pcd_body_file)
                         pcd_vertex_count += len(vertices)
+                elif pcd_fusion_mode == "tsdf":
+                    _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc)
     except Exception:
-        pcd_body_file.close()
+        if pcd_body_file is not None:
+            pcd_body_file.close()
         raise
     finally:
         if depth_zip is not None:
@@ -662,6 +737,11 @@ def save_artifacts(
                 f.write(f"{idx}: {phrase}\n")
 
     try:
-        _write_backproject_pcd(out_path, pcd_body_file, pcd_vertex_count)
+        if pcd_fusion_mode == "backproject":
+            assert pcd_body_file is not None
+            _write_backproject_pcd(out_path, pcd_body_file, pcd_vertex_count)
+        else:
+            _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)
     finally:
-        pcd_body_file.close()
+        if pcd_body_file is not None:
+            pcd_body_file.close()
