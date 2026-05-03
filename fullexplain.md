@@ -1,0 +1,2371 @@
+# Full Computation Walkthrough For The Current Standalone ViPE Run
+
+This document explains the reduced ViPE standalone path as it exists now. It covers the computation started by `run.py` and the optional trajectory comparison command that you run after it.
+
+The current flattened config means the old Hydra group flags `pipeline=dav3` and `streams=frame_dir_stream` are no longer part of the active runtime. The equivalent standalone run is:
+
+```bash
+export NUMEXPR_MAX_THREADS=16
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export CUDA_VISIBLE_DEVICES='2'
+
+python run.py \
+  streams.base_path=/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/color \
+  streams.fps=30 \
+  pipeline.output.path=/robodata/smodak/repos/vipe/outputs/scene00_dav3tsdf \
+  pipeline.output.save_artifacts=true \
+  pipeline.output.save_viz=true \
+  pipeline.output.pcd_fusion_mode=tsdf
+```
+
+The optional command after that is:
+
+```bash
+python3 scripts/make_traj_compare_video.py \
+  outputs/scene00_dav3tsdf \
+  --gt-pose-dir /robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/pose \
+  --fps 30 \
+  --alignment first \
+  --export
+```
+
+## Side-By-Side Toy Trace
+
+The complete numeric toy trace has been split into [fullexplain-toy.md](./fullexplain-toy.md). Keep it open next to this file; chunk numbers and names match this explanation.
+
+## High-Level Runtime Flow
+
+```mermaid
+flowchart TD
+    A[Shell environment and Hydra overrides] --> B[run.py]
+    B --> C[FrameDirStreamList]
+    C --> D[FrameDirStream: sorted image files]
+    D --> E[Initialization processors]
+    E --> E1[GeoCalib shared intrinsics]
+    E --> E2[Track Anything instance masks]
+    E1 --> F[Cached initialized stream]
+    E2 --> F
+    F --> G[SLAMSystem]
+    G --> G1[Standard resize and crop]
+    G1 --> G2[DROID features and motion filter]
+    G2 --> G3[Pass 1: keyframe graph]
+    G3 --> G4[Frontend incremental BA]
+    G4 --> G5[Backend global BA]
+    G5 --> G6[Pass 2: non-keyframe pose infill]
+    G6 --> H[SLAMOutput]
+    H --> H1[Trajectory: c2w poses]
+    H --> H2[Recovered original-size intrinsics]
+    H --> H3[SLAM keyframe map]
+    H --> I[Rebuilt output stream]
+    I --> J[Post processors]
+    J --> J1[Assign pose and intrinsics to each original frame]
+    J --> J2[DAV3 multiview final depth]
+    J2 --> K[save_artifacts]
+    K --> K1[RGB mp4, pose npz, intrinsics npz, depth zip, mask zip]
+    K --> K2{pcd_fusion_mode}
+    K2 -->|backproject| K3[color_backproject.ply]
+    K2 -->|tsdf| K4[color_tsdf.ply]
+    J2 --> L[save_projection_video]
+    L --> M[color_vis.mp4]
+    K1 --> N[make_traj_compare_video.py optional]
+    N --> N1[trajectory comparison mp4]
+    N --> N2[pose_aligned txt export]
+```
+
+The important separation is:
+
+| Stage | What it computes |
+| --- | --- |
+| Initialization | Intrinsics and dynamic-object masks |
+| SLAM | Camera poses, keyframe disparity map, and sparse keyframe map |
+| Post depth | Final dense metric depth for every original frame |
+| Artifacts | Persist RGB, poses, intrinsics, depth, masks, and one selected PCD output |
+| Trajectory script | Passive visualization and aligned pose export only |
+
+## Chunk 1: Shell, Hydra Config, And Runtime Construction
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `run.py` | Hydra entrypoint and per-stream loop |
+| `configs/default.yaml` | Single active config |
+| `vipe/runtime.py` | Fixed constructors for frame-dir stream and annotation pipeline |
+| `vipe/pipeline/default.py` | `DefaultAnnotationPipeline` |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Shell command] --> B[Environment variables]
+    A --> C[Hydra CLI overrides]
+    C --> D[configs/default.yaml]
+    D --> E[DictConfig args]
+    E --> F[make_frame_dir_stream_list(args.streams)]
+    E --> G[make_annotation_pipeline(args.pipeline)]
+    F --> H[FrameDirStreamList]
+    G --> I[DefaultAnnotationPipeline]
+    H --> J[stream_list length is 1]
+    J --> K[run stream index 0]
+    K --> L[pipeline.run(video_stream)]
+```
+
+### Computation
+
+`run.py` is decorated with:
+
+```python
+@hydra.main(version_base=None, config_path="configs", config_name="default")
+```
+
+Hydra loads `configs/default.yaml`, then applies CLI overrides such as:
+
+```text
+streams.base_path=/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/color
+streams.fps=30
+pipeline.output.path=/robodata/smodak/repos/vipe/outputs/scene00_dav3tsdf
+pipeline.output.save_artifacts=true
+pipeline.output.save_viz=true
+pipeline.output.pcd_fusion_mode=tsdf
+```
+
+The shell variables do not change Python control flow directly:
+
+| Variable | Effect |
+| --- | --- |
+| `CUDA_VISIBLE_DEVICES='2'` | Makes physical GPU 2 appear as CUDA device 0 inside PyTorch/Open3D/DA3 calls. |
+| `NUMEXPR_MAX_THREADS=16` | Controls NumExpr thread count if NumExpr is imported. |
+| `OMP_NUM_THREADS=16` | Controls OpenMP thread count for libraries that obey it. |
+| `MKL_NUM_THREADS=16` | Controls MKL thread count for libraries that obey it. |
+
+`run.py` then does:
+
+```python
+stream_list = make_frame_dir_stream_list(args.streams)
+logger = configure_logging()
+pipeline = make_annotation_pipeline(args.pipeline)
+for stream_idx in range(len(stream_list)):
+    video_stream = stream_list[stream_idx]
+    pipeline.run(video_stream)
+```
+
+Current reduced setup has one stream only. `FrameDirStreamList.__len__()` returns `1`. `FrameDirStreamList.__getitem__(0)` creates a `FrameDirStream`.
+
+`make_annotation_pipeline` creates:
+
+```python
+DefaultAnnotationPipeline(
+    init=config.init,
+    slam=config.slam,
+    post=config.post,
+    output=config.output,
+)
+```
+
+The pipeline constructor creates the output root:
+
+```python
+self.out_path = Path(self.out_cfg.path)
+self.out_path.mkdir(exist_ok=True, parents=True)
+self.camera_type = CameraType(self.init_cfg.camera_type)
+```
+
+With the command above:
+
+```text
+self.out_path = /robodata/smodak/repos/vipe/outputs/scene00_dav3tsdf
+self.camera_type = CameraType.PINHOLE
+```
+
+### Branches
+
+| Branch | Current command outcome |
+| --- | --- |
+| Multiple streams | Not active. `FrameDirStreamList` has exactly one stream. |
+| Multiview input | Not active. `pipeline.run` receives a `VideoStream`, not `MultiviewVideoList`. |
+| `save_artifacts` | Active because CLI sets `true`. |
+| `save_viz` | Active because CLI sets `true`. |
+| `pcd_fusion_mode` | `tsdf` for the command shown. Default is `backproject` if not overridden. |
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-toy) for the matching numeric example for this chunk.
+
+## Chunk 2: Frame Directory Stream And Frame Ordering
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/streams/frame_dir_stream.py` | Reads image files into CUDA `VideoFrame` objects |
+| `vipe/utils/misc.py` | Numeric-vs-lexicographic image sorting |
+| `vipe/streams/base.py` | `VideoFrame`, `VideoStream`, `CachedVideoStream`, `ProcessedVideoStream` |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[base_path] --> B[Path exists check]
+    B --> C[glob jpg jpeg png bmp tiff tif both cases]
+    C --> D{Are all stems pure digits?}
+    D -->|yes| E[sort by int(stem), then str(path)]
+    D -->|no| F[sort lexicographically by str(path)]
+    E --> G[frame_files]
+    F --> G
+    G --> H[read first frame with cv2.imread]
+    H --> I[record H, W, fps, start, end, step]
+    I --> J[__next__ reads each selected frame]
+    J --> K[BGR to RGB]
+    K --> L[float32 0..1 tensor on CUDA]
+    L --> M[VideoFrame(raw_frame_idx, rgb)]
+```
+
+### Computation
+
+`FrameDirStreamList.__getitem__(0)` calls:
+
+```python
+FrameDirStream(
+    self.frame_directory,
+    fps=self.fps_value,
+    seek_range=self.frame_range,
+)
+```
+
+`FrameDirStream.__init__`:
+
+1. Checks `path.is_dir()`.
+2. Collects image files with extensions:
+   ```python
+   [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+   ```
+   and uppercase variants.
+3. Calls:
+   ```python
+   self.frame_files = sort_image_sequence(set(self.frame_files))
+   ```
+4. Reads the first frame with `cv2.imread` to set `_height` and `_width`.
+5. Sets:
+   ```python
+   self.start = seek_range.start
+   self.end = seek_range.stop if seek_range.stop != -1 else _n_frames
+   self.end = min(self.end, _n_frames)
+   self.step = seek_range.step
+   self._fps = self._fps / self.step
+   ```
+
+The current image sorting rule is:
+
+```python
+def sort_image_sequence(paths):
+    paths = list(paths)
+    if paths and all(Path(path).stem.isdigit() for path in paths):
+        return sorted(paths, key=lambda path: (int(Path(path).stem), str(path)))
+    return sorted(paths, key=str)
+```
+
+That means:
+
+| File names | Sort order |
+| --- | --- |
+| `0.png`, `1.png`, `2.png`, `10.png` | `0`, `1`, `2`, `10` because every stem is numeric |
+| `frame1.png`, `frame10.png`, `frame2.png` | lexicographic: `frame1`, `frame10`, `frame2` |
+| mixed `0.png`, `frame1.png` | lexicographic because not every stem is numeric |
+
+`FrameDirStream.__next__` increments `current_frame_idx` until it lands inside `[start, end)` and satisfies `(idx - start) % step == 0`.
+
+For each selected file:
+
+```python
+frame = cv2.imread(str(frame_path))              # H,W,3 BGR uint8 CPU
+frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # H,W,3 RGB uint8 CPU
+frame_rgb = torch.as_tensor(frame).float() / 255.0
+frame_rgb = frame_rgb.cuda()
+return VideoFrame(raw_frame_idx=self.current_frame_idx, rgb=frame_rgb)
+```
+
+The resulting `VideoFrame` initially has:
+
+```python
+VideoFrame(
+    raw_frame_idx=<integer index in sorted file list>,
+    rgb=<CUDA tensor, shape H x W x 3, float32, range 0..1>,
+    pose=None,
+    camera_type=None,
+    intrinsics=None,
+    instance=None,
+    instance_phrases=None,
+    mask=None,
+    metric_depth=None,
+    depth_confidence=None,
+)
+```
+
+### Branches
+
+| Branch | Behavior |
+| --- | --- |
+| `frame_end == -1` | Uses all files through the end. |
+| `frame_skip > 1` | Reads every `frame_skip`-th image and divides FPS by `frame_skip`. |
+| `streams.cached=true` | `FrameDirStreamList` wraps the stream in an eager `ProcessedVideoStream(...).cache(online=False)`. Current command does not set this. |
+| Image read fails | Raises `ValueError`. |
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-2-toy) for the matching numeric example for this chunk.
+
+## Chunk 3: Initial Stream Processors: GeoCalib Intrinsics And Track Anything Masks
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/pipeline/default.py` | Builds the initialization processors |
+| `vipe/pipeline/processors.py` | `GeoCalibIntrinsicsProcessor`, `TrackAnythingProcessor` |
+| `vipe/priors/geocalib/*` | GeoCalib model and LM optimizer |
+| `vipe/priors/track_anything/*` | GroundingDINO, SAM, AOT object tracking |
+| `vipe/utils/morph.py` | Erosion used to shrink valid masks |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Raw FrameDirStream] --> B[_add_init_processors]
+    B --> C[Assert no existing intrinsics, camera type, depth, instance]
+    C --> D[GeoCalibIntrinsicsProcessor constructor]
+    D --> D1[Read sample frames through temporary CachedVideoStream]
+    D1 --> D2[GeoCalib calibrate shared intrinsics]
+    D2 --> D3[Store one fov_y]
+    C --> E{init.instance is not null?}
+    E -->|yes| F[TrackAnythingProcessor constructor]
+    E -->|no| G[No object mask processor]
+    F --> H[ProcessedVideoStream raw + processors]
+    D3 --> H
+    G --> H
+    H --> I[cache online=True]
+    I --> J[CachedVideoStream lazily stores initialized frames on CPU]
+```
+
+### Pipeline Construction
+
+`DefaultAnnotationPipeline._add_init_processors(video_stream)` first asserts that the raw frame stream has none of these attributes:
+
+```python
+FrameAttribute.INTRINSICS
+FrameAttribute.CAMERA_TYPE
+FrameAttribute.METRIC_DEPTH
+FrameAttribute.INSTANCE
+```
+
+Then it always appends:
+
+```python
+GeoCalibIntrinsicsProcessor(video_stream, camera_type=self.camera_type)
+```
+
+Because the current config has `pipeline.init.instance` populated, it also appends:
+
+```python
+TrackAnythingProcessor(
+    self.init_cfg.instance.phrases,
+    add_sky=self.init_cfg.instance.add_sky,
+    sam_run_gap=int(video_stream.fps() * self.init_cfg.instance.kf_gap_sec),
+)
+```
+
+With your normal command:
+
+```text
+fps = 30
+kf_gap_sec = 2.0
+sam_run_gap = int(30 * 2.0) = 60
+```
+
+With the toy sequence:
+
+```text
+fps = 2
+kf_gap_sec = 2.0
+sam_run_gap = int(2 * 2.0) = 4
+```
+
+The processors are wrapped in:
+
+```python
+ProcessedVideoStream(video_stream, init_processors).cache("process", online=True)
+```
+
+`online=True` means `CachedVideoStream` is created but not fully consumed immediately. Frames are loaded and processed lazily when SLAM asks for them. Each loaded processed frame is stored on CPU inside `CachedVideoStream.data`, then returned on CUDA when indexed.
+
+### GeoCalib Intrinsics Computation
+
+`GeoCalibIntrinsicsProcessor` inherits from `IntrinsicEstimationProcessor`.
+
+First, `IntrinsicEstimationProcessor.__init__` computes sample indices:
+
+```python
+gap_frame = int(gap_sec * video_stream.fps())
+gap_frame = min(gap_frame, (len(video_stream) - 1) // 2)
+self.sample_frame_inds = [0, gap_frame, gap_frame * 2]
+```
+
+Default `gap_sec` is `1.0`.
+
+For a real ScanNet run at `fps=30` with 5578 frames:
+
+```text
+gap_frame = min(30, (5578 - 1) // 2) = 30
+sample_frame_inds = [0, 30, 60]
+```
+
+For the toy sequence:
+
+```text
+gap_frame = min(int(1.0 * 2), (10 - 1)//2) = min(2, 4) = 2
+sample_frame_inds = [0, 2, 4]
+```
+
+`GeoCalibIntrinsicsProcessor.__init__` then:
+
+1. Asserts `camera_type == CameraType.PINHOLE`.
+2. Constructs `GeoCalib(weights="pinhole").cuda()`.
+3. Creates a temporary `CachedVideoStream(video_stream)`.
+4. Reads sample frames by index:
+   ```python
+   sample_frames = torch.stack([indexable_stream[i].rgb.moveaxis(-1, 0) for i in self.sample_frame_inds])
+   ```
+   Shape is `(3, 3, H0, W0)`.
+5. Calls:
+   ```python
+   res = model.calibrate(sample_frames, shared_intrinsics=True)
+   ```
+6. Stores:
+   ```python
+   self.fov_y = res["camera"].vfov[0].item()
+   self.camera_type = camera_type
+   ```
+
+GeoCalib internal sequence:
+
+```mermaid
+flowchart TD
+    A[3 RGB sample frames C,H,W in range 0..1] --> B[ImagePreprocessor resize short side to 320, edge divisible by 32]
+    B --> C[MSCAN high-level features]
+    B --> D[LowLevelEncoder features]
+    C --> E[PerspectiveDecoder]
+    D --> E
+    E --> F[up_field, up_confidence]
+    E --> G[latitude_field, latitude_confidence]
+    F --> H[LMOptimizer]
+    G --> H
+    H --> I[Initialize camera from 0.7 * max(h,w) focal]
+    I --> J[Iteratively optimize gravity and focal]
+    J --> K[Return camera vfov]
+```
+
+The calibration model predicts dense perspective fields:
+
+| Field | Shape after postprocess | Meaning |
+| --- | --- | --- |
+| `up_field` | `(B, 2, H, W)` | 2D image-space up direction |
+| `up_confidence` | `(B, H, W)` | Confidence for up field |
+| `latitude_field` | `(B, 1, H, W)` | Predicted latitude angle |
+| `latitude_confidence` | `(B, H, W)` | Confidence for latitude |
+
+`LMOptimizer` creates an initial pinhole camera and gravity, computes analytic perspective fields for that camera, and minimizes residuals between predicted fields and analytic fields. It uses Huber-weighted residuals and Levenberg-Marquardt updates. With `shared_intrinsics=True`, all 3 sample frames share the same optimized focal length, but each frame can have its own gravity estimate.
+
+For every frame later, `GeoCalibIntrinsicsProcessor.__call__` sets the actual ViPE intrinsics:
+
+```python
+frame_height, frame_width = frame.size()
+fx = fy = frame_height / (2 * np.tan(self.fov_y / 2))
+frame.intrinsics = torch.as_tensor([fx, fy, frame_width / 2, frame_height / 2]).float()
+frame.camera_type = self.camera_type
+```
+
+Important: this code uses image height to compute both `fx` and `fy` from vertical FOV. `cx` and `cy` are image center coordinates.
+
+### Track Anything Mask Computation
+
+Current config has these phrases:
+
+```yaml
+phrases:
+  - person
+  - animal
+  - vehicle
+  - ball
+  - balloon
+  - gun
+  - pet
+  - car
+  - bus
+add_sky: true
+```
+
+`TrackAnythingProcessor.__init__` mutates the phrase list by appending `"sky"` when `add_sky` is true:
+
+```python
+if self.add_sky:
+    self.mask_phrases.append(VideoFrame.SKY_PROMPT)
+```
+
+It constructs:
+
+```python
+TrackAnythingPipeline(self.mask_phrases, sam_points_per_side=50, sam_run_gap=self.sam_run_gap)
+```
+
+`TrackAnythingPipeline` downloads or loads checkpoints if missing:
+
+| Model | Purpose |
+| --- | --- |
+| SAM ViT-B | Segment boxes into masks |
+| AOT / DeAOT | Track object masks over time |
+| GroundingDINO | Detect boxes for text phrases |
+
+For each frame, `TrackAnythingProcessor.__call__`:
+
+```python
+frame.instance, frame.instance_phrases = self.tracker.track(frame)
+frame_instance_mask = frame.instance == 0
+if self.add_sky:
+    frame_instance_mask |= frame.sky_mask
+frame.mask = erode(frame_instance_mask, self.mask_expand)
+```
+
+Interpretation:
+
+| Tensor | Shape | Meaning |
+| --- | --- | --- |
+| `frame.instance` | `(H0, W0)` uint8 | `0` means background, positive ids are tracked/detected instances |
+| `frame.instance_phrases` | dict | maps instance id to phrase, for example `{0: "background", 1: "person", 2: "sky"}` |
+| `frame.sky_mask` | `(H0, W0)` bool | true where instance phrase is exactly `"sky"` |
+| `frame.mask` | `(H0, W0)` bool | true means valid for SLAM; false means invalid/dynamic/masked out |
+
+The code treats background as valid. It also treats sky as valid if `add_sky=true`. Other detected phrases are invalid. Then erosion shrinks the valid region. Erosion with `mask_expand=5` means a valid pixel remains valid only if all pixels in a local `5 x 5` neighborhood are valid after padding. This removes thin uncertain boundaries near masked objects.
+
+Track Anything branch behavior inside `TrackAnythingPipeline.track`:
+
+| Frame condition | Computation |
+| --- | --- |
+| `frame_idx == 0` | GroundingDINO detects text boxes, SAM segments boxes, AOT receives first reference mask. |
+| `frame_idx % sam_run_gap == 0` | GroundingDINO+SAM detect new objects, AOT tracks existing objects, new objects are added if mostly not already tracked. |
+| Otherwise | AOT tracks existing objects only and optionally updates memory. |
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-3-toy) for the matching numeric example for this chunk.
+
+## Chunk 4: SLAM Standard Resize, Graph Buffer, And Model Setup
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/slam/system.py` | `SLAMSystem`, resize processor, two SLAM passes |
+| `vipe/slam/components/buffer.py` | Persistent keyframe graph state |
+| `vipe/slam/networks/droid_net.py` | DROID feature/context/update networks |
+| `vipe/priors/depth/dav3.py` | DAV3 metric depth used on SLAM keyframes |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Initialized CachedVideoStream] --> B[SLAMSystem.run]
+    B --> C[Wrap each stream in StandardResizeStreamProcessor]
+    C --> D[Compute resized frame size]
+    D --> E[Update config: height, width, n_views, camera_type, has_init_pose]
+    E --> F[_build_components]
+    F --> F1[DroidNet]
+    F --> F2[GraphBuffer tensors]
+    F --> F3[MotionFilter]
+    F --> F4[SLAMFrontend]
+    F --> F5[SLAMBackend]
+    F --> F6[InnerFiller]
+    F --> F7[DAV3 metric depth model for keyframes]
+```
+
+### Standard Resize And Crop
+
+SLAM never works at the original frame size directly. It wraps the initialized stream with:
+
+```python
+ProcessedVideoStream(video_stream, [StandardResizeStreamProcessor()])
+```
+
+For each frame, `StandardResizeStreamProcessor._compute_frame_size_crop` computes:
+
+```python
+h0, w0 = previous_frame_size
+scale_factor = sqrt((384 * 512) / (h0 * w0))
+h1 = int(h0 * scale_factor)
+w1 = int(w0 * scale_factor)
+
+crop_h = h1 % 8
+crop_w = w1 % 8
+crop_top = crop_h // 2
+crop_bottom = crop_h - crop_top
+crop_left = crop_w // 2
+crop_right = crop_w - crop_left
+
+self.fac_x = w0 / w1
+self.fac_y = h0 / h1
+self.scx = crop_left
+self.scy = crop_top
+```
+
+Then `__call__` does:
+
+```python
+frame_data = frame_data.resize((h1, w1))
+frame_data = frame_data.crop(top=crop_top, bottom=crop_bottom, left=crop_left, right=crop_right)
+```
+
+`VideoFrame.resize` changes:
+
+| Field | Resize rule |
+| --- | --- |
+| `rgb` | bilinear interpolation |
+| `mask` | bilinear interpolation then `> 0.9` |
+| `instance` | nearest interpolation |
+| `metric_depth` | bilinear interpolation if present |
+| `depth_confidence` | bilinear interpolation if present |
+| `intrinsics` | `fx,cx` scaled by `w1/w0`, `fy,cy` scaled by `h1/h0` |
+
+`VideoFrame.crop` changes:
+
+| Field | Crop rule |
+| --- | --- |
+| `rgb`, `mask`, `instance`, `metric_depth`, `depth_confidence` | slice `[top:bottom, left:right]` |
+| `intrinsics` | `cx -= left`, `cy -= top` |
+
+The resized dimensions must be divisible by 8 because DROID features and disparities live at `1/8` resolution.
+
+### GraphBuffer State
+
+After resize, `SLAMSystem.run` sets config values:
+
+```python
+self.config.update({
+    "height": frame_size[0],
+    "width": frame_size[1],
+    "n_views": len(video_streams),
+    "has_init_pose": FrameAttribute.POSE in video_streams[0].attributes(),
+    "camera_type": camera_type,
+})
+```
+
+For the current standalone path:
+
+```text
+n_views = 1
+has_init_pose = false
+camera_type = PINHOLE
+```
+
+`GraphBuffer` allocates fixed-size CUDA tensors:
+
+| Buffer | Toy shape | Meaning |
+| --- | --- | --- |
+| `tstamp` | `(1024,)` | raw frame index for each keyframe/buffer frame |
+| `images` | `(1024,1,3,384,512)` float16 | resized RGB images |
+| `poses` | `(1024,7)` | SE3 world-to-camera pose as translation + quaternion |
+| `intrinsics` | `(1,4)` | resized pinhole intrinsics |
+| `rig` | `(1,7)` | camera rig transform, identity for single view |
+| `disps` | `(1024,1,48,64)` | optimized inverse depth/disparity |
+| `disps_sens` | `(1024,1,48,64)` | DAV3 metric inverse-depth anchor |
+| `masks` | `(1024,1,48,64)` bool | true means invalid |
+| `fmaps` | `(1024,1,128,48,64)` half | DROID feature maps |
+| `nets` | `(1024,1,128,48,64)` half | DROID GRU hidden state |
+| `inps` | `(1024,1,128,48,64)` half | DROID context input |
+| `cross_view_idx` | `(1024,1,2)` | unused in single-view except identity bookkeeping |
+
+`poses` and `rig` are initialized to identity:
+
+```text
+[tx, ty, tz, qx, qy, qz, qw] = [0, 0, 0, 0, 0, 0, 1]
+```
+
+`disps` is initialized to `init_disp`, default `1.0`. That corresponds to initial depth `1 / 1.0 = 1.0 m`.
+
+### DROID Network Setup
+
+`DroidNet()` contains:
+
+| Module | Purpose |
+| --- | --- |
+| `fnet = BasicEncoder(output_dim=128, norm_fn="instance")` | Feature maps for correlation |
+| `cnet = BasicEncoder(output_dim=256, norm_fn="none")` | Context split into hidden state and input |
+| `update = UpdateModule()` | RAFT/DROID-style recurrent update that predicts coordinate deltas, weights, and damping |
+
+`load_weights` checks:
+
+```python
+ckpt_path = Path(torch.hub.get_dir()) / "droid_slam" / "droid.pth"
+```
+
+If missing, it downloads the DROID checkpoint, strips `module.` prefixes, adapts the 4-channel original output heads down to 2 channels, loads weights, and sets eval mode.
+
+### Keyframe DAV3 Metric Depth Model
+
+Because config has:
+
+```yaml
+pipeline:
+  slam:
+    keyframe_depth: dav3
+```
+
+`SLAMSystem._build_components` creates:
+
+```python
+self.metric_depth = make_depth_model("dav3")
+```
+
+This is `DepthAnything3Model`, using:
+
+```python
+DepthAnything3.from_pretrained("depth-anything/DA3METRIC-LARGE")
+```
+
+This keyframe model is separate from the final post-processing multiview DAV3 model. It is used to anchor SLAM keyframe inverse depths during bundle adjustment.
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-4-toy) for the matching numeric example for this chunk.
+
+## Chunk 5: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/slam/system.py` | Pass 1 loop, `_precompute_features`, `_add_keyframe` |
+| `vipe/slam/components/motion_filter.py` | Keyframe decision |
+| `vipe/slam/components/frontend.py` | Warmup, incremental graph updates, keyframe pruning |
+| `vipe/slam/components/factor_graph.py` | Correlation, update operator, graph edges |
+| `vipe/slam/components/buffer.py` | Dense BA call and frame-distance metric |
+| `vipe/slam/ba/*` | Sparse solver and residual terms |
+| `vipe/slam/maths/geom.py` | Inverse projection, projection, SE3 transforms |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[SLAM Pass 1 frame loop] --> B[_precompute_features]
+    B --> C[images V,C,H,W and invalid masks V,h,w]
+    C --> D[MotionFilter.check]
+    D --> E{First frame or dense motion > threshold or last frame?}
+    E -->|yes| F[_add_keyframe phase 1]
+    E -->|no| G[Do not add to GraphBuffer]
+    F --> H[Store image, features, context, mask, intrinsics, DAV3 inverse depth]
+    G --> I[frontend.run]
+    H --> I
+    I --> J{Frontend initialized?}
+    J -->|no and n_frames == warmup| K[Initialize graph with neighborhood factors]
+    J -->|yes and new keyframe exists| L[Incremental graph update]
+    J -->|otherwise| M[No frontend operation]
+    K --> N[Graph update and BA]
+    L --> N
+    N --> O{Prune second-newest keyframe if too close}
+    O -->|distance < keyframe_thresh| P[Remove keyframe]
+    O -->|distance >= keyframe_thresh| Q[Keep keyframe]
+```
+
+### Per-Frame Feature Precomputation
+
+Each pass-1 iteration receives `frame_data_list` from:
+
+```python
+for frame_idx, frame_data_list in enumerate(zip(*video_streams)):
+```
+
+In standalone single-view mode:
+
+```python
+len(frame_data_list) == 1
+```
+
+`_precompute_features(frame_data_list)`:
+
+```python
+images_list = []
+masks_list = []
+for frame_data in frame_data_list:
+    images_list.append(frame_data.rgb)
+    if frame_data.mask is not None:
+        mask_height, mask_width = frame_data.mask.shape
+        mask_height, mask_width = mask_height // 8, mask_width // 8
+        mask = interpolate(frame_data.mask[None,None].float(), (mask_height,mask_width), mode="bilinear")[0,0] > 0.9
+        masks_list.append(~mask)
+images = rearrange(torch.stack(images_list), "n h w c -> n c h w")
+masks = torch.stack(masks_list) if masks_list else None
+```
+
+Output shapes for toy:
+
+```python
+images.shape == (1, 3, 384, 512)
+masks.shape == (1, 48, 64)
+```
+
+`masks` is true where invalid.
+
+### MotionFilter Keyframe Decision
+
+`MotionFilter.check(images, buffer_masks)` runs on every frame.
+
+First frame branch:
+
+```python
+if not self.initialized:
+    net, inp = self.net.encode_context(images)
+    self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
+    self.f_mask = buffer_masks
+    self.current_frame_idx = 0
+    self.last_kf_frame_idx = 0
+    self.initialized = True
+    return True
+```
+
+So the first frame is always a keyframe.
+
+Later-frame branch:
+
+1. Encode current feature map:
+   ```python
+   gmap = self.net.encode_features(images)
+   ```
+   Toy shape: `(1,128,48,64)`.
+2. Create low-res coordinate grid:
+   ```python
+   coords0.shape == (1,1,48,64,2)
+   ```
+   Pixel `(x=10,y=5)` has coordinate `[10,5]`.
+3. Build correlation between last keyframe feature map and current feature map:
+   ```python
+   corr = CorrBlock(self.f_fmap[None], gmap[None])(coords0)
+   ```
+4. Run one learned DROID update:
+   ```python
+   _, delta, weight = self.net.update.forward(self.f_net[None], self.f_inp[None], corr)
+   ```
+   `delta.shape == (1,1,48,64,2)`.
+5. Compute per-pixel flow magnitude:
+   ```python
+   dense_flow = delta.norm(dim=-1)[0]  # shape (1,48,64)
+   ```
+6. If a mask exists, average only valid pixels from the last keyframe:
+   ```python
+   f_weight = (~self.f_mask).float()
+   dense_motion_score = (dense_flow * f_weight).mean([1,2]) / (f_weight.mean([1,2]) + 1e-6)
+   ```
+7. For multiple views, take the minimum across views. For standalone this is one value.
+8. Return `True` if:
+   ```python
+   dense_motion_score > self.thresh
+   ```
+   Default threshold is `2.4`.
+
+`SLAMSystem.run` also forces the last frame to be a keyframe:
+
+```python
+if self.motion_filter.check(images, buffer_masks) or frame_idx == total_n_frames - 1:
+    is_keyframe = True
+```
+
+### Keyframe Addition
+
+When a frame is accepted as a keyframe, `_add_keyframe(..., phase=1)` runs.
+
+Let:
+
+```python
+kf_idx = self.buffer.n_frames
+```
+
+The function stores:
+
+```python
+self.buffer.tstamp[kf_idx] = frame_idx
+self.buffer.images[kf_idx] = images
+self.buffer.fmaps[kf_idx] = self.droid_net.encode_features(images)
+self.buffer.nets[kf_idx], self.buffer.inps[kf_idx] = self.droid_net.encode_context(images)
+if buffer_masks is not None:
+    self.buffer.masks[kf_idx] = buffer_masks
+```
+
+For each view:
+
+```python
+if kf_idx == 0:
+    self.buffer.intrinsics[view_idx] = frame_data.intrinsics
+```
+
+If the frame already has metric depth, it samples it into `disps_sens`. In current initialized frames, metric depth is not present yet, so this part is normally skipped before DAV3 keyframe depth.
+
+If an input pose exists and phase is 1, it stores that pose. In current standalone frame-dir runs, input poses are not present, so this is skipped:
+
+```python
+if frame_data.pose is not None and phase == 1:
+    self.buffer.poses[kf_idx] = (SE3(self.buffer.rig[view_idx]) * frame_data.pose.inv()).data
+```
+
+Then phase 1 runs keyframe DAV3:
+
+```python
+self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx)
+```
+
+`GraphBuffer.update_disps_sens` creates:
+
+```python
+DepthEstimationInput(
+    rgb=self.images[frame_idx].moveaxis(1, -1).float(),  # V,H,W,3
+    intrinsics=self.intrinsics[0],
+    camera_type=self.camera_type,
+)
+```
+
+`DepthAnything3Model.estimate`:
+
+1. Converts RGB to uint8 numpy list.
+2. Runs `DA3METRIC-LARGE` single-image metric depth:
+   ```python
+   self.model.inference(rgb_images, process_res_method="upper_bound_resize", process_res=504)
+   ```
+3. Computes focal scaling:
+   ```python
+   dav3_camera_focal = focal_length / max(width, height) * 504
+   dav3_metric_depth = dav3_result.depth * dav3_camera_focal / 300.0
+   ```
+4. Zeroes sky depth from DA3 sky mask.
+5. Interpolates to the SLAM image size.
+
+Back in `GraphBuffer.update_disps_sens`, ViPE converts metric depth to inverse depth at the DROID grid sample positions:
+
+```python
+disp_sens = metric_depth[:, 3::8, 3::8]
+disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
+self.disps_sens[frame_idx] = disp_sens
+```
+
+For a `384 x 512` SLAM image, `3::8` gives `48` rows and `64` columns. It samples pixel centers offset by 3 at each 8-pixel block.
+
+Finally:
+
+```python
+self.buffer.n_frames += 1
+```
+
+### Frontend Initialization
+
+`self.frontend.run()` is called every frame, but it only acts when enough keyframes are present or a new keyframe arrives after initialization.
+
+Initialization branch:
+
+```python
+if not self.is_initialized and self.video.n_frames == self.warmup:
+    self.__initialize()
+```
+
+Default `warmup=8`.
+
+`__initialize`:
+
+1. Sets:
+   ```python
+   self.t1 = self.video.n_frames
+   ```
+2. Adds neighborhood factors:
+   ```python
+   self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
+   ```
+   Current config has `seq_init=true`, so `r=1`.
+3. Runs 8 graph updates:
+   ```python
+   for _ in range(8):
+       self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose)
+   ```
+4. If `seq_init=false`, it would also add proximity factors and run 8 more updates. Current config does not use that branch.
+5. If no initial poses exist, initialize the next pose by constant velocity:
+   ```python
+   self.__init_pose()
+   ```
+6. Set next disparity initial value to mean of recent disparities:
+   ```python
+   self.video.disps[self.t1, v] = self.video.disps[self.t1 - 4:self.t1, v].mean()
+   ```
+7. Mark all warmup frames dirty for visualization.
+8. Set `self.is_initialized=True`.
+9. Remove factors older than `warmup - 4`, storing them as inactive:
+   ```python
+   self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
+   ```
+
+### Frontend Incremental Update
+
+After initialization, when a new keyframe exists:
+
+```python
+elif self.is_initialized and self.t1 < self.video.n_frames:
+    self.__update()
+```
+
+`__update`:
+
+1. Increments optimized keyframe count:
+   ```python
+   self.t1 += 1
+   ```
+2. Drops old active factors whose age is too high:
+   ```python
+   self.graph.rm_factors(self.graph.age > self.max_age, store=True)
+   ```
+3. Adds proximity factors:
+   ```python
+   self.graph.add_proximity_factors(
+       self.t1 - 5,
+       max(self.t1 - self.frontend_window, 0),
+       rad=self.frontend_radius,
+       nms=self.frontend_nms,
+       thresh=self.frontend_thresh,
+       beta=self.beta,
+       remove=True,
+   )
+   ```
+4. Runs 4 graph updates:
+   ```python
+   for _ in range(self.iters1):  # iters1 = 4
+       self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+   ```
+5. Computes dense-disparity frame distance between the second-newest and third-newest keyframes:
+   ```python
+   d = self.video.frame_distance_dense_disp(t1-3, t1-2, beta=self.beta, bidirectional=True)
+   ```
+6. If `d.max() < keyframe_thresh`, remove the second-newest keyframe:
+   ```python
+   self.graph.rm_second_newest_keyframe(self.t1 - 2)
+   self.t1 -= 1
+   ```
+7. Else run 2 more graph updates:
+   ```python
+   for _ in range(self.iters2):  # iters2 = 2
+       self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+   ```
+8. Predict initial pose and disparity for the next possible keyframe.
+
+### Factor Graph Update
+
+`FactorGraph.update` is the central DROID-style learned optimization step.
+
+For all active graph edges `(i,j)`:
+
+1. Reproject current dense disparity from source frame `i` into target frame `j`:
+   ```python
+   coords1, _ = self.buffer.reproject_dense_disp(self.ii, self.jj)
+   coords1.shape == (num_edges * n_views, 48, 64, 2)
+   ```
+2. Build motion features:
+   ```python
+   motn = torch.cat([coords1 - coords0, self.target - coords1], dim=-1)
+   ```
+   Per low-res pixel, this is:
+   ```text
+   [current_rigid_flow_x, current_rigid_flow_y, previous_residual_x, previous_residual_y]
+   ```
+3. Sample correlation features at `coords1`:
+   ```python
+   corr = self.corr(coords1)
+   ```
+4. Run learned update:
+   ```python
+   self.f_net, delta, weight, damping, _ = self.net.update.forward(...)
+   ```
+   Outputs:
+   | Output | Shape | Meaning |
+   | --- | --- | --- |
+   | `delta` | `(1,E*V,48,64,2)` | learned correction to projected coordinates |
+   | `weight` | `(1,E*V,48,64,2)` | per-residual confidence in x and y |
+   | `damping` | `(1,unique_dense_disps,48,64)` | dense disparity damping |
+5. Zero weights at invalid mask pixels:
+   ```python
+   weight[:, self.buffer.masks[pi, qi]] = 0.0
+   ```
+6. Set new target coordinates:
+   ```python
+   self.target = coords1 + delta
+   self.weight = weight
+   self.damping[di] = damping
+   ```
+7. Run dense bundle adjustment:
+   ```python
+   self.buffer.bundle_adjustment(...)
+   ```
+
+### Dense Bundle Adjustment Terms
+
+`GraphBuffer.bundle_adjustment` builds a `Solver` with two active term families in the current reduced path:
+
+| Term | Active when | Residual |
+| --- | --- | --- |
+| `DenseDepthFlowTerm` | Always for graph edges | projected coordinate minus learned target coordinate |
+| `DispSensRegularizationTerm` | When `disps_sens` exists for a keyframe | optimized disparity minus DAV3 inverse depth |
+
+The dense flow term is:
+
+```text
+E = proj_j( rig_j^-1 * pose_j * pose_i^-1 * rig_i * iproj_i(disparity_i) ) - target_ij
+```
+
+For single-view `rig_i = rig_j = identity`, so:
+
+```text
+E = proj_j( pose_j * pose_i^-1 * iproj_i(disparity_i) ) - target_ij
+```
+
+The projection math for pinhole:
+
+```text
+Given disparity d = 1 / depth.
+For low-res pixel coordinate (u,v):
+X = (u - cx) / fx
+Y = (v - cy) / fy
+homogeneous inverse-projected point = [X, Y, 1, d]
+```
+
+After SE3 transform, projection:
+
+```text
+x = fx * X/Z + cx
+y = fy * Y/Z + cy
+```
+
+The solver:
+
+1. Evaluates residuals and Jacobians.
+2. Builds sparse normal equations `J^T W J x = -J^T W r`.
+3. Applies damping.
+4. Marginalizes dense disparity with Schur complement.
+5. Solves the reduced sparse system with SciPy sparse `spsolve`.
+6. Applies updates using retractions:
+   | Variable | Retraction |
+   | --- | --- |
+   | `pose` | SE3 pose retraction |
+   | `dense_disp` | dense disparity additive/retracted update |
+   | `intrinsics` | fixed in your command |
+   | `rig` | fixed in standalone single-view |
+
+Because `pipeline.slam.optimize_intrinsics=false`, the frontend does not optimize intrinsics. They remain the GeoCalib estimate at resized scale.
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-toy) for the matching numeric example for this chunk.
+
+## Chunk 6: Backend Global BA And SLAM Map Extraction
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/slam/components/backend.py` | Global BA over keyframes |
+| `vipe/slam/components/factor_graph.py` | Batch graph update with low-memory correlation |
+| `vipe/slam/components/buffer.py` | Global frame-distance graph and map extraction |
+| `vipe/slam/interface.py` | `SLAMMap`, `SLAMOutput` |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Pass 1 complete with keyframes] --> B[backend.run steps=7]
+    B --> C[Build non-incremental FactorGraph]
+    C --> D[Add backend proximity factors]
+    D --> E{Any graph edges?}
+    E -->|yes| F[update_batch with AltCorrBlock]
+    E -->|no| G[Use sensor depth for single keyframe]
+    F --> H[Dense BA over all keyframes]
+    H --> I[backend.run steps=backend_iters]
+    I --> J[Another global BA pass]
+    J --> K[extract_slam_map]
+    K --> L[Inverse project optimized keyframe disparities]
+    L --> M[Depth consistency filtering]
+    M --> N[SLAMMap with xyz, rgb, packinfo, keyframe frame ids]
+```
+
+### Backend Graph Creation
+
+After pass 1:
+
+```python
+self.backend.run(7, log=self.visualize)
+self.backend.run(self.config.backend_iters, update_depth=False, log=self.visualize)
+```
+
+Default:
+
+```text
+backend_iters = 24
+```
+
+`SLAMBackend.run` creates a fresh non-incremental `FactorGraph`:
+
+```python
+graph = FactorGraph(
+    self.net,
+    self.video,
+    self.device,
+    max_factors=16 * t,
+    incremental=False,
+    cross_view=self.args.cross_view,
+)
+```
+
+For standalone single-view, `cross_view` becomes false inside `FactorGraph` because `buffer.n_views == 1`.
+
+The backend adds denser proximity factors:
+
+```python
+graph.add_proximity_factors(
+    rad=self.args.backend_radius,
+    nms=self.args.backend_nms,
+    thresh=self.args.backend_thresh,
+    beta=self.args.beta,
+)
+```
+
+Defaults:
+
+```text
+backend_radius = 2
+backend_nms = 3
+backend_thresh = 22.0
+beta = 0.3
+```
+
+`add_proximity_factors` adds:
+
+1. Local neighborhood edges around each keyframe.
+2. Additional edges whose frame-distance score is below threshold.
+3. Bidirectional pairs for accepted edges.
+
+### Backend Batch Update
+
+If the graph has edges and `self.depth_model is not None`, the backend calls `_iterate_with_depth`.
+
+Current config has keyframe DAV3 depth, so the depth branch is active.
+
+`_iterate_with_depth(graph, steps, more_iters)`:
+
+```python
+steps_preintr = steps // 2
+steps_postintr = steps - steps_preintr
+graph.update_batch(..., steps=steps_preintr, optimize_intrinsics=self.args.optimize_intrinsics)
+self.video.update_disps_sens(self.depth_model, frame_idx=None)
+graph.update_batch(..., steps=steps_postintr, optimize_intrinsics=False)
+```
+
+Because your command has `optimize_intrinsics=false`, both backend halves keep intrinsics fixed. `update_disps_sens(frame_idx=None)` checks whether intrinsics changed. If they did not change, it returns early:
+
+```python
+if torch.allclose(self.last_depth_intrinsics, self.intrinsics):
+    return
+```
+
+The second call `backend.run(..., update_depth=False)` still enters `_iterate_with_depth` because the current code ignores the `update_depth` argument. In practice the DAV3 sensor depth recomputation usually short-circuits when intrinsics are unchanged.
+
+`FactorGraph.update_batch` uses `AltCorrBlock` instead of materializing all correlation volumes:
+
+```python
+corr_op = AltCorrBlock(self.buffer.flattened_fmaps[None])
+```
+
+For each batch step:
+
+1. Reproject current dense disparities to get `coords1`.
+2. Build motion features.
+3. Process graph edges in source-index chunks of size `s=8`.
+4. Sample alt correlation only for the chunk.
+5. Run the DROID update module.
+6. Update target coordinates, weights, and damping.
+7. Run dense BA over all keyframes.
+
+### SLAM Map Extraction
+
+After backend and pass 2 infill later, `SLAMSystem.run` extracts a keyframe map:
+
+```python
+slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
+slam_map.backend_graph = self.backend.last_graph
+```
+
+Default:
+
+```text
+map_filter_thresh = 0.05
+```
+
+`GraphBuffer.extract_slam_map`:
+
+1. Chooses all keyframe buffer indices if `t_range is None`.
+2. Converts stored world-to-camera poses to camera-to-world:
+   ```python
+   c2w_se3 = SE3(self.poses[t_range]).inv()
+   ```
+3. Takes low-res colors:
+   ```python
+   images = self.images[t_range][..., 3::8, 3::8]
+   ```
+   Toy shape after rearrange: `(K,1,48,64,3)`.
+4. For each view:
+   - Build camera model from resized intrinsics.
+   - Scale intrinsics by `1/8`.
+   - Inverse project every low-res disparity pixel into camera coordinates.
+   - Transform points into world coordinates.
+5. Compute consistency count with `slam_ext.depth_filter`.
+6. Build mask:
+   ```python
+   masks = (
+       (count >= min(2, n_frames - 1))
+       & (disps_v > 0.5 * disps_v.mean(dim=[1,2], keepdim=True))
+       & (~self.masks[t_range, v])
+   )
+   ```
+7. Pack only valid points into `SLAMMap.from_masked_dense_disp`.
+
+`SLAMMap` stores:
+
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `dense_disp_xyz` | `(M,3)` | world-space keyframe map points |
+| `dense_disp_rgb` | `(M,3)` | RGB colors in `0..1` |
+| `dense_disp_packinfo` | `(K,1,2)` | for each keyframe/view: start offset and count in packed point arrays |
+| `dense_disp_frame_inds` | list length `K` | raw frame ids of keyframes |
+| `backend_graph` | `(Q,2)` or `None` | final backend keyframe graph edges |
+
+This SLAM map is not the final saved TSDF/backproject point cloud. It is an internal low-resolution keyframe map used for visualization and multiview depth conditioning.
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-6-toy) for the matching numeric example for this chunk.
+
+## Chunk 7: SLAM Pass 2 And Non-Keyframe Pose Infill
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/slam/system.py` | Pass 2 loop |
+| `vipe/slam/components/inner_filler.py` | Pose interpolation and optimization for every original frame |
+| `vipe/slam/components/factor_graph.py` | Infill graph updates |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Backend keyframe graph complete] --> B[inner_filler.set_start_idx number_of_keyframes]
+    B --> C[SLAM Pass 2 over every frame]
+    C --> D[_add_keyframe phase 2 for every frame]
+    D --> E{Chunk has infill_chunk_size frames or this is last frame?}
+    E -->|no| C
+    E -->|yes| F[InnerFiller.compute]
+    F --> G[Find nearest left and right keyframes by timestamp]
+    G --> H[Initialize pose by SE3 constant-velocity interpolation]
+    H --> I[Build factors keyframe->infilled frame]
+    I --> J[Run 10 motion-only graph updates]
+    J --> K[Append filled poses]
+    K --> L[Reset buffer.n_frames back to keyframe count]
+    L --> M[get_result returns poses for all N frames]
+```
+
+### Computation
+
+After backend, SLAM has optimized only keyframes. Non-keyframe poses are filled in pass 2.
+
+The code sets:
+
+```python
+self.inner_filler.set_start_idx(self.buffer.n_frames)
+```
+
+At this moment, `self.buffer.n_frames` is the number of optimized keyframes.
+
+Then pass 2 loops over every original frame again:
+
+```python
+for frame_idx, frame_data_list in enumerate(zip(*video_streams)):
+    images, buffer_masks = self._precompute_features(frame_data_list)
+    self._add_keyframe(frame_idx, images, buffer_masks, frame_data_list, phase=2)
+    if self.inner_filler.check() or frame_idx == total_n_frames - 1:
+        self.inner_filler.compute()
+```
+
+`_add_keyframe(..., phase=2)` stores every frame after the keyframes in the same `GraphBuffer`, but it does not run `update_disps_sens` because that only happens for `phase == 1`.
+
+`InnerFiller.check()` returns:
+
+```python
+self.video.n_frames - self.start_idx >= self.args.infill_chunk_size
+```
+
+Default:
+
+```text
+infill_chunk_size = 16
+```
+
+So for long scenes, it fills in chunks of 16 appended frames. For the toy 10-frame sequence, it fills once at the last frame.
+
+### Pose Initialization Inside `compute`
+
+Let:
+
+```python
+m_tstamp = self.video.tstamp[self.start_idx:total_frames]  # timestamps for frames to fill
+n_tstamp = self.video.tstamp[:self.start_idx]              # keyframe timestamps
+```
+
+For every infill timestamp, it finds left and right keyframes:
+
+```python
+t0 = torch.searchsorted(n_tstamp, m_tstamp, right=True) - 1
+t1 = torch.where(t0 < self.start_idx - 1, t0 + 1, t0)
+```
+
+So:
+
+| Case | `t0` | `t1` |
+| --- | --- | --- |
+| timestamp before the last keyframe | nearest left keyframe | next keyframe |
+| timestamp at or after last keyframe | last keyframe | same last keyframe |
+
+Then it does SE3 constant-velocity interpolation:
+
+```python
+d_time = n_tstamp[t1] - n_tstamp[t0] + 1e-3
+n_pose = SE3(self.video.poses[:self.start_idx])
+d_pose = n_pose[t1] * n_pose[t0].inv()
+vel = d_pose.log() / d_time.unsqueeze(-1)
+w = vel * (m_tstamp - n_tstamp[t0]).unsqueeze(-1)
+m_pose = SE3.exp(w) * n_pose[t0]
+self.video.poses[self.start_idx:total_frames] = m_pose.data
+```
+
+These poses are world-to-camera because `GraphBuffer.poses` stores inverse/camera poses.
+
+### Optional Dense Disparity Infill Branch
+
+Current config:
+
+```yaml
+infill_dense_disp: false
+```
+
+So the dense disparity branch is not active.
+
+If it were true, `InnerFiller` would:
+
+1. Initialize infill frame disparities from nearest keyframe mean disparity.
+2. Replace with `disps_sens` where available.
+3. Add reverse factors from infilled frame to keyframes.
+4. Optimize both motion and dense disparity.
+
+Current path uses:
+
+```python
+motion_only = not self.args.infill_dense_disp  # true
+```
+
+### Infill Graph Optimization
+
+`InnerFiller.compute` builds a temporary incremental `FactorGraph`:
+
+```python
+graph = FactorGraph(..., max_factors=-1, incremental=True, cross_view=False)
+```
+
+For each infill frame, it adds:
+
+```python
+graph.add_factors(t0, infill_inds)
+graph.add_factors(t1, infill_inds)
+```
+
+That means each infilled frame is constrained by reprojection factors from its left and right neighboring keyframes.
+
+Then:
+
+```python
+for _ in range(10):
+    graph.update(
+        self.start_idx,
+        total_frames,
+        motion_only=True,
+        limited_disp=True,
+    )
+```
+
+Because `motion_only=True`, BA fixes dense disparity and optimizes poses only.
+
+After optimization:
+
+```python
+current_poses = SE3(self.video.poses[self.start_idx:total_frames].clone())
+self.filled_poses.append(current_poses)
+self.video.n_frames = self.start_idx
+```
+
+Resetting `video.n_frames` discards appended infill frames from the keyframe graph buffer, while preserving the filled poses in `self.filled_poses`.
+
+### Return From SLAM
+
+After pass 2:
+
+```python
+filled_return = self.inner_filler.get_result()
+```
+
+`filled_return.poses` has one world-to-camera pose for every original frame.
+
+Then `SLAMSystem.run` returns:
+
+```python
+SLAMOutput(
+    trajectory=filled_return.poses.inv(),  # camera-to-world
+    intrinsics=original_intrinsics,
+    rig=SE3(self.buffer.rig.clone()),
+    slam_map=slam_map,
+)
+```
+
+`original_intrinsics` are recovered from resized/cropped SLAM intrinsics:
+
+```python
+new_intrinsics = after_intrinsics.clone()
+new_intrinsics[2] += crop_left
+new_intrinsics[3] += crop_top
+new_intrinsics[0:4:2] *= fac_x
+new_intrinsics[1:4:2] *= fac_y
+```
+
+For the toy no-crop case:
+
+```text
+after_intrinsics = [332.5536, 332.5536, 256.0, 192.0]
+fac_x = 32 / 512 = 0.0625
+fac_y = 24 / 384 = 0.0625
+original_intrinsics = [20.7846, 20.7846, 16.0, 12.0]
+```
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-7-toy) for the matching numeric example for this chunk.
+
+## Chunk 8: Rebuilding The Output Stream And Assigning SLAM Results
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/pipeline/default.py` | `_rebuild_init_streams`, `_add_post_processors` |
+| `vipe/streams/base.py` | `AssignAttributesProcessor`, `ProcessedVideoStream` |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[SLAMOutput ready] --> B[_rebuild_init_streams]
+    B --> C[Read cached initialized frames from slam_stream.data]
+    C --> D[Extract cached intrinsics, camera type, instance, mask, phrases]
+    D --> E[Clear slam_stream.data and CUDA cache]
+    E --> F[ProcessedVideoStream over original raw stream]
+    F --> G[AssignCachedInitProcessor restores init attributes]
+    G --> H[_add_post_processors]
+    H --> I[AssignAttributesProcessor adds pose and recovered intrinsics]
+    H --> J{post.depth_align_model is not null?}
+    J -->|yes| K[MultiviewDepthProcessor mvd_dav3]
+    J -->|no| L[No final dense depth]
+    K --> M[Final output_stream]
+```
+
+### Rebuilding The Initialized Stream
+
+SLAM consumed `slam_streams`, which are `CachedVideoStream` objects containing initialized frames. Those frames are resized during SLAM, but `slam_stream.data` itself stores CPU copies before the SLAM resize wrapper.
+
+`DefaultAnnotationPipeline._rebuild_init_streams` extracts these cached initialization attributes:
+
+```python
+cached_attributes = [
+    FrameAttribute.INTRINSICS,
+    FrameAttribute.CAMERA_TYPE,
+    FrameAttribute.INSTANCE,
+    FrameAttribute.MASK,
+]
+```
+
+For each attribute:
+
+```python
+attribute_values = [frame.get_attribute(attribute) for frame in cached_frames]
+if any(value is not None for value in attribute_values):
+    stream_attributes[attribute] = attribute_values
+```
+
+It separately records:
+
+```python
+instance_phrases = [frame.instance_phrases for frame in cached_frames]
+```
+
+Then it creates a new stream:
+
+```python
+ProcessedVideoStream(
+    original_video_stream,
+    [AssignCachedInitProcessor(stream_attributes, instance_phrases)],
+)
+```
+
+This stream starts again from original raw images, not resized SLAM frames. As it iterates, `AssignCachedInitProcessor` restores the cached init attributes frame by frame.
+
+Then it frees the old cached frames:
+
+```python
+slam_stream.data = []
+slam_stream.iterator = None
+gc.collect()
+torch.cuda.empty_cache()
+```
+
+### Assigning Poses And Intrinsics
+
+For each output stream, `_add_post_processors` creates:
+
+```python
+AssignAttributesProcessor({
+    FrameAttribute.POSE: slam_output.get_view_trajectory(view_idx),
+    FrameAttribute.INTRINSICS: [slam_output.intrinsics[view_idx]] * len(video_stream),
+})
+```
+
+For standalone single-view:
+
+```python
+slam_output.get_view_trajectory(0) = slam_output.trajectory * slam_output.rig[0][None]
+```
+
+Because `rig[0]` is identity, the assigned pose is the SLAM camera-to-world trajectory.
+
+Then, because config has:
+
+```yaml
+pipeline:
+  post:
+    depth_align_model: "mvd_dav3"
+```
+
+it appends:
+
+```python
+MultiviewDepthProcessor(slam_output, model="mvd_dav3")
+```
+
+### ProcessedVideoStream Multi-Pass Behavior
+
+The final output stream has processors:
+
+```text
+AssignCachedInitProcessor
+AssignAttributesProcessor
+MultiviewDepthProcessor
+```
+
+`MultiviewDepthProcessor.n_passes_required = 2`, so the final `ProcessedVideoStream.__iter__` performs two passes:
+
+```python
+for pass_idx in range(self.n_passes_required):
+    iterator = self._build_iterator(pass_idx)
+    if pass_idx != self.n_passes_required - 1:
+        for _ in pbar(iterator, desc=f"Pre-iterating for pass {pass_idx}"):
+            pass
+return iterator
+```
+
+This means:
+
+| Pass | Purpose |
+| --- | --- |
+| pass 0 | Iterate all frames to let `MultiviewDepthProcessor.record_keyframes` save keyframe frames internally. No frames are yielded to artifact writing. |
+| pass 1 | Run DAV3 multiview depth windows and yield final frames with depth. |
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-8-toy) for the matching numeric example for this chunk.
+
+## Chunk 9: Final DAV3 Multiview Depth For Every Frame
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/pipeline/processors.py` | `MultiviewDepthProcessor` |
+| `vipe/streams/base.py` | `VideoFrame.dav3_conditions` |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Final output stream pass 0] --> B[record_keyframes]
+    B --> C[Store frames whose index is in slam_map.dense_disp_frame_inds]
+    C --> D[Final output stream pass 1]
+    D --> E[Build sliding window of up to 10 frames]
+    E --> F{Window full or last frame?}
+    F -->|no| E
+    F -->|yes| G[Probe neighboring keyframes]
+    G --> H[Build DAV3 image, extrinsic, intrinsic lists]
+    H --> I[DepthAnything3 DA3-GIANT multiview inference]
+    I --> J[Interpolate depth/confidence to original frame size]
+    J --> K{Trailing overlap exists?}
+    K -->|yes| L[Linearly blend overlap depths/confidences]
+    K -->|no| M[Use window depths]
+    L --> N[Yield non-overlap frames]
+    M --> N
+    N --> O[Save trailing frames for next overlap]
+```
+
+### Processor State
+
+Constructor:
+
+```python
+self.keyframes_inds = slam_output.slam_map.dense_disp_frame_inds
+self.keyframes_data = []
+self.n_frames = 0
+self.n_passes_required = 2
+self.window_size = 10
+self.overlap_size = 3
+self.secondary_keyframe = False
+```
+
+It loads:
+
+```python
+DepthAnything3.from_pretrained("depth-anything/DA3-GIANT")
+```
+
+This is the final post-SLAM multiview depth model. It is different from the SLAM keyframe single-image metric depth model:
+
+| Use | Model |
+| --- | --- |
+| SLAM keyframe inverse-depth anchor | `depth-anything/DA3METRIC-LARGE` |
+| Final depth for every frame | `depth-anything/DA3-GIANT` |
+
+### Pass 0: Record Keyframes
+
+`record_keyframes`:
+
+```python
+for frame_idx, frame in enumerate(previous_iterator):
+    self.n_frames += 1
+    if frame_idx in self.keyframes_inds:
+        self.keyframes_data.append(frame)
+    yield frame
+```
+
+The pre-iteration in `ProcessedVideoStream.__iter__` consumes these yielded frames only to populate processor state. Artifact writing does not see them yet.
+
+### Pass 1: Sliding Window Depth
+
+`estimate_depth_sliding_window` maintains:
+
+```python
+current_sliding_window: list[VideoFrame]
+current_sliding_window_idx: list[int]
+trailing_depth: torch.Tensor | None
+trailing_confidence: torch.Tensor | None
+```
+
+Each frame is appended until:
+
+```python
+len(current_sliding_window) == window_size or is_last_frame
+```
+
+For each ready window:
+
+1. Find neighboring keyframes for every frame index in the window:
+   ```python
+   sw_keyframe_inds = list(set(sum([self._probe_keyframe_indices(i) for i in current_sliding_window_idx], [])))
+   ```
+2. Remove keyframes already in the sliding window:
+   ```python
+   sw_keyframe_inds = [
+       t for t in sw_keyframe_inds
+       if self.keyframes_inds[t] not in current_sliding_window_idx
+   ]
+   ```
+3. Convert window frames to DAV3 conditions:
+   ```python
+   sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
+   ```
+4. Convert extra keyframe context frames to DAV3 conditions.
+5. Run:
+   ```python
+   dav3_api.inference(
+       list(sw_images + kf_images),
+       extrinsics=np.stack(sw_exts + kf_exts, axis=0),
+       intrinsics=np.stack(sw_ints + kf_ints, axis=0),
+       process_res_method="lower_bound_resize",
+   )
+   ```
+6. Keep only the first `len(sw_images)` outputs, because appended keyframes were context only.
+7. Interpolate depth to the original frame size:
+   ```python
+   sw_depth = interpolate(sw_depth[:, None], frame.size(), mode="bilinear")[:,0]
+   ```
+8. Do the same for confidence if present.
+
+`VideoFrame.dav3_conditions()` returns:
+
+```python
+dav3_rgb = (self.rgb.cpu().numpy() * 255).astype(np.uint8)
+dav3_ext = self.pose.inv().matrix().cpu().numpy()  # world-to-camera
+dav3_int = [[fx,0,cx],[0,fy,cy],[0,0,1]]
+```
+
+Important: ViPE frame pose is camera-to-world. DAV3 receives extrinsics as world-to-camera.
+
+### Overlap Blending
+
+If the current window has trailing depth from the previous window:
+
+```python
+n_interp_frames = len(trailing_depth)
+alpha = torch.linspace(0, 1, n_interp_frames + 2)[1:-1][:, None, None]
+sw_depth[:n_interp_frames] = trailing_depth * (1 - alpha) + sw_depth[:n_interp_frames] * alpha
+```
+
+For default `overlap_size=3`, alpha values are:
+
+```text
+torch.linspace(0,1,5)[1:-1] = [0.25, 0.50, 0.75]
+```
+
+So overlap frame depths are blended:
+
+| Overlap position | Output depth |
+| --- | --- |
+| first overlap | `0.75 * old + 0.25 * new` |
+| second overlap | `0.50 * old + 0.50 * new` |
+| third overlap | `0.25 * old + 0.75 * new` |
+
+Number of yielded frames:
+
+```python
+n_frames_to_yield = window_size - overlap_size if not is_last_frame else len(current_sliding_window)
+```
+
+Default normal window yields `10 - 3 = 7` frames and keeps 3 trailing frames for the next window. Last window yields everything.
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-9-toy) for the matching numeric example for this chunk.
+
+## Chunk 10: Artifact Saving, PCD Fusion, And Visualization
+
+Source files:
+
+| File | Role |
+| --- | --- |
+| `vipe/pipeline/default.py` | Calls `io.save_artifacts` and `save_projection_video` |
+| `vipe/utils/io.py` | Saves RGB, pose, depth, masks, PCD |
+| `vipe/utils/visualization.py` | Projection/depth/instance visualization video |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[Final output_stream] --> B{save_artifacts?}
+    B -->|yes| C[save_artifacts]
+    B -->|no| D[Skip artifact save]
+    C --> E[Iterate output stream with DAV3 depth]
+    E --> F[Write RGB mp4]
+    E --> G[Collect pose matrices]
+    E --> H[Collect intrinsics]
+    E --> I[Write depth EXR files into zip]
+    E --> J[Write instance PNG files into zip]
+    E --> K{pcd_fusion_mode}
+    K -->|backproject| L[Append sampled world points to temporary PLY body]
+    K -->|tsdf| M[Integrate frame into Open3D TSDF volume]
+    L --> N[Write color_backproject.ply]
+    M --> O[Extract TSDF mesh and sample max_points]
+    O --> P[Write color_tsdf.ply]
+    C --> Q[Write pose npz, intrinsics npz, camera txt, mask phrases]
+    D --> R{save_viz?}
+    Q --> R
+    R -->|yes| S[save_projection_video]
+    R -->|no| T[Done]
+```
+
+### Artifact Paths
+
+For input base path:
+
+```text
+/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/color
+```
+
+`FrameDirStream.name()` is the directory basename:
+
+```text
+artifact_name = "color"
+```
+
+With output:
+
+```text
+/robodata/smodak/repos/vipe/outputs/scene00_dav3tsdf
+```
+
+Artifacts are:
+
+| Artifact | Path |
+| --- | --- |
+| RGB video | `outputs/scene00_dav3tsdf/rgb/color.mp4` |
+| Pose npz | `outputs/scene00_dav3tsdf/pose/color.npz` |
+| Depth zip | `outputs/scene00_dav3tsdf/depth/color.zip` |
+| Intrinsics npz | `outputs/scene00_dav3tsdf/intrinsics/color.npz` |
+| Camera type txt | `outputs/scene00_dav3tsdf/intrinsics/color_camera.txt` |
+| Mask zip | `outputs/scene00_dav3tsdf/mask/color.zip` |
+| Mask phrase txt | `outputs/scene00_dav3tsdf/mask/color.txt` |
+| Backproject PCD | `outputs/scene00_dav3tsdf/pcd/color_backproject.ply` |
+| TSDF PCD | `outputs/scene00_dav3tsdf/pcd/color_tsdf.ply` |
+| Info pickle | `outputs/scene00_dav3tsdf/vipe/color_info.pkl` |
+| ViPE viz video | `outputs/scene00_dav3tsdf/vipe/color_vis.mp4` |
+
+Only one PCD is written per run, based on `pcd_fusion_mode`.
+
+### `save_artifacts` Streaming Pass
+
+`save_artifacts` is designed to avoid keeping the whole final sequence in RAM.
+
+It initializes:
+
+```python
+pose_list = []
+intrinsics_list = []
+camera_type_list = []
+instance_phrases_combined = {}
+depth_zip = None
+mask_zip = None
+```
+
+For PCD:
+
+```python
+if pcd_fusion_mode not in {"backproject", "tsdf"}:
+    raise ValueError(...)
+
+pcd_body_file = tempfile.TemporaryFile() if pcd_fusion_mode == "backproject" else None
+pcd_vertex_count = 0
+max_points_per_frame = ceil(max_pcd_points / max(len(final_stream), 1))
+tsdf_volume = _make_tsdf_volume(...) if pcd_fusion_mode == "tsdf" else None
+```
+
+With `max_pcd_points=8,000,000` and a real 5578-frame scene:
+
+```text
+max_points_per_frame = ceil(8,000,000 / 5578) = 1435
+```
+
+With the toy 10-frame sequence:
+
+```text
+max_points_per_frame = ceil(8,000,000 / 10) = 800,000
+```
+
+During iteration, for each final frame:
+
+1. If pose exists, append `(frame_idx, pose.matrix())`.
+2. If intrinsics exist, append `(frame_idx, intrinsics)`.
+3. If camera type exists, append `(frame_idx, camera_type)`.
+4. Write RGB frame to H264 mp4.
+5. If metric depth exists, write `float16` EXR to zip as `00000.exr`, `00001.exr`, etc.
+6. If instance exists, write PNG mask to zip as `00000.png`, `00001.png`, etc.
+7. Merge instance phrase dictionaries.
+8. Update selected PCD fusion mode.
+
+At the end:
+
+1. Close zips.
+2. Save pose npz:
+   ```python
+   np.savez(path, data=pose_data, inds=pose_inds)
+   ```
+3. Save intrinsics npz:
+   ```python
+   np.savez(path, data=intrinsics_data, inds=intrinsics_inds)
+   ```
+4. Save camera type txt.
+5. Save mask phrase txt.
+6. Write selected PCD.
+
+### Backproject PCD Mode
+
+This branch runs when:
+
+```text
+pipeline.output.pcd_fusion_mode=backproject
+```
+
+For each frame, `_backproject_vertices` requires:
+
+```python
+frame_data.metric_depth is not None
+frame_data.pose is not None
+frame_data.intrinsics is not None
+max_points_per_frame > 0
+```
+
+It computes:
+
+```python
+depth = frame_data.metric_depth.detach().cpu().numpy()
+valid = np.isfinite(depth) & (depth > 0.0)
+```
+
+If depth confidence exists:
+
+```python
+confidence = frame_data.depth_confidence.detach().cpu().numpy()
+valid &= (confidence >= mean(confidence) * conf_threshold_coef) & (confidence > 1e-5)
+```
+
+Default:
+
+```text
+conf_threshold_coef = 0.75
+sample_ratio = 0.015
+```
+
+Sampling rule:
+
+| Confidence exists? | Initial sample count |
+| --- | --- |
+| yes | `int(num_valid * sample_ratio)` |
+| no | `num_valid` |
+
+Then:
+
+```python
+sample_count = min(sample_count, max_points_per_frame)
+```
+
+If sampling is needed:
+
+| Confidence exists? | Sampling method |
+| --- | --- |
+| yes | random without replacement with seed `frame_data.raw_frame_idx` |
+| no | deterministic striding |
+
+Backprojection formula:
+
+```python
+ys, xs = np.divmod(valid_flat, width)
+zs = depth.ravel()[valid_flat]
+fx, fy, cx, cy = intrinsics
+
+points_cam[:,0] = (xs - cx) * zs / fx
+points_cam[:,1] = (ys - cy) * zs / fy
+points_cam[:,2] = zs
+points_cam[:,3] = 1.0
+
+points_world = (pose_c2w @ points_cam.T).T[:, :3]
+```
+
+Colors come from the same RGB pixels:
+
+```python
+colors = frame_data.rgb.reshape(-1,3)[valid_flat] * 255
+```
+
+The temporary binary vertex body is written as:
+
+```text
+x float32, y float32, z float32, red uint8, green uint8, blue uint8
+```
+
+At the end, `_write_backproject_pcd` writes the PLY header and copies the temporary body to `pcd/color_backproject.ply`.
+
+### TSDF PCD Mode
+
+This branch runs for your shown command:
+
+```text
+pipeline.output.pcd_fusion_mode=tsdf
+```
+
+It creates:
+
+```python
+o3d.pipelines.integration.ScalableTSDFVolume(
+    voxel_length=pcd_tsdf_voxel_length,
+    sdf_trunc=pcd_tsdf_sdf_trunc,
+    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+)
+```
+
+Defaults:
+
+```text
+voxel_length = 0.02 m
+sdf_trunc = 0.15 m
+depth_trunc = 5.0 m
+```
+
+For every final frame, `_integrate_tsdf_frame`:
+
+1. Checks depth, pose, and intrinsics exist.
+2. Converts invalid depth to zero:
+   ```python
+   depth[~np.isfinite(depth)] = 0.0
+   depth[depth <= 0.0] = 0.0
+   ```
+3. Converts RGB to uint8.
+4. Creates Open3D camera intrinsics:
+   ```python
+   PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+   ```
+5. Creates RGBD image:
+   ```python
+   RGBDImage.create_from_color_and_depth(
+       color,
+       depth,
+       depth_scale=1.0,
+       depth_trunc=5.0,
+       convert_rgb_to_intensity=False,
+   )
+   ```
+6. Converts pose to world-to-camera:
+   ```python
+   w2c = frame_data.pose.inv().matrix().cpu().numpy()
+   ```
+7. Integrates:
+   ```python
+   volume.integrate(rgbd, intrinsics, w2c)
+   ```
+
+Conceptually, the TSDF volume stores a sparse voxel grid. Each voxel stores a truncated signed distance to the closest observed surface plus an integration weight and color. Every depth frame updates voxels near that observed surface. Free space and far-away volume are not represented as a full dense infinite grid; Open3D `ScalableTSDFVolume` allocates blocks as needed.
+
+After all frames:
+
+```python
+mesh = volume.extract_triangle_mesh()
+pcd = mesh.sample_points_uniformly(number_of_points=max_points)
+o3d.io.write_point_cloud(str(out_path.tsdf_pcd_path), pcd, write_ascii=False)
+```
+
+So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled points on the extracted TSDF mesh. The requested sample count is `max_points`, default `8,000,000`.
+
+### Visualization Video
+
+After artifact saving, because `save_viz=true`, pipeline calls:
+
+```python
+viz_stream = io.ArtifactVideoStream(artifact_path) if save_artifacts else output_stream
+save_projection_video(artifact_path.meta_vis_path, viz_stream, slam_output, ...)
+```
+
+Because artifacts were saved, visualization re-reads saved artifacts from disk through `ArtifactVideoStream`.
+
+The default visualization panels are:
+
+```yaml
+viz_attributes: [["rgb", "instance"], ["depth", "pcd"]]
+```
+
+`save_projection_video` writes a grid where:
+
+| Panel | Data source |
+| --- | --- |
+| `rgb` | saved RGB mp4 |
+| `instance` | saved mask zip and phrase txt |
+| `depth` | saved final DAV3 depth zip, displayed as reciprocal depth color map |
+| `pcd` | internal low-res `slam_output.slam_map` projected into each frame |
+
+Important: the `pcd` visualization panel does not project `color_tsdf.ply` or `color_backproject.ply`. It projects the internal SLAM keyframe map.
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-10-toy) for the matching numeric example for this chunk.
+
+## Chunk 11: Optional Trajectory Comparison And Pose Export
+
+Source file:
+
+| File | Role |
+| --- | --- |
+| `scripts/make_traj_compare_video.py` | Passive trajectory plot and aligned pose export |
+
+### Diagram
+
+```mermaid
+flowchart TD
+    A[ViPE output directory] --> B[Find pose/*.npz]
+    B --> C[Load predicted frame ids and c2w poses]
+    D[GT pose dir] --> E[Load numeric txt poses]
+    C --> F[Find overlapping frame ids]
+    E --> F
+    F --> G{alignment}
+    G -->|first| H[first_to_gt = gt_first @ inv(pred_first)]
+    G -->|se3| I[Umeyama rigid alignment]
+    G -->|sim3| J[Umeyama similarity alignment]
+    H --> K[Aligned predicted poses]
+    I --> K
+    J --> K
+    K --> L{--export?}
+    L -->|yes| M[Write pose_aligned/*.txt]
+    L -->|no| N[No pose txt export]
+    K --> O[Draw 2D trajectory mp4]
+```
+
+### Loading Predicted Poses
+
+The script discovers the ViPE pose file:
+
+```python
+pose_files = sorted((vipe_output_dir / "pose").glob("*.npz"))
+```
+
+For your standalone path, this is normally:
+
+```text
+outputs/scene00_dav3tsdf/pose/color.npz
+```
+
+The npz stores:
+
+```python
+data["inds"]  # frame ids
+data["data"]  # camera-to-world 4x4 matrices
+```
+
+`load_pred_pose_npz` returns:
+
+```python
+frame_ids = data["inds"].astype(np.int64)
+pose_mats = data["data"].astype(np.float64)
+xyz = pose_mats[:, :3, 3]
+```
+
+### Loading GT Poses
+
+GT pose files are loaded with numeric sorting:
+
+```python
+pose_files = sorted(gt_pose_dir.glob("*.txt"), key=lambda p: int(p.stem))
+```
+
+Each pose must be a finite `4 x 4` matrix. Non-finite or wrong-shaped poses are skipped.
+
+### Overlap And Alignment
+
+The script builds maps by frame id:
+
+```python
+pred_map = {frame_id: predicted_xyz}
+gt_map = {frame_id: gt_xyz}
+overlap_ids = sorted(set(pred_map) & set(gt_map))
+```
+
+With `--alignment first`:
+
+```python
+first_id = overlap_ids[0]
+first_to_gt = gt_pose_map[first_id] @ inv(pred_pose_map[first_id])
+aligned_pose_mats = first_to_gt[None] @ pred_pose_mats
+```
+
+This assumes the first overlapping predicted camera pose should exactly coincide with the first overlapping GT camera pose. It does not estimate scale, rotation, or translation from the whole trajectory.
+
+With `--alignment se3`, it uses Umeyama alignment with scale fixed to `1.0`.
+
+With `--alignment sim3`, it uses Umeyama alignment with scale estimated.
+
+### Export And Video
+
+If `--export` is present:
+
+```python
+export_dir = vipe_output_dir / "pose_aligned"
+np.savetxt(export_dir / f"{frame_id}.txt", aligned_pose_mat)
+```
+
+The trajectory video path defaults to:
+
+```text
+<vipe_output_dir>/vipe_aux_vis/<sequence>_traj.mp4
+```
+
+For sequence `color`:
+
+```text
+outputs/scene00_dav3tsdf/vipe_aux_vis/color_traj.mp4
+```
+
+The plot:
+
+1. Chooses a 2D plane, default `xy`.
+2. Computes bounds from all GT and aligned predicted points.
+3. Draws a grid.
+4. Draws GT trajectory in green.
+5. Draws predicted trajectory in blue/orange.
+6. Writes one video frame for each integer frame id from `0` to max GT/pred id.
+
+This script does not change ViPE SLAM, depth, or PCD artifacts. It only reads saved poses and writes a trajectory visualization plus optional aligned pose txt files.
+
+### Toy Trace
+
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-11-toy) for the matching numeric example for this chunk.
+
+## End-To-End Toy Trace
+
+The end-to-end toy sequence diagram and final toy output table are in [fullexplain-toy.md](./fullexplain-toy.md#end-to-end-toy-trace-summary).
+
+## Current Active Versus Inactive Major Branches
+
+| Branch | Current command value | Effect |
+| --- | --- | --- |
+| Frame input type | frame directory only | Reads sorted images directly. No mp4 decode path exists in the reduced setup. |
+| Camera type | `pinhole` | GeoCalib and DAV3 path assume pinhole. |
+| Sparse tracks | removed/no-op path gone | No sparse feature tracks participate in BA. |
+| Initial poses | absent | SLAM estimates poses from scratch. |
+| `optimize_intrinsics` | `false` | GeoCalib intrinsics are fixed during BA. |
+| `visualize` | `false` | No Rerun live visualization. |
+| `keyframe_depth` | `dav3` | DAV3 metric depth regularizes keyframe disparities. |
+| `post.depth_align_model` | `mvd_dav3` | Final dense depth comes from DAV3 multiview inference. |
+| `save_artifacts` | `true` in your command | RGB/pose/depth/intrinsics/masks/PCD are written. |
+| `save_viz` | `true` in your command | `vipe/color_vis.mp4` is written. |
+| `pcd_fusion_mode` | `tsdf` in your command | `pcd/color_tsdf.ply` is written, not `color_backproject.ply`. |
+
+## Practical Interpretation Of The Final Results
+
+| Artifact | What it represents |
+| --- | --- |
+| `pose/color.npz` | ViPE-estimated camera-to-world trajectory for every selected input frame. |
+| `intrinsics/color.npz` | One recovered original-resolution pinhole intrinsic vector repeated for every frame. |
+| `depth/color.zip` | Final DAV3 multiview metric depth conditioned on ViPE poses and intrinsics. |
+| `pcd/color_tsdf.ply` | Surface point cloud sampled from TSDF fusion of final DAV3 depth plus ViPE poses/intrinsics. |
+| `pcd/color_backproject.ply` | Only produced if `pcd_fusion_mode=backproject`; direct sampled pixel backprojection of final DAV3 depth plus ViPE poses/intrinsics. |
+| `vipe/color_vis.mp4` | Diagnostic visualization using final saved artifacts plus the internal low-res SLAM map. |
+| `pose_aligned/*.txt` | Optional post-script output; ViPE poses left-multiplied so the first predicted pose equals the first GT pose. |
+
+The key computational distinction is:
+
+```text
+SLAM estimates poses using DROID-style dense reprojection factors and DAV3 keyframe depth regularization.
+Final saved depth is recomputed afterward by DAV3 multiview using the solved poses and intrinsics.
+Final saved PCD is built from that final depth plus those solved poses and intrinsics.
+```
+

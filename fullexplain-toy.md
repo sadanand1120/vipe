@@ -1,0 +1,785 @@
+# Numeric Toy Trace For The Current Standalone ViPE Run
+
+Open this beside [fullexplain.md](./fullexplain.md). The chunk numbers match one-to-one with the main explanation.
+
+## Toy Sequence Used Throughout
+
+Every chunk below uses the same toy sequence. The numeric values are intentionally small, but the data flow and tensor transformations match the current code.
+
+Assume:
+
+| Object | Toy value |
+| --- | --- |
+| Input directory | `/toy/scene0000_00/color` |
+| File names | `0.png` through `9.png` |
+| Number of frames | `N = 10` |
+| Raw RGB size | `H0 = 24`, `W0 = 32` |
+| Input FPS | `2.0` |
+| `frame_start`, `frame_end`, `frame_skip` | `0`, `-1`, `1` |
+| Effective stream FPS | `2.0 / 1 = 2.0` |
+| `camera_type` | `pinhole` |
+| GeoCalib toy vertical FOV output | `60 deg = 1.0472 rad` |
+| Raw intrinsics from that FOV | `[fx, fy, cx, cy] = [20.7846, 20.7846, 16.0, 12.0]` |
+| SLAM resize target result | `384 x 512`, no crop for this toy |
+| SLAM low-res grid | `48 x 64` |
+| SLAM warmup | `8` keyframes |
+| Motion-filter toy decisions | frames `0,1,2,3,4,5,6,8,9` are keyframes, frame `7` is non-keyframe |
+| PCD mode in the command | `tsdf` |
+| Max PCD points | `8,000,000` |
+
+Toy image values used in examples:
+
+| Pixel | Toy RGB float |
+| --- | --- |
+| frame 0 pixel `(u=0, v=0)` | `[0.10, 0.20, 0.30]` |
+| frame 0 pixel `(u=16, v=12)` | `[0.50, 0.40, 0.30]` |
+| frame 0 pixel `(u=31, v=23)` | `[0.90, 0.80, 0.70]` |
+
+Toy final pose and depth values used later:
+
+| Frame | Toy final camera-to-world pose translation |
+| --- | --- |
+| frame 0 | `[0.0, 0.0, 0.0]` |
+| frame 1 | `[0.1, 0.0, 0.0]` |
+| frame 7 | `[0.7, 0.0, 0.0]` |
+| frame 9 | `[0.9, 0.0, 0.0]` |
+
+| Pixel | Toy final metric depth |
+| --- | --- |
+| frame 0 pixel `(16,12)` | `2.0 m` |
+| frame 0 pixel `(0,0)` | `3.0 m` |
+
+The toy network outputs are illustrative. They show exact shapes, exact formulas, and exact branch behavior. They are not claiming that the learned networks will output those exact values on a real image.
+
+<a id="chunk-1-toy"></a>
+## Chunk 1 Toy: Shell, Hydra Config, And Runtime Construction
+
+
+Toy CLI:
+
+```bash
+python run.py streams.base_path=/toy/scene0000_00/color streams.fps=2 pipeline.output.path=/toy/out pipeline.output.save_artifacts=true pipeline.output.save_viz=true pipeline.output.pcd_fusion_mode=tsdf
+```
+
+Hydra produces:
+
+```python
+args.streams.base_path == "/toy/scene0000_00/color"
+args.streams.fps == 2
+args.streams.frame_start == 0
+args.streams.frame_end == -1
+args.streams.frame_skip == 1
+args.pipeline.output.pcd_fusion_mode == "tsdf"
+```
+
+Runtime objects:
+
+```python
+stream_list = FrameDirStreamList("/toy/scene0000_00/color", fps=2, frame_start=0, frame_end=-1, frame_skip=1)
+len(stream_list) == 1
+video_stream = stream_list[0]
+video_stream.name() == "color"
+pipeline.out_path == Path("/toy/out")
+```
+
+<a id="chunk-2-toy"></a>
+## Chunk 2 Toy: Frame Directory Stream And Frame Ordering
+
+
+Input files:
+
+```text
+/toy/scene0000_00/color/0.png
+/toy/scene0000_00/color/1.png
+...
+/toy/scene0000_00/color/9.png
+```
+
+All stems are numeric, so sorted order is:
+
+```python
+[0.png, 1.png, 2.png, 3.png, 4.png, 5.png, 6.png, 7.png, 8.png, 9.png]
+```
+
+`frame_start=0`, `frame_end=-1`, `frame_skip=1` gives:
+
+```python
+self.start = 0
+self.end = 10
+self.step = 1
+len(video_stream) == len(range(0, 10, 1)) == 10
+video_stream.fps() == 2.0 / 1 == 2.0
+video_stream.frame_size() == (24, 32)
+video_stream.name() == "color"
+```
+
+For `0.png`, suppose OpenCV reads BGR pixel `(v=0,u=0)` as `[76, 51, 26]`. After BGR-to-RGB and normalization:
+
+```python
+rgb[0,0] = [26, 51, 76] / 255.0 = [0.1020, 0.2000, 0.2980]
+```
+
+The first yielded frame is:
+
+```python
+VideoFrame(
+    raw_frame_idx=0,
+    rgb=torch.tensor(shape=(24,32,3), device="cuda", dtype=float32),
+)
+```
+
+<a id="chunk-3-toy"></a>
+## Chunk 3 Toy: Initial Stream Processors: GeoCalib Intrinsics And Track Anything Masks
+
+
+GeoCalib samples toy frames:
+
+```python
+sample_frame_inds = [0, 2, 4]
+sample_frames.shape == (3, 3, 24, 32)
+```
+
+Assume GeoCalib returns:
+
+```python
+self.fov_y = 1.0472  # 60 deg
+```
+
+For every raw frame:
+
+```python
+frame_height = 24
+frame_width = 32
+fx = fy = 24 / (2 * tan(1.0472 / 2))
+   = 24 / (2 * 0.57735)
+   = 20.7846
+cx = 32 / 2 = 16.0
+cy = 24 / 2 = 12.0
+frame.intrinsics = [20.7846, 20.7846, 16.0, 12.0]
+frame.camera_type = PINHOLE
+```
+
+For Track Anything, toy `sam_run_gap=4`.
+
+Assume frame 0 detections:
+
+```python
+frame.instance =
+[
+  [0,0,0,0],
+  [0,1,1,0],
+  [0,1,1,0],
+  [2,2,0,0],
+]
+```
+
+This is shown as `4 x 4` for readability; real shape is `24 x 32`.
+
+Assume:
+
+```python
+frame.instance_phrases = {0: "background", 1: "person", 2: "sky"}
+```
+
+Then:
+
+```python
+frame.instance == 0 =
+[
+  [1,1,1,1],
+  [1,0,0,1],
+  [1,0,0,1],
+  [0,0,1,1],
+]
+
+frame.sky_mask =
+[
+  [0,0,0,0],
+  [0,0,0,0],
+  [0,0,0,0],
+  [1,1,0,0],
+]
+
+frame_instance_mask before erosion =
+[
+  [1,1,1,1],
+  [1,0,0,1],
+  [1,0,0,1],
+  [1,1,1,1],
+]
+```
+
+After erosion, valid regions near the person shrink. The exact output depends on the full `24 x 32` mask and the `5 x 5` window, but the rule is exactly:
+
+```text
+output[v,u] = true only if every value in the centered 5 x 5 input patch is true
+```
+
+Final initialized toy frame 0:
+
+```python
+VideoFrame(
+    raw_frame_idx=0,
+    rgb.shape=(24,32,3),
+    intrinsics=[20.7846,20.7846,16.0,12.0],
+    camera_type=PINHOLE,
+    instance.shape=(24,32),
+    mask.shape=(24,32),
+)
+```
+
+<a id="chunk-4-toy"></a>
+## Chunk 4 Toy: SLAM Standard Resize, Graph Buffer, And Model Setup
+
+
+Toy raw frame size is `(24,32)`.
+
+Resize scale:
+
+```text
+scale_factor = sqrt((384*512)/(24*32))
+             = sqrt(196608 / 768)
+             = sqrt(256)
+             = 16
+h1 = int(24 * 16) = 384
+w1 = int(32 * 16) = 512
+crop_h = 384 % 8 = 0
+crop_w = 512 % 8 = 0
+```
+
+No crop. Intrinsics after resize:
+
+```text
+raw intrinsics = [20.7846, 20.7846, 16.0, 12.0]
+w scale = 512 / 32 = 16
+h scale = 384 / 24 = 16
+resized intrinsics = [332.5536, 332.5536, 256.0, 192.0]
+```
+
+One resized frame entering SLAM:
+
+```python
+frame.rgb.shape == (384,512,3)
+frame.mask.shape == (384,512)
+frame.intrinsics == [332.5536, 332.5536, 256.0, 192.0]
+```
+
+SLAM `_precompute_features` converts it to:
+
+```python
+images.shape == (1,3,384,512)  # V,C,H,W
+buffer_masks.shape == (1,48,64) or None
+```
+
+If a resized valid mask pixel block has `mask[80:88,120:128]` mostly true, then downsampling with bilinear and `>0.9` can mark the corresponding low-res pixel valid. `_precompute_features` appends `~mask`, so:
+
+```text
+VideoFrame.mask true  -> valid at original/resized frame
+GraphBuffer.masks true -> invalid at 1/8 SLAM grid
+```
+
+<a id="chunk-5-toy"></a>
+## Chunk 5 Toy: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
+
+
+Toy pass-1 motion decisions:
+
+| Raw frame | MotionFilter result | Forced last? | Added to keyframe buffer? | Buffer keyframe index |
+| --- | --- | --- | --- | --- |
+| 0 | true first frame | no | yes | 0 |
+| 1 | true | no | yes | 1 |
+| 2 | true | no | yes | 2 |
+| 3 | true | no | yes | 3 |
+| 4 | true | no | yes | 4 |
+| 5 | true | no | yes | 5 |
+| 6 | true | no | yes | 6 |
+| 7 | false | no | no | none |
+| 8 | true | no | yes | 7 |
+| 9 | false | yes | yes | 8 |
+
+For frame 0:
+
+```python
+images.shape = (1,3,384,512)
+gmap.shape = (1,128,48,64)
+net.shape = (1,128,48,64)
+inp.shape = (1,128,48,64)
+buffer.tstamp[0] = 0
+buffer.intrinsics[0] = [332.5536, 332.5536, 256.0, 192.0]
+```
+
+Assume DAV3 keyframe metric depth at resized pixel `(v=3,u=3)` is `2.0 m`. Then:
+
+```python
+disp_sens[0,0] = 1 / 2.0 = 0.5
+buffer.disps_sens[0,0,0,0] = 0.5
+```
+
+For a toy motion-filter frame, assume the learned `delta` norms over four valid low-res pixels are:
+
+```text
+[1.0, 2.0, 4.0, 5.0]
+```
+
+Mean score:
+
+```text
+dense_motion_score = (1+2+4+5)/4 = 3.0
+```
+
+Since `3.0 > filter_thresh 2.4`, the frame becomes a keyframe.
+
+For a non-keyframe, assume valid norms:
+
+```text
+[0.5, 1.2, 2.0, 1.1]
+dense_motion_score = 1.2
+```
+
+Since `1.2 <= 2.4`, frame 7 is not added in pass 1.
+
+When buffer reaches 8 keyframes at raw frame 8:
+
+```python
+buffer.n_frames == 8
+frontend.is_initialized == False
+```
+
+`frontend.__initialize()` adds directed adjacent edges:
+
+```text
+(0,1), (1,0), (1,2), (2,1), ..., (6,7), (7,6)
+```
+
+There are `2 * (8 - 1) = 14` directed edges.
+
+For one low-res point on edge `(0,1)`, suppose:
+
+```text
+coords0 = [10.0, 5.0]
+current projected coords1 = [11.2, 5.4]
+previous target = [11.0, 5.0]
+```
+
+Motion feature is:
+
+```text
+coords1 - coords0 = [1.2, 0.4]
+target - coords1 = [-0.2, -0.4]
+motn = [1.2, 0.4, -0.2, -0.4]
+```
+
+Suppose the learned update returns:
+
+```text
+delta = [-0.1, 0.2]
+weight = [0.8, 0.7]
+```
+
+Then:
+
+```text
+new target = coords1 + delta = [11.1, 5.6]
+residual for BA = projected_coords - target
+```
+
+If current BA projection is `[11.2,5.4]`, residual is:
+
+```text
+r = [11.2,5.4] - [11.1,5.6] = [0.1, -0.2]
+weighted squared residual = 0.8*(0.1^2) + 0.7*(-0.2^2)
+                          = 0.008 + 0.028
+                          = 0.036
+```
+
+For sensor-depth regularization at the same low-res pixel, suppose:
+
+```text
+optimized disparity = 0.45
+DAV3 sensor disparity = 0.50
+dense_disp_alpha = 0.001
+residual = 0.45 - 0.50 = -0.05
+cost contribution = 0.001 * (-0.05)^2 = 0.0000025
+```
+
+<a id="chunk-6-toy"></a>
+## Chunk 6 Toy: Backend Global BA And SLAM Map Extraction
+
+
+Pass 1 toy keyframes:
+
+```python
+slam_map.dense_disp_frame_inds = [0,1,2,3,4,5,6,8,9]
+K = 9
+```
+
+Low-res colors per keyframe:
+
+```python
+images.shape = (9,1,48,64,3)
+```
+
+For keyframe 0, low-res coordinate `(u=32, v=24)` with resized intrinsics:
+
+```text
+scaled intrinsics for low-res = [332.5536/8, 332.5536/8, 256/8, 192/8]
+                             = [41.5692, 41.5692, 32.0, 24.0]
+disparity = 0.5
+depth = 1 / 0.5 = 2.0
+```
+
+Pinhole inverse projection at the principal point:
+
+```text
+X = (u - cx) / fx = (32 - 32) / 41.5692 = 0
+Y = (v - cy) / fy = (24 - 24) / 41.5692 = 0
+Camera point = [X/depth? internal homogeneous disparity form resolves to z=2.0 at projection time]
+World point with identity c2w = [0.0, 0.0, 2.0]
+```
+
+If depth consistency count for this pixel is `3`, and `min(2,K-1)=2`, and mask is valid:
+
+```text
+count >= 2 -> true
+disparity > 0.5 * mean_disparity -> true if mean < 1.0
+~invalid_mask -> true
+```
+
+The point is retained in `dense_disp_xyz`.
+
+If another pixel has:
+
+```text
+count = 1
+```
+
+It is filtered out because `1 < 2`.
+
+<a id="chunk-7-toy"></a>
+## Chunk 7 Toy: SLAM Pass 2 And Non-Keyframe Pose Infill
+
+
+Toy keyframes after pass 1:
+
+```python
+n_tstamp = [0,1,2,3,4,5,6,8,9]
+start_idx = 9
+```
+
+Pass 2 appends all raw frames:
+
+```python
+m_tstamp = [0,1,2,3,4,5,6,7,8,9]
+```
+
+For frame 7:
+
+```python
+searchsorted([0,1,2,3,4,5,6,8,9], 7, right=True) = 7
+t0 = 7 - 1 = 6        # keyframe raw timestamp 6
+t1 = t0 + 1 = 7       # keyframe raw timestamp 8
+```
+
+Assume keyframe world-to-camera translations are:
+
+```text
+pose at raw frame 6 translation = [-0.6, 0, 0]
+pose at raw frame 8 translation = [-0.8, 0, 0]
+```
+
+The initial interpolated world-to-camera translation for raw frame 7 is halfway:
+
+```text
+d_time = 8 - 6 + 0.001 = 2.001
+fraction = (7 - 6) / 2.001 = 0.49975
+translation approx = [-0.6,0,0] + 0.49975 * ([-0.8,0,0] - [-0.6,0,0])
+                   = [-0.69995, 0, 0]
+```
+
+The graph update then refines this pose using DROID reprojection constraints to nearby keyframes.
+
+After `filled_return.poses.inv()`, camera-to-world translation is approximately:
+
+```text
+[0.7, 0, 0]
+```
+
+Final `SLAMOutput` toy:
+
+```python
+slam_output.trajectory.shape == (10,)  # SE3 batch
+slam_output.intrinsics.shape == (1,4)
+slam_output.intrinsics[0] == [20.7846,20.7846,16.0,12.0]
+slam_output.keyframe_ids == [0,1,2,3,4,5,6,8,9]
+```
+
+<a id="chunk-8-toy"></a>
+## Chunk 8 Toy: Rebuilding The Output Stream And Assigning SLAM Results
+
+
+After rebuilding, toy raw frame 7 is loaded again from `/toy/scene0000_00/color/7.png`:
+
+```python
+frame.rgb.shape == (24,32,3)
+```
+
+`AssignCachedInitProcessor` restores:
+
+```python
+frame.intrinsics = [20.7846,20.7846,16.0,12.0]
+frame.camera_type = PINHOLE
+frame.instance.shape = (24,32)
+frame.mask.shape = (24,32)
+frame.instance_phrases = {...}
+```
+
+`AssignAttributesProcessor` then overwrites intrinsics with the recovered SLAM intrinsics:
+
+```python
+frame.pose = slam_output.trajectory[7]  # c2w
+frame.intrinsics = slam_output.intrinsics[0]
+```
+
+For the toy:
+
+```python
+frame.pose.translation()[:3] approx [0.7,0,0]
+frame.intrinsics == [20.7846,20.7846,16.0,12.0]
+```
+
+Then the multiview depth processor will attach:
+
+```python
+frame.metric_depth.shape == (24,32)
+frame.depth_confidence.shape == (24,32) or None
+```
+
+<a id="chunk-9-toy"></a>
+## Chunk 9 Toy: Final DAV3 Multiview Depth For Every Frame
+
+
+Toy has exactly 10 frames and `window_size=10`, so pass 1 creates one window:
+
+```python
+current_sliding_window_idx = [0,1,2,3,4,5,6,7,8,9]
+is_last_frame = True
+```
+
+Neighbor keyframe probe for frame 7:
+
+```python
+keyframes_inds = [0,1,2,3,4,5,6,8,9]
+searchsorted(keyframes_inds, 7, side="right") = 7
+left_idx = 7 - 1 = 6      # raw frame 6
+frame_idx < keyframes_inds[-1] -> 7 < 9 true
+also append left_idx + 1 = 7  # raw frame 8
+```
+
+But raw frame 6 and raw frame 8 are already in the current sliding window, so they are removed from extra keyframe context.
+
+DAV3 input list length:
+
+```python
+len(sw_images) = 10
+len(kf_images) = 0
+total DAV3 images = 10
+extrinsics.shape = (10,4,4)
+intrinsics.shape = (10,3,3)
+```
+
+For toy frame 0:
+
+```python
+pose c2w =
+[[1,0,0,0],
+ [0,1,0,0],
+ [0,0,1,0],
+ [0,0,0,1]]
+
+extrinsic w2c = inverse(pose) = identity
+
+intrinsic K =
+[[20.7846, 0,       16.0],
+ [0,       20.7846, 12.0],
+ [0,       0,       1.0]]
+```
+
+Assume DAV3 returns depth for frame 0 at a lower internal size, then ViPE interpolates it to:
+
+```python
+frame.metric_depth.shape = (24,32)
+frame.metric_depth[12,16] = 2.0
+frame.depth_confidence[12,16] = 0.92
+```
+
+Because this toy has one last window, all 10 frames are yielded and `trailing_depth` is empty at the end.
+
+<a id="chunk-10-toy"></a>
+## Chunk 10 Toy: Artifact Saving, PCD Fusion, And Visualization
+
+### Backprojection Formula
+
+
+Even though your command uses TSDF, the backproject branch is useful for understanding the coordinate convention.
+
+Toy frame 0:
+
+```text
+pixel (u=16, v=12)
+depth z = 2.0
+intrinsics = [20.7846,20.7846,16.0,12.0]
+pose c2w = identity
+```
+
+Camera point:
+
+```text
+x = (16 - 16.0) * 2.0 / 20.7846 = 0.0
+y = (12 - 12.0) * 2.0 / 20.7846 = 0.0
+z = 2.0
+points_cam = [0.0, 0.0, 2.0, 1.0]
+```
+
+World point:
+
+```text
+points_world = identity @ points_cam = [0.0, 0.0, 2.0]
+```
+
+Color:
+
+```text
+frame.rgb[12,16] = [0.50, 0.40, 0.30]
+PLY color = [127, 102, 76]
+```
+
+For frame 1 with camera-to-world translation `[0.1,0,0]`, same camera point becomes:
+
+```text
+points_world = [0.1,0,0] + [0,0,2] = [0.1,0,2.0]
+```
+
+### TSDF Integration
+
+
+Toy TSDF settings:
+
+```text
+voxel_length = 0.02
+sdf_trunc = 0.15
+depth_trunc = 5.0
+```
+
+For frame 0 pixel `(16,12)` with depth `2.0`, the observed surface is at world point `[0,0,2]`.
+
+Open3D integrates voxels near this point along the camera ray. For a voxel centered exactly at `[0,0,2]`, signed distance is near:
+
+```text
+surface_depth - voxel_depth = 2.0 - 2.0 = 0.0
+truncated_signed_distance = 0.0 / 0.15 = 0.0
+```
+
+For a voxel centered at `[0,0,1.94]`, signed distance is:
+
+```text
+2.0 - 1.94 = 0.06
+normalized TSDF = 0.06 / 0.15 = 0.4
+```
+
+For a voxel at `[0,0,1.70]`, distance is:
+
+```text
+2.0 - 1.70 = 0.30
+```
+
+Since `0.30 > sdf_trunc`, it is outside the truncated band and is not updated as a near-surface voxel by this surface observation.
+
+After all toy frames integrate, the volume extracts a mesh at the zero-crossing of the TSDF. Then it samples up to `8,000,000` points on that mesh and writes `pcd/color_tsdf.ply`.
+
+For a 10-frame toy scene, the mesh likely has far fewer meaningful triangles than 8M points, but Open3D's sampler still attempts to return the requested number by sampling triangle areas with replacement-like distribution over the mesh surface.
+
+<a id="chunk-11-toy"></a>
+## Chunk 11 Toy: Optional Trajectory Comparison And Pose Export
+
+
+Toy predicted poses:
+
+| Frame | Pred c2w translation |
+| --- | --- |
+| 0 | `[0.2, 0.0, 0.0]` |
+| 1 | `[0.3, 0.0, 0.0]` |
+| 2 | `[0.4, 0.0, 0.0]` |
+
+Toy GT poses:
+
+| Frame | GT c2w translation |
+| --- | --- |
+| 0 | `[0.0, 1.0, 0.0]` |
+| 1 | `[0.1, 1.0, 0.0]` |
+| 2 | `[0.2, 1.0, 0.0]` |
+
+With `alignment=first`:
+
+```text
+pred_first translation = [0.2,0,0]
+gt_first translation = [0,1,0]
+first_to_gt translation = gt_first - pred_first = [-0.2,1,0]
+```
+
+Aligned predicted translations:
+
+```text
+frame 0: [0.2,0,0] + [-0.2,1,0] = [0.0,1.0,0]
+frame 1: [0.3,0,0] + [-0.2,1,0] = [0.1,1.0,0]
+frame 2: [0.4,0,0] + [-0.2,1,0] = [0.2,1.0,0]
+```
+
+Exported files:
+
+```text
+pose_aligned/0.txt
+pose_aligned/1.txt
+pose_aligned/2.txt
+```
+
+<a id="end-to-end-toy-trace-summary"></a>
+## End-To-End Toy Trace Summary
+
+```mermaid
+sequenceDiagram
+    participant R as Raw frame dir
+    participant I as Init processors
+    participant S as SLAM
+    participant D as DAV3 MVD
+    participant O as Output artifacts
+    R->>I: 10 RGB frames, each 24x32x3
+    I->>I: GeoCalib samples frames 0,2,4
+    I->>I: intrinsics [20.7846,20.7846,16,12]
+    I->>I: Track Anything masks frames 0..9
+    I->>S: initialized cached stream
+    S->>S: resize each frame to 384x512
+    S->>S: pass 1 keyframes 0,1,2,3,4,5,6,8,9
+    S->>S: frontend initialize at 8 keyframes
+    S->>S: backend global BA
+    S->>S: pass 2 fills frame 7 pose
+    S->>D: c2w poses, intrinsics, keyframe map
+    D->>D: sliding window depth for frames 0..9
+    D->>O: final frames with pose, intrinsics, depth, mask
+    O->>O: save RGB, depth, pose, intrinsics, masks
+    O->>O: integrate TSDF and write pcd/color_tsdf.ply
+```
+
+Final toy outputs:
+
+| Output | Toy content |
+| --- | --- |
+| `rgb/color.mp4` | 10 frames, 24x32 RGB encoded as video |
+| `pose/color.npz` | `inds=[0..9]`, `data.shape=(10,4,4)` |
+| `intrinsics/color.npz` | `inds=[0..9]`, `data.shape=(10,4)` |
+| `depth/color.zip` | 10 EXR depth maps, each 24x32 |
+| `mask/color.zip` | 10 PNG instance masks, each 24x32 |
+| `pcd/color_tsdf.ply` | sampled point cloud from TSDF mesh |
+| `vipe/color_vis.mp4` | RGB/instance/depth/internal-SLAM-map projection video |
+| `vipe_aux_vis/color_traj.mp4` | optional trajectory plot from post script |
+| `pose_aligned/*.txt` | optional first-pose-aligned predicted c2w matrices |
+
