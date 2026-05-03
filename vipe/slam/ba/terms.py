@@ -93,11 +93,10 @@ class SolverTerm(ABC):
 
 class DenseDepthFlowTerm(SolverTerm):
     """
-    E(pose_pi, pose_pj, dense_disp_di, intr_qi, intr_qj) = \
-        proj(rig_j.inv() * pose_j * pose_i.inv() * rig_i, dense_disp_di) - target_[ij di]
+    E(pose_pi, pose_pj, dense_disp_di, intrinsics) = \
+        proj(pose_j * pose_i.inv(), dense_disp_di) - target_[ij di]
 
         Pose is the world2cam transform.
-        Rig is the cam2world(central cam) transform.
         target_[ij di] is the target projected location.
     res_dim = H*W*2
     """
@@ -106,14 +105,11 @@ class DenseDepthFlowTerm(SolverTerm):
         self,
         pose_i_inds: torch.Tensor,
         pose_j_inds: torch.Tensor,
-        rig_i_inds: torch.Tensor,
-        rig_j_inds: torch.Tensor,
         dense_disp_i_inds: torch.Tensor,
         target: torch.Tensor,
         weight: torch.Tensor,
         intrinsics: torch.Tensor | None,
         intrinsics_factor: float,
-        rig: SE3 | None,
         image_size: tuple[int, int],
         camera_type: CameraType,
     ) -> None:
@@ -122,14 +118,10 @@ class DenseDepthFlowTerm(SolverTerm):
         self.n_terms = pose_i_inds.shape[0]
         assert pose_i_inds.shape == (self.n_terms,)
         assert pose_j_inds.shape == (self.n_terms,)
-        assert rig_i_inds.shape == (self.n_terms,)
-        assert rig_j_inds.shape == (self.n_terms,)
         assert dense_disp_i_inds.shape == (self.n_terms,)
 
         self.pose_i_inds = pose_i_inds
         self.pose_j_inds = pose_j_inds
-        self.rig_i_inds = rig_i_inds
-        self.rig_j_inds = rig_j_inds
         self.dense_disp_i_inds = dense_disp_i_inds
         self.image_size = image_size
         self.camera_type = camera_type
@@ -140,14 +132,11 @@ class DenseDepthFlowTerm(SolverTerm):
         self.weight = weight.reshape(self.n_terms, n_pixels, 2)  # (n_terms, H*W, 2)
         self.intrinsics = intrinsics.reshape(-1, 4) if intrinsics is not None else None  # (Q, 4)
         self.intrinsics_factor = intrinsics_factor
-        self.rig = rig
 
     def group_names(self) -> set[str]:
         names = {"pose", "dense_disp"}
         if self.intrinsics is None:
             names.add("intrinsics")
-        if self.rig is None:
-            names.add("rig")
         return names
 
     def forward(self, variables: dict[str, Any], jacobian: bool = True) -> TermEvalReturn:
@@ -164,32 +153,23 @@ class DenseDepthFlowTerm(SolverTerm):
             intrinsics = variables["intrinsics"]
         else:
             intrinsics = self.intrinsics
-        if optimize_rig := self.rig is None:
-            rig = variables["rig"]
-        else:
-            rig = self.rig
 
         assert isinstance(pose, SE3) and isinstance(dense_disp, torch.Tensor)
         assert dense_disp.shape[1] == self.image_size[0] * self.image_size[1]
-        assert intrinsics.shape[0] == rig.shape[0]
 
         camera_model_cls = self.camera_type.camera_model_cls()
 
-        coords, valid, (Ji, Jj, Jz), (Jfi, Jfj), (Jri, Jrj) = geom.iproj_i_proj_j_disp(
+        coords, valid, (Ji, Jj, Jz), (Jfi, Jfj) = geom.iproj_i_proj_j_disp(
             pose,
             dense_disp.view(-1, self.image_size[0], self.image_size[1]),
             None,
             (camera_model_cls(intrinsics).scaled(1.0 / self.intrinsics_factor).intrinsics),
             self.camera_type,
-            rig,
             self.pose_i_inds,
             self.pose_j_inds,
-            self.rig_i_inds,
-            self.rig_j_inds,
             self.dense_disp_i_inds,
             jacobian_p_d=jacobian,
             jacobian_f=jacobian and optimize_intrinsics,
-            jacobian_r=jacobian and optimize_rig,
         )
         coords = rearrange(coords, "n h w c -> n (h w) c", c=2)
         weight = rearrange(valid, "n h w 1 -> n (h w) 1") * self.weight  # (n_terms, H*W, 2)
@@ -218,22 +198,14 @@ class DenseDepthFlowTerm(SolverTerm):
                 assert Jfi is not None and Jfj is not None
                 Jfi = rearrange(Jfi, "n h w c d -> n (h w c) d", c=2)
                 Jfj = rearrange(Jfj, "n h w c d -> n (h w c) d", c=2)
+                intr_inds = torch.zeros(self.n_terms, dtype=torch.long, device=term_inds.device)
                 J_dict["intrinsics"] = SparseDenseBlockMatrix(
                     i_inds=torch.cat([term_inds, term_inds]),
-                    j_inds=torch.cat([self.rig_i_inds, self.rig_j_inds]),
+                    j_inds=torch.cat([intr_inds, intr_inds]),
                     data=camera_model_cls.J_scale(
                         1.0 / self.intrinsics_factor,
                         torch.cat([Jfi, Jfj], dim=0),
                     ),
-                )
-            if optimize_rig:
-                assert Jri is not None and Jrj is not None
-                Jri = rearrange(Jri, "n h w c d -> n (h w c) d", c=2, d=6)
-                Jrj = rearrange(Jrj, "n h w c d -> n (h w c) d", c=2, d=6)
-                J_dict["rig"] = SparseDenseBlockMatrix(
-                    i_inds=torch.cat([term_inds, term_inds]),
-                    j_inds=torch.cat([self.rig_i_inds, self.rig_j_inds]),
-                    data=torch.cat([Jri, Jrj], dim=0),
                 )
 
         return ConcreteTermEvalReturn(
@@ -300,134 +272,4 @@ class DispSensRegularizationTerm(SolverTerm):
             alpha=self.alpha,
             i_inds=self.i_inds,
             disps_sens_res=dense_disp[self.i_inds] - self.disps_sens[self.i_inds],
-        )
-
-
-class TracksFlowTerm(SolverTerm):
-    """
-    E (pose_pi, pose_pj, tracks_di, intr_qi, intr_qj) = \
-        proj(rig_j.inv() * pose_j * pose_i.inv() * rig_i, tracks_di) - target_[ij di]
-
-        Pose is the world2cam transform.
-        Rig is the cam2world(central cam) transform.
-        target_[ij di] is the target projected location.
-    res_dim = n_tracks*2
-    """
-
-    def __init__(
-        self,
-        pose_i_inds: torch.Tensor,
-        pose_j_inds: torch.Tensor,
-        rig_i_inds: torch.Tensor,
-        rig_j_inds: torch.Tensor,
-        tracks_i_inds: torch.Tensor,
-        target: torch.Tensor,
-        weight: torch.Tensor,
-        tracks_uv: torch.Tensor,
-        intrinsics: torch.Tensor | None,
-        rig: SE3,
-        camera_type: CameraType,
-    ) -> None:
-        super().__init__()
-
-        self.n_terms = pose_i_inds.shape[0]
-        assert pose_i_inds.shape == (self.n_terms,)
-        assert pose_j_inds.shape == (self.n_terms,)
-        assert rig_i_inds.shape == (self.n_terms,)
-        assert rig_j_inds.shape == (self.n_terms,)
-        assert tracks_i_inds.shape == (self.n_terms,)
-
-        self.pose_i_inds = pose_i_inds
-        self.pose_j_inds = pose_j_inds
-        self.rig_i_inds = rig_i_inds
-        self.rig_j_inds = rig_j_inds
-        self.tracks_i_inds = tracks_i_inds
-        self.camera_type = camera_type
-
-        self.target = target.reshape(self.n_terms, -1, 2)  # (n_terms, n_tracks, 2)
-        self.weight = weight.reshape(self.n_terms, -1, 2)  # (n_terms, n_tracks, 2)
-        self.tracks_uv = tracks_uv
-
-        self.n_tracks = self.target.shape[1]
-        assert self.target.shape[1] == self.n_tracks
-        assert self.weight.shape[1] == self.n_tracks
-        assert self.tracks_uv.shape[1] == self.n_tracks
-
-        self.intrinsics = intrinsics.reshape(-1, 4) if intrinsics is not None else None
-        self.rig = rig
-
-    def group_names(self) -> set[str]:
-        names = {"pose", "tracks_disp"}
-        if self.intrinsics is None:
-            names.add("intrinsics")
-        return names
-
-    def forward(self, variables: dict[str, Any], jacobian: bool = True) -> TermEvalReturn:
-        """
-        variables contain:
-            - pose: (n_var, ) SE3 of poses
-            - tracks_disp: (n_var, n_tracks) tensor of disparities
-            - intrinsics: (Q, 4) tensor of intrinsics (optional)
-        """
-        pose, tracks_disp = variables["pose"], variables["tracks_disp"]
-        if optimize_intrinsics := self.intrinsics is None:
-            intrinsics = variables["intrinsics"]
-        else:
-            intrinsics = self.intrinsics
-
-        assert isinstance(pose, SE3) and isinstance(tracks_disp, torch.Tensor)
-        assert tracks_disp.shape[1] == self.n_tracks
-        assert intrinsics.shape[0] == self.rig.shape[0]
-
-        coords, valid, (Ji, Jj, Jz), (Jfi, Jfj), _ = geom.iproj_i_proj_j_disp(
-            pose,
-            tracks_disp,
-            self.tracks_uv,
-            intrinsics,
-            self.camera_type,
-            self.rig,
-            self.pose_i_inds,
-            self.pose_j_inds,
-            self.rig_i_inds,
-            self.rig_j_inds,
-            self.tracks_i_inds,
-            jacobian_p_d=jacobian,
-            jacobian_f=jacobian and optimize_intrinsics,
-            jacobian_r=False,
-        )
-        weight = self.weight * valid
-
-        J_dict = {}
-        if jacobian:
-            assert Ji is not None and Jj is not None and Jz is not None
-            Ji = rearrange(Ji, "n t c d -> n (t c) d", c=2, d=6)
-            Jj = rearrange(Jj, "n t c d -> n (t c) d", c=2, d=6)
-            Jz = rearrange(Jz, "n t c d -> n (t) (c d)", c=2, d=1)
-            term_inds = torch.arange(self.n_terms).to(pose.device)
-            J_dict = {
-                "pose": SparseDenseBlockMatrix(
-                    i_inds=torch.cat([term_inds, term_inds]),
-                    j_inds=torch.cat([self.pose_i_inds, self.pose_j_inds]),
-                    data=torch.cat([Ji, Jj], dim=0),
-                ),
-                "tracks_disp": SparseMDiagonalBlockMatrix(
-                    i_inds=term_inds,
-                    j_inds=self.tracks_i_inds,
-                    data=Jz,
-                ),
-            }
-            if optimize_intrinsics:
-                assert Jfi is not None and Jfj is not None
-                Jfi = rearrange(Jfi, "n t c d -> n (t c) d", c=2)
-                Jfj = rearrange(Jfj, "n t c d -> n (t c) d", c=2)
-                J_dict["intrinsics"] = SparseDenseBlockMatrix(
-                    i_inds=torch.cat([term_inds, term_inds]),
-                    j_inds=torch.cat([self.rig_i_inds, self.rig_j_inds]),
-                    data=torch.cat([Jfi, Jfj], dim=0),
-                )
-
-        return ConcreteTermEvalReturn(
-            J=J_dict,
-            w=weight.view(self.n_terms, -1),
-            r=rearrange(coords - self.target, "n t c -> n (t c)", c=2),
         )

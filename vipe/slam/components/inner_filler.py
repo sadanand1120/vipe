@@ -98,7 +98,6 @@ class InnerFiller:
             self.device,
             max_factors=-1,
             incremental=True,
-            cross_view=False,  # No need for interpolation.
         )
         infill_inds = torch.arange(self.start_idx, total_frames).to(self.device)
         graph.add_factors(t0, infill_inds)

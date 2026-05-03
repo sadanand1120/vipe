@@ -1,23 +1,30 @@
 import hydra
 from omegaconf import DictConfig
 
-from vipe.runtime import make_annotation_pipeline, make_frame_dir_stream_list
+from vipe.pipeline.default import DefaultAnnotationPipeline
+from vipe.streams.base import FrameDir
 from vipe.utils.logging import configure_logging
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="default")
 def run(args: DictConfig) -> None:
-    stream_list = make_frame_dir_stream_list(args.streams)
-
     logger = configure_logging()
-    pipeline = make_annotation_pipeline(args.pipeline)
-    for stream_idx in range(len(stream_list)):
-        video_stream = stream_list[stream_idx]
-        logger.info(
-            f"Processing {video_stream.name()} ({stream_idx + 1} / {len(stream_list)})"
-        )
-        pipeline.run(video_stream)
-        logger.info(f"Finished processing {video_stream.name()}")
+    frame_stream = FrameDir(
+        path=args.streams.base_path,
+        fps=args.streams.fps,
+        frame_start=args.streams.frame_start,
+        frame_end=args.streams.frame_end,
+        frame_skip=args.streams.frame_skip,
+    )
+    pipeline = DefaultAnnotationPipeline(
+        init=args.pipeline.init,
+        slam=args.pipeline.slam,
+        post=args.pipeline.post,
+        output=args.pipeline.output,
+    )
+    logger.info(f"Processing {frame_stream.name()}")
+    pipeline.run(frame_stream)
+    logger.info(f"Finished processing {frame_stream.name()}")
 
 
 if __name__ == "__main__":

@@ -23,8 +23,7 @@ import torch
 from vipe.priors.geocalib import GeoCalib
 from vipe.priors.track_anything import TrackAnythingPipeline
 from vipe.slam.interface import SLAMOutput
-from vipe.streams.base import (CachedVideoStream, FrameAttribute,
-                               StreamProcessor, VideoFrame, VideoStream)
+from vipe.streams.base import FrameAttribute, FrameProcessor, FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
@@ -33,13 +32,13 @@ from vipe.utils.morph import erode
 logger = logging.getLogger(__name__)
 
 
-class IntrinsicEstimationProcessor(StreamProcessor):
+class IntrinsicEstimationProcessor(FrameProcessor):
     """Override existing intrinsics with estimated intrinsics."""
 
-    def __init__(self, video_stream: VideoStream, gap_sec: float = 1.0) -> None:
+    def __init__(self, frame_stream: FrameStream, gap_sec: float = 1.0) -> None:
         super().__init__()
-        gap_frame = int(gap_sec * video_stream.fps())
-        gap_frame = min(gap_frame, (len(video_stream) - 1) // 2)
+        gap_frame = int(gap_sec * frame_stream.fps())
+        gap_frame = min(gap_frame, (len(frame_stream) - 1) // 2)
         self.sample_frame_inds = [0, gap_frame, gap_frame * 2]
         self.fov_y = -1.0
         self.camera_type = CameraType.PINHOLE
@@ -47,7 +46,7 @@ class IntrinsicEstimationProcessor(StreamProcessor):
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.INTRINSICS}
 
-    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
+    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
         assert self.fov_y > 0, "FOV not set"
         frame_height, frame_width = frame.size()
         fx = fy = frame_height / (2 * np.tan(self.fov_y / 2))
@@ -61,16 +60,22 @@ class IntrinsicEstimationProcessor(StreamProcessor):
 class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
     def __init__(
         self,
-        video_stream: VideoStream,
+        frame_stream: FrameStream,
         gap_sec: float = 1.0,
         camera_type: CameraType = CameraType.PINHOLE,
     ) -> None:
-        super().__init__(video_stream, gap_sec)
+        super().__init__(frame_stream, gap_sec)
         assert camera_type == CameraType.PINHOLE, "Only pinhole camera intrinsics are supported"
 
         model = GeoCalib(weights="pinhole").cuda()
-        indexable_stream = CachedVideoStream(video_stream)
-        sample_frames = torch.stack([indexable_stream[i].rgb.moveaxis(-1, 0) for i in self.sample_frame_inds])
+        sample_frame_set = set(self.sample_frame_inds)
+        sample_by_idx = {}
+        for frame_idx, frame in enumerate(frame_stream):
+            if frame_idx in sample_frame_set:
+                sample_by_idx[frame_idx] = frame.rgb.moveaxis(-1, 0)
+            if frame_idx >= self.sample_frame_inds[-1]:
+                break
+        sample_frames = torch.stack([sample_by_idx[i] for i in self.sample_frame_inds])
         res = model.calibrate(
             sample_frames,
             shared_intrinsics=True,
@@ -80,7 +85,7 @@ class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
         self.camera_type = camera_type
 
 
-class TrackAnythingProcessor(StreamProcessor):
+class TrackAnythingProcessor(FrameProcessor):
     """
     A processor that tracks a mask caption in the video.
     """
@@ -97,7 +102,7 @@ class TrackAnythingProcessor(StreamProcessor):
         self.add_sky = add_sky
 
         if self.add_sky:
-            self.mask_phrases.append(VideoFrame.SKY_PROMPT)
+            self.mask_phrases.append(FrameData.SKY_PROMPT)
 
         self.tracker = TrackAnythingPipeline(self.mask_phrases, sam_points_per_side=50, sam_run_gap=self.sam_run_gap)
         self.mask_expand = mask_expand
@@ -105,7 +110,7 @@ class TrackAnythingProcessor(StreamProcessor):
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.INSTANCE, FrameAttribute.MASK}
 
-    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
+    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
         frame.instance, frame.instance_phrases = self.tracker.track(frame)
         self.last_track_frame = frame.raw_frame_idx
 
@@ -118,15 +123,14 @@ class TrackAnythingProcessor(StreamProcessor):
         return frame
 
 
-class MultiviewDepthProcessor(StreamProcessor):
+class DAV3DepthProcessor(FrameProcessor):
     """
-    Use DAV3 multi-view depth to estimate depth for each frame.
+    Use DAV3 to estimate depth for each frame.
     Depth is conditioned on camera poses and intrinsics from SLAM.
 
     Depth is estimated in a sliding-window manner, and overlapped frames are linearly averaged to sharp transitions.
     To create enough parallex to improve estimation confidence, for each window we optionally also include
     neighboring keyframes, and their secondary neighboring keyframes.
-    (Multi-view input video frames are currently not supported)
     """
 
     def __init__(
@@ -145,7 +149,7 @@ class MultiviewDepthProcessor(StreamProcessor):
         self.secondary_keyframe = secondary_keyframe
 
         self.keyframes_inds = unpack_optional(self.slam_output.slam_map).dense_disp_frame_inds
-        self.keyframes_data: list[VideoFrame] = []
+        self.keyframes_data: list[FrameData] = []
         self.n_frames = 0
 
         # Need two passes for this iterator to work.
@@ -169,8 +173,8 @@ class MultiviewDepthProcessor(StreamProcessor):
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.METRIC_DEPTH, FrameAttribute.DEPTH_CONFIDENCE}
 
-    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
-        raise NotImplementedError("MultiviewDepthProcessor should not be called directly.")
+    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
+        raise NotImplementedError("DAV3DepthProcessor should not be called directly.")
 
     def _probe_keyframe_indices(self, frame_idx: int) -> list[int]:
         inds: list[int] = []
@@ -187,19 +191,19 @@ class MultiviewDepthProcessor(StreamProcessor):
                 inds.append(matching_secondary_j[picked_sj_idx])
         return inds
 
-    def record_keyframes(self, previous_iterator: Iterator[VideoFrame]) -> Iterator[VideoFrame]:
+    def record_keyframes(self, previous_iterator: Iterator[FrameData]) -> Iterator[FrameData]:
         for frame_idx, frame in enumerate(previous_iterator):
             self.n_frames += 1
             if frame_idx in self.keyframes_inds:
                 self.keyframes_data.append(frame)
             yield frame
 
-    def estimate_depth_sliding_window(self, previous_iterator: Iterator[VideoFrame]) -> Iterator[VideoFrame]:
-        current_sliding_window: list[VideoFrame] = []
+    def estimate_depth_sliding_window(self, previous_iterator: Iterator[FrameData]) -> Iterator[FrameData]:
+        current_sliding_window: list[FrameData] = []
         current_sliding_window_idx: list[int] = []
         trailing_depth: torch.Tensor | None = None
         trailing_confidence: torch.Tensor | None = None
-        for frame_idx, frame in pbar(enumerate(previous_iterator), desc="Estimating multi-view depth"):
+        for frame_idx, frame in pbar(enumerate(previous_iterator), desc="Estimating DAV3 depth"):
             current_sliding_window.append(frame)
             current_sliding_window_idx.append(frame_idx)
             is_last_frame = frame_idx == self.n_frames - 1
@@ -263,7 +267,7 @@ class MultiviewDepthProcessor(StreamProcessor):
 
         assert len(current_sliding_window) == 0, "Current sliding window should be empty"
 
-    def update_iterator(self, previous_iterator: Iterator[VideoFrame], pass_idx: int) -> Iterator[VideoFrame]:
+    def update_iterator(self, previous_iterator: Iterator[FrameData], pass_idx: int) -> Iterator[FrameData]:
         if pass_idx == 0:
             yield from self.record_keyframes(previous_iterator)
         elif pass_idx == 1:

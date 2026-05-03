@@ -26,7 +26,7 @@ from pycg import image
 
 from vipe.ext.lietorch import SE3
 from vipe.slam.interface import SLAMOutput
-from vipe.streams.base import VideoFrame, VideoStream
+from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
@@ -288,12 +288,12 @@ def image_above_text(img: np.ndarray, text: str = "<TEXT>") -> Image.Image:
 
 def save_projection_video(
     video_path: Path,
-    video_stream: VideoStream,
+    frame_stream: FrameStream,
     slam_output: SLAMOutput | None,
     subsample_factor: int,
     attributes: list[list[str]],
 ):
-    img_h, img_w = video_stream.frame_size()
+    img_h, img_w = frame_stream.frame_size()
     img_h //= subsample_factor
     img_w //= subsample_factor
 
@@ -318,12 +318,12 @@ def save_projection_video(
     depth_range = [np.inf, -np.inf]
     rectified_coords_norm = None
 
-    def get_rgb_img(frame_data: VideoFrame) -> np.ndarray:
+    def get_rgb_img(frame_data: FrameData) -> np.ndarray:
         rgb_img = frame_data.rgb.cpu().numpy().astype(float)
         rgb_img = (rgb_img * 255).astype(np.uint8)
         return cv2.resize(rgb_img, (img_w, img_h))
 
-    def get_depth_img(frame_data: VideoFrame) -> np.ndarray:
+    def get_depth_img(frame_data: FrameData) -> np.ndarray:
         if frame_data.metric_depth is None:
             return na_img
 
@@ -348,7 +348,7 @@ def save_projection_video(
         depth_img = (depth_img - depth_min) / (depth_max - depth_min)
         return colorize_depth(np.clip(depth_img, 0, 1))
 
-    def get_pcd_img(frame_data: VideoFrame, rgb_img: np.ndarray) -> np.ndarray:
+    def get_pcd_img(frame_data: FrameData, rgb_img: np.ndarray) -> np.ndarray:
         if slam_map is None:
             return na_img
 
@@ -372,7 +372,7 @@ def save_projection_video(
             )
         return cv2.addWeighted(rgb_img, 0.2, pcd_img, 0.8, 0)
 
-    def get_rectified_img(frame_data: VideoFrame) -> np.ndarray:
+    def get_rectified_img(frame_data: FrameData) -> np.ndarray:
         nonlocal rectified_coords_norm
         if frame_data.intrinsics is None or frame_data.camera_type is None:
             return na_img
@@ -398,7 +398,7 @@ def save_projection_video(
         )[0].float()
         return (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-    def get_instance_img(frame_data: VideoFrame, rgb_img: np.ndarray) -> np.ndarray:
+    def get_instance_img(frame_data: FrameData, rgb_img: np.ndarray) -> np.ndarray:
         if frame_data.instance is None:
             return na_img
 
@@ -427,10 +427,10 @@ def save_projection_video(
         instance_img = cv2.resize(instance_img, (img_w, img_h))
         return cv2.addWeighted(rgb_img, 0.5, instance_img, 0.5, 0)
 
-    with VideoWriter(video_path, video_stream.fps()) as vw:
+    with VideoWriter(video_path, frame_stream.fps()) as vw:
         trajectory_length = 0.0
         last_pose = None
-        for frame_idx, frame_data in pbar(enumerate(video_stream), total=len(video_stream), desc="Writing viz video"):
+        for frame_idx, frame_data in pbar(enumerate(frame_stream), total=len(frame_stream), desc="Writing viz video"):
             rgb_img = get_rgb_img(frame_data)
             img_rows = []
             for attr_row in attributes:

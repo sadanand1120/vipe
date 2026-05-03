@@ -19,7 +19,8 @@ import click
 import hydra
 
 from vipe import get_config_path
-from vipe.runtime import make_annotation_pipeline, make_frame_dir_stream_list
+from vipe.pipeline.default import DefaultAnnotationPipeline
+from vipe.streams.base import FrameDir
 from vipe.utils.logging import configure_logging
 from vipe.utils.viser import run_viser
 
@@ -60,9 +61,20 @@ def infer(frame_dir: Path, fps: float, output: Path, visualize: bool):
         args = hydra.compose("default", overrides=overrides)
 
     logger.info(f"Processing frame directory {frame_dir}...")
-    vipe_pipeline = make_annotation_pipeline(args.pipeline)
-    video_stream = make_frame_dir_stream_list(args.streams)[0]
-    vipe_pipeline.run(video_stream)
+    vipe_pipeline = DefaultAnnotationPipeline(
+        init=args.pipeline.init,
+        slam=args.pipeline.slam,
+        post=args.pipeline.post,
+        output=args.pipeline.output,
+    )
+    frame_stream = FrameDir(
+        path=args.streams.base_path,
+        fps=args.streams.fps,
+        frame_start=args.streams.frame_start,
+        frame_end=args.streams.frame_end,
+        frame_skip=args.streams.frame_skip,
+    )
+    vipe_pipeline.run(frame_stream)
     logger.info("Finished")
 
 

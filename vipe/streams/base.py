@@ -13,20 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Iterator, Protocol
+from pathlib import Path
+from typing import Any, Iterator, Protocol
 
+import cv2
 import numpy as np
 import torch
-from torch.utils.data import IterableDataset
 
 from vipe.ext.lietorch import SE3
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
-
-logger = logging.getLogger(__name__)
+from vipe.utils.misc import sort_image_sequence
 
 
 class FrameAttribute(Enum):
@@ -40,10 +39,10 @@ class FrameAttribute(Enum):
 
 
 @dataclass(kw_only=True, slots=True)
-class VideoFrame:
+class FrameData:
     """
-    Frame data from a single video frame.
-    - raw_frame_idx: The index of the frame in the video.
+    Frame data from one RGB image.
+    - raw_frame_idx: The index of the frame in the sorted frame directory.
     - rgb: The RGB image of the frame. The shape is (H, W, 3), RGB, with range 0-1.
     - pose: The pose of the camera at the time the frame was captured (c2w aka. Twc, opencv convention).
     - camera_type: The type of camera used to capture the raw frame.
@@ -133,10 +132,10 @@ class VideoFrame:
         else:
             raise ValueError(f"Attribute {attribute} is not available in the frame.")
 
-    def cpu(self) -> "VideoFrame":
+    def cpu(self) -> "FrameData":
         map_cpu = lambda x: x.cpu() if x is not None else None
 
-        return VideoFrame(
+        return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=self.rgb.cpu(),
             mask=map_cpu(self.mask),
@@ -150,10 +149,10 @@ class VideoFrame:
             information=self.information,
         )
 
-    def cuda(self) -> "VideoFrame":
+    def cuda(self) -> "FrameData":
         map_cuda = lambda x: x.cuda() if x is not None else None
 
-        return VideoFrame(
+        return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=self.rgb.cuda(),
             mask=map_cuda(self.mask),
@@ -167,7 +166,7 @@ class VideoFrame:
             information=self.information,
         )
 
-    def resize(self, size: tuple[int, int]) -> "VideoFrame":
+    def resize(self, size: tuple[int, int]) -> "FrameData":
         """
         Resize the frame to a given size.
         """
@@ -210,7 +209,7 @@ class VideoFrame:
         # Distortion coefficients are usually w.r.t normalized coordinates so no need to change here.
         new_camera_type = self.camera_type
 
-        return VideoFrame(
+        return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=new_rgb,
             mask=new_mask,
@@ -224,7 +223,7 @@ class VideoFrame:
             information=self.information,
         )
 
-    def crop(self, top: int, bottom: int, left: int, right: int) -> "VideoFrame":
+    def crop(self, top: int, bottom: int, left: int, right: int) -> "FrameData":
         """
         Crop the frame with given top, bottom, left, right.
         """
@@ -257,7 +256,7 @@ class VideoFrame:
 
         new_camera_type = self.camera_type
 
-        return VideoFrame(
+        return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=new_rgb,
             mask=new_mask,
@@ -299,9 +298,9 @@ class VideoFrame:
         return dav3_rgb, dav3_ext, dav3_int
 
 
-class VideoStream(IterableDataset[VideoFrame]):
+class FrameStream:
     """
-    Base class for video streams.
+    Minimal frame sequence interface used by the pipeline.
     """
 
     def frame_size(self) -> tuple[int, int]:
@@ -319,125 +318,75 @@ class VideoStream(IterableDataset[VideoFrame]):
     def attributes(self) -> set[FrameAttribute]:
         return set()
 
-    def get_stream_attribute(self, attribute: FrameAttribute) -> list[Any]:
-        stream_attribute = []
-        for frame in self:
-            stream_attribute.append(frame.get_attribute(attribute))
-        return stream_attribute
 
-
-class MultiviewVideoList(Iterable[VideoStream]):
+class FrameDir(FrameStream):
     """
-    A list of video streams from multiple views.
+    Re-iterable RGB frame directory reader.
     """
 
-    def __init__(self, name: str, video_streams: list[VideoStream], rig: SE3) -> None:
-        if len(rig.shape) == 0:
-            rig = rig[None]
-        self._name = name
-        self._video_streams = video_streams
-        self._rig = rig
-        self._len = len(video_streams[0])
+    def __init__(
+        self,
+        path: str | Path,
+        fps: float,
+        frame_start: int = 0,
+        frame_end: int = -1,
+        frame_skip: int = 1,
+        name: str | None = None,
+    ) -> None:
+        path = Path(path)
+        self.path = path
+        self._name = name if name is not None else path.name
 
-        for vs in video_streams:
-            assert len(vs) == self._len
-        assert self._rig.shape[0] == len(video_streams)
+        if not path.is_dir():
+            raise ValueError(f"Frame directory not found: {path}")
 
-    def __len__(self) -> int:
-        return len(self._video_streams)
+        image_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+        frame_files = []
+        for ext in image_extensions:
+            frame_files.extend(path.glob(f"*{ext}"))
+            frame_files.extend(path.glob(f"*{ext.upper()}"))
 
-    def __iter__(self):
-        for idx in range(len(self)):
-            yield self[idx]
+        self.frame_files = sort_image_sequence(set(frame_files))
+        if not self.frame_files:
+            raise ValueError(f"No image files found in directory: {path}")
 
-    def name(self) -> str:
-        return self._name
+        first_frame = cv2.imread(str(self.frame_files[0]))
+        if first_frame is None:
+            raise ValueError(f"Could not read first frame: {self.frame_files[0]}")
 
-    def rig(self) -> SE3:
-        return self._rig.cuda()
+        self._height, self._width = first_frame.shape[:2]
+        self.start = frame_start
+        self.end = len(self.frame_files) if frame_end == -1 else min(frame_end, len(self.frame_files))
+        self.step = frame_skip
+        self._fps = fps / self.step
 
-    def num_frames(self) -> int:
-        return self._len
-
-    def __getitem__(self, idx: int) -> VideoStream:
-        return self._video_streams[idx]
-
-
-class CachedVideoStream(VideoStream):
-    """
-    Cache a video stream.
-    """
-
-    DISPLAY_THRESH = 20
-
-    def __init__(self, video_stream: VideoStream, desc: str = "Caching") -> None:
-        self._frame_size = video_stream.frame_size()
-        self._fps = video_stream.fps()
-        self._name = video_stream.name()
-        self._attributes = video_stream.attributes()
-        self._len = len(video_stream)
-        self.iterator = iter(video_stream)
-        self.data: list[VideoFrame] = []
-        self.desc = desc
+    def frame_size(self) -> tuple[int, int]:
+        return (self._height, self._width)
 
     def fps(self) -> float:
         return self._fps
 
-    def frame_size(self) -> tuple[int, int]:
-        return self._frame_size
-
     def name(self) -> str:
         return self._name
 
     def __len__(self) -> int:
-        return self._len
+        return len(range(self.start, self.end, self.step))
 
-    def __getitem__(self, index) -> VideoFrame:
-        assert index < len(self)
-        n_iters_needed = index - len(self.data) + 1
-        if n_iters_needed <= 0:
-            return self.data[index].cuda()
+    def __iter__(self) -> Iterator[FrameData]:
+        for frame_idx in range(self.start, self.end, self.step):
+            frame_path = self.frame_files[frame_idx]
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                raise ValueError(f"Could not read frame: {frame_path}")
 
-        itr = range(n_iters_needed)
-        if n_iters_needed > self.DISPLAY_THRESH:
-            itr = pbar(itr, total=n_iters_needed, desc=self.desc)
-
-        for _ in itr:
-            assert self.iterator is not None
-            try:
-                self.data.append(next(self.iterator).cpu())
-            except StopIteration:
-                logger.warning(
-                    "Iterator is exhausted -- expecting total frames = %d, stopped at %d",
-                    len(self),
-                    len(self.data),
-                )
-                self._len = len(self.data)
-                index = min(index, self._len - 1)
-                break
-
-        # If iteration is finished, we can release the iterator
-        if len(self.data) == len(self):
-            self.iterator = None
-            torch.cuda.empty_cache()
-
-        return self.data[index].cuda()
-
-    def __iter__(self):
-        for idx in range(len(self)):
-            # Since len(self) might change during iteration, we check again here:
-            if idx >= len(self):
-                break
-
-            yield self[idx]
-
-    def attributes(self) -> set[FrameAttribute]:
-        return self._attributes
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
+            yield FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb)
 
 
-class StreamProcessor(Protocol):
+class FrameProcessor(Protocol):
     """
-    Interface of a stream processor that processes each video frame.
+    Interface for one lazy per-frame transform.
     """
 
     n_passes_required: int = 1
@@ -451,32 +400,32 @@ class StreamProcessor(Protocol):
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes
 
-    def update_iterator(self, previous_iterator: Iterator[VideoFrame], pass_idx: int) -> Iterator[VideoFrame]:
+    def update_iterator(self, previous_iterator: Iterator[FrameData], pass_idx: int) -> Iterator[FrameData]:
         for frame_idx, frame in enumerate(previous_iterator):
             yield self(frame_idx, frame)
 
-    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame: ...
+    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData: ...
 
 
-class AssignAttributesProcessor(StreamProcessor):
+class AssignAttributesProcessor(FrameProcessor):
     def __init__(self, stream_attributes: dict[FrameAttribute, list[Any]]):
         self.stream_attributes = stream_attributes
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes.union(self.stream_attributes.keys())
 
-    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
+    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
         for attribute, attribute_values in self.stream_attributes.items():
             frame.set_attribute(attribute, attribute_values[frame_idx])
         return frame
 
 
-class ProcessedVideoStream(VideoStream):
+class ProcessedFrameStream(FrameStream):
     """
-    A video stream from a raw video stream, with processing applied.
+    Lazy frame stream with processing applied.
     """
 
-    def __init__(self, stream: VideoStream, processors: list[StreamProcessor]) -> None:
+    def __init__(self, stream: FrameStream, processors: list[FrameProcessor]) -> None:
         super().__init__()
         self.stream = stream
         self.processors = processors
@@ -503,16 +452,7 @@ class ProcessedVideoStream(VideoStream):
     def name(self) -> str:
         return self.stream.name()
 
-    def cache(self, desc: str = "Caching", online: bool = False) -> CachedVideoStream:
-        vs = CachedVideoStream(self, desc)
-
-        # If not online, we trigger __getitem__ of the last element to force storing all frames.
-        if not online:
-            _ = vs[len(vs) - 1]
-
-        return vs
-
-    def _build_iterator(self, pass_idx: int) -> Iterator[VideoFrame]:
+    def _build_iterator(self, pass_idx: int) -> Iterator[FrameData]:
         iterator = iter(self.stream)
         for processor in self.processors:
             iterator = processor.update_iterator(iterator, pass_idx)
@@ -529,15 +469,3 @@ class ProcessedVideoStream(VideoStream):
                 for _ in pbar(iterator, desc=f"Pre-iterating for pass {pass_idx}"):
                     pass
         return iterator
-
-
-class StreamList:
-    def __len__(self) -> int:
-        raise NotImplementedError
-
-    def __getitem__(self, index) -> VideoStream:
-        raise NotImplementedError
-
-    def stream_name(self, index: int) -> str:
-        # This can be overriden by subclasses to avoid instantiating the stream.
-        return self[index].name()

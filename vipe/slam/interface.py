@@ -30,7 +30,7 @@ class SLAMMap:
     dense_disp_xyz: torch.Tensor
     # (M, 3) tensor of RGB colors (0-1)
     dense_disp_rgb: torch.Tensor
-    # (N, V, 2) range of corresponding keyframe and view indices
+    # (N, 2) range of corresponding keyframe indices
     dense_disp_packinfo: torch.Tensor
     # Actual frame indices of the dense_disp_xyz (assert sorted)
     dense_disp_frame_inds: list[int]
@@ -80,18 +80,18 @@ class SLAMMap:
         backend_graph: torch.Tensor | None = None,
     ):
         """
-        xyz: (N, V, H, W, 3)
-        rgb: (N, V, H, W, 3)
-        mask: (N, V, H, W)
+        xyz: (N, H, W, 3)
+        rgb: (N, H, W, 3)
+        mask: (N, H, W)
         tstamps: (N,)
         backend_graph: (Q, 2)
         """
         assert torch.all(tstamps[1:] > tstamps[:-1]), "Timestamps should be sorted."
-        N, V, H, W, C = xyz.shape
+        N, H, W, C = xyz.shape
         xyz = xyz.reshape(-1, C)[mask.reshape(-1)]
         rgb = rgb.reshape(-1, C)[mask.reshape(-1)]
-        valid_count = mask.sum([2, 3]).reshape(-1)
-        packinfo = torch.stack([torch.cumsum(valid_count, 0) - valid_count, valid_count], dim=-1).reshape(N, V, 2)
+        valid_count = mask.sum([1, 2]).reshape(-1)
+        packinfo = torch.stack([torch.cumsum(valid_count, 0) - valid_count, valid_count], dim=-1).reshape(N, 2)
         assert tstamps.shape[0] == N
         return SLAMMap(
             dense_disp_xyz=xyz,
@@ -101,20 +101,12 @@ class SLAMMap:
             backend_graph=backend_graph,
         )
 
-    def get_dense_disp_pcd(self, keyframe_idx: int, view_idx: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
-        if view_idx == -1:
-            xyz, color = [], []
-            for v in range(self.dense_disp_packinfo.shape[1]):
-                xyz_v, color_v = self.get_dense_disp_pcd(keyframe_idx, v)
-                xyz.append(xyz_v)
-                color.append(color_v)
-            return torch.cat(xyz, dim=0), torch.cat(color, dim=0)
-        else:
-            start, count = self.dense_disp_packinfo[keyframe_idx, view_idx]
-            return (
-                self.dense_disp_xyz[start : start + count],
-                self.dense_disp_rgb[start : start + count],
-            )
+    def get_dense_disp_pcd(self, keyframe_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        start, count = self.dense_disp_packinfo[keyframe_idx]
+        return (
+            self.dense_disp_xyz[start : start + count],
+            self.dense_disp_rgb[start : start + count],
+        )
 
     def get_dense_disp_full_pcd(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -130,7 +122,6 @@ class SLAMMap:
     def project_map(
         self,
         frame_tstamp: int,
-        view_idx: int,
         target_size: tuple[int, int],
         target_intrinsics: torch.Tensor,
         target_pose: SE3,
@@ -144,8 +135,7 @@ class SLAMMap:
 
         xyz_list = []
         for keyframe_idx in range(left_keyframe_idx, right_keyframe_idx + 1):
-            # If view_idx = -1 this will be all views
-            xyz, _ = self.get_dense_disp_pcd(keyframe_idx, view_idx)
+            xyz, _ = self.get_dense_disp_pcd(keyframe_idx)
             xyz_list.append(xyz)
         all_xyz = torch.cat(xyz_list, dim=0)
 
@@ -186,9 +176,8 @@ class SLAMMap:
 @dataclass(kw_only=True)
 class SLAMOutput:
     trajectory: SE3  # (N,)
-    intrinsics: torch.Tensor  # (V, 4)
+    intrinsics: torch.Tensor  # (4,)
 
-    rig: SE3 | None = None  # (V,)
     slam_map: SLAMMap | None = None
 
     # Residual of BA (unit is pixel/diagonal) -- average num of pixels/diagonal between predicted and observed flows
@@ -199,7 +188,3 @@ class SLAMOutput:
     def keyframe_ids(self) -> np.ndarray:
         assert self.slam_map is not None, "SLAM map not available."
         return np.array(self.slam_map.dense_disp_frame_inds)
-
-    def get_view_trajectory(self, view_idx: int) -> SE3:
-        assert self.rig is not None, "Rig not available."
-        return self.trajectory * self.rig[view_idx][None]  # type: ignore

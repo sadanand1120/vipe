@@ -147,20 +147,29 @@ def run_vipe(overrides: list[str]) -> None:
     import hydra
 
     from vipe import get_config_path
-    from vipe.runtime import make_annotation_pipeline, make_frame_dir_stream_list
+    from vipe.pipeline.default import DefaultAnnotationPipeline
+    from vipe.streams.base import FrameDir
     from vipe.utils.logging import configure_logging
 
     with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
         cfg = hydra.compose("default", overrides=overrides)
 
-    stream_list = make_frame_dir_stream_list(cfg.streams)
-    if len(stream_list) != 1:
-        raise ValueError(f"Expected exactly one frame stream, got {len(stream_list)}")
-
     logger = configure_logging()
-    stream = stream_list[0]
+    stream = FrameDir(
+        path=cfg.streams.base_path,
+        fps=cfg.streams.fps,
+        frame_start=cfg.streams.frame_start,
+        frame_end=cfg.streams.frame_end,
+        frame_skip=cfg.streams.frame_skip,
+    )
+    pipeline = DefaultAnnotationPipeline(
+        init=cfg.pipeline.init,
+        slam=cfg.pipeline.slam,
+        post=cfg.pipeline.post,
+        output=cfg.pipeline.output,
+    )
     logger.info(f"Running ViPE on {stream.name()}")
-    make_annotation_pipeline(cfg.pipeline).run(stream)
+    pipeline.run(stream)
 
 
 def _read_depth_zip(depth_path: Path) -> dict[int, np.ndarray]:

@@ -27,7 +27,6 @@ class MotionFilter:
     """
     This class is used to filter incoming frames and extract features.
     This module re-uses Droid's network to detect scene changes without considering the mask.
-    For multi-view input, spawn keyframes if any of the views exceed the threshold.
     """
 
     def __init__(
@@ -57,19 +56,18 @@ class MotionFilter:
         main update operation - run on every frame in video
 
         Args:
-            image (torch.Tensor): VCHW image RGB 0-1
-            buffer_masks (torch.Tensor): Vhw mask 1-invalid, 0-valid
+            image (torch.Tensor): BCHW image RGB 0-1
+            buffer_masks (torch.Tensor): Bhw mask 1-invalid, 0-valid
         """
 
         ht = images.shape[-2] // 8
         wd = images.shape[-1] // 8
 
         # extract features (subsequent depth will also work on this resolution)
-        gmap = self.net.encode_features(images)  # (V, 128, ht//8, wd//8)
+        gmap = self.net.encode_features(images)  # (1, 128, ht//8, wd//8)
 
         ### always add first frame to the depth video ###
         if not self.initialized:
-            # (V, 128, ht//8, wd//8) x2
             net, inp = self.net.encode_context(images)
             # Store features of the last keyframe.
             self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
@@ -83,26 +81,20 @@ class MotionFilter:
         else:
             self.current_frame_idx += 1
 
-            # index correlation volume (1, 1, ht//8, wd//8, 2)
             coords0 = self.coords_grid(ht, wd, device=self.device)[None, None]
-            coords0 = coords0.repeat(1, images.shape[0], 1, 1, 1)
 
             # compute cost volume using current frame and the last keyframe.
-            # (1, V, 196, ht//8, wd//8)
             corr = CorrBlock(self.f_fmap[None], gmap[None])(coords0)
 
             # approximate flow magnitude using 1 update iteration
             _, delta, weight = self.net.update.forward(self.f_net[None], self.f_inp[None], corr)
-            # flow-delta and weight: (1, V, ht//8, wd//8, 2)
-
             dense_flow = delta.norm(dim=-1)[0]
             if self.f_mask is not None:
                 f_weight = (~self.f_mask).float()
                 dense_motion_score = (dense_flow * f_weight).mean([1, 2]) / (f_weight.mean([1, 2]) + 1e-6)
             else:
                 dense_motion_score = dense_flow.mean([1, 2])
-            # Across views [max is the most conservative, while min don't add a lot of KFs]
-            dense_motion_score = dense_motion_score.min().item()
+            dense_motion_score = dense_motion_score.item()
 
             # check motion magnitue / add new frame to video
             if dense_motion_score > self.thresh:

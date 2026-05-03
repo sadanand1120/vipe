@@ -8,7 +8,7 @@ import gdown
 import numpy as np
 import torch
 
-from vipe.streams.base import VideoFrame
+from vipe.streams.base import FrameData
 
 from .seg_tracker import SegTracker
 
@@ -79,12 +79,12 @@ class TrackAnythingPipeline:
         self.segtracker.restart_tracker()
         self.instance_phrase = {0: "background"}
 
-    def track(self, frame_data: VideoFrame) -> tuple[torch.Tensor, dict[int, str]]:
+    def track(self, frame_data: FrameData) -> tuple[torch.Tensor, dict[int, str]]:
         """
         Detect new and track existing objects in the frame.
 
         Args:
-            frame_data (VideoFrame): The frame data to track.
+            frame_data (FrameData): The frame data to track.
 
         Returns:
             torch.Tensor: The mask of the tracked objects (H, W) uint8 tensor.

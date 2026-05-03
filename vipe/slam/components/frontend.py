@@ -43,7 +43,6 @@ class SLAMFrontend:
             device,
             max_factors=48,
             incremental=True,
-            cross_view=args.cross_view,
         )
 
         # Number of frames that the frontend has so far optimized.
@@ -117,8 +116,7 @@ class SLAMFrontend:
         # set pose for next itration
         if not self.has_init_pose:
             self.__init_pose()
-        for v in range(self.video.n_views):
-            self.video.disps[self.t1, v] = self.video.disps[self.t1 - 1, v].mean()
+        self.video.disps[self.t1] = self.video.disps[self.t1 - 1].mean()
 
         # update visualization
         self.video.dirty[self.graph.ii.min() : self.t1] = True
@@ -139,8 +137,7 @@ class SLAMFrontend:
 
         if not self.has_init_pose:
             self.__init_pose()
-        for v in range(self.video.n_views):
-            self.video.disps[self.t1, v] = self.video.disps[self.t1 - 4 : self.t1, v].mean()
+        self.video.disps[self.t1] = self.video.disps[self.t1 - 4 : self.t1].mean()
         self.video.dirty[: self.t1] = True
 
         # initialization complete

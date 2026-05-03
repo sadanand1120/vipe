@@ -190,49 +190,47 @@ def iproj_i_proj_j_disp(
     disps_uv: torch.Tensor | None,
     intrinsics: torch.Tensor,
     camera_type: CameraType,
-    rig: SE3,
     pi: torch.Tensor,
     pj: torch.Tensor,
-    qi: torch.Tensor,
-    qj: torch.Tensor,
     di: torch.Tensor | None,
     jacobian_p_d: bool,
     jacobian_f: bool,
-    jacobian_r: bool,
 ):
     """
-    Compute proj[rig_qj.inv() * pose_j * pose_i.inv() * rig_qi * iproj(disp_i, intr_qi), intr_qj]
+    Compute proj[pose_j * pose_i.inv() * iproj(disp_i, intrinsics), intrinsics]
 
     Args:
         poses: (N, ) SE3 of inverse poses
-        disps: (NV/M, ...) tensor of disparities
-        disps_uv: (NV/M, ..., 2) tensor of uv coordinates (if None, disps must be dense_disps)
-        intrinsics: (Q, 4+D) tensor of intrinsics
-        rig: (Q, ) SE3 of rig c2w poses
+        disps: (N/M, ...) tensor of disparities
+        disps_uv: (N/M, ..., 2) tensor of uv coordinates (if None, disps must be dense_disps)
+        intrinsics: (4+D,) tensor of shared intrinsics
         pi: (M,) tensor of indices for pose_i indexing in N space
         pj: (M,) tensor of indices for pose_j indexing in N space
-        qi: (M,) tensor of indices for intr_qi indexing in Q space
-        qj: (M,) tensor of indices for intr_qj indexing in Q space
-        di: (M,) tensor of indices for dense_disp_i indexing in NV space
+        di: (M,) tensor of indices for dense_disp_i indexing in N space
             if None, disps/disps_uv must have leading dimension of M (i.e. n_terms).
         jacobian_p_d: bool to compute jacobian of the dense_disps
         jacobian_f: bool to compute jacobian of the focal/distortion
-        jacobian_r: bool to compute jacobian of the rig
 
     Returns:
         x1: (M, ..., 2) tensor of coordinates
         valid: (M, ..., 1) tensor of valid points
         (Ji, Jj, Jz): tuple of jacobian of the poses (M, ..., 2, 6), (M, ..., 2, 6), (M, ..., 2, 1)
         (Jfi, Jfj): tuple of jacobian of the intrinsics (M, ..., 2, 1+D), (M, ..., 2, 1+D)
-        (Jri, Jrj): tuple of jacobian of the rig    (M, ..., 2, 6), (M, ..., 2, 6)
     """
-    jacobian_p_d = jacobian_p_d or jacobian_f or jacobian_r
+    jacobian_p_d = jacobian_p_d or jacobian_f
 
-    # Convert leading dimension from M to NV.
+    # Convert leading dimension from M to N.
     if di is not None:
         disps = disps[di]
         if disps_uv is not None:
             disps_uv = disps_uv[di]
+
+    if intrinsics.dim() == 1 or intrinsics.shape[0] == 1:
+        intr_i = intrinsics.reshape(1, -1).expand(pi.shape[0], -1)
+        intr_j = intr_i
+    else:
+        intr_i = intrinsics[pi]
+        intr_j = intrinsics[pj]
 
     # inverse project (pinhole)
     # X0 (n_terms, ..., 4)
@@ -241,15 +239,14 @@ def iproj_i_proj_j_disp(
     X0, Jz, Jfi = iproj_disp(
         disps,
         disps_uv,
-        intrinsics[qi],
+        intr_i,
         camera_type,
         compute_jz=jacobian_p_d,
         compute_jf=jacobian_f,
     )
 
     # transform
-    Gij = poses[pj] * poses[pi].inv()
-    T = rig[qj].inv() * Gij * rig[qi]  # type: ignore
+    T = poses[pj] * poses[pi].inv()
     assert T is not None
     # X1 (n_terms, ..., 4), Ja = d(T*iproj_z)/dT = (n_terms, ..., 4, 6)
     X1, Ja = actp(T, X0, compute_jp=jacobian_p_d)
@@ -257,7 +254,7 @@ def iproj_i_proj_j_disp(
     # project (pinhole),
     # Jp = d(proj)/d(T*iproj_z) = (n_terms, ..., 2, 4)
     # Jfj = d(proj)/dfj = (n_terms, ..., 2, 1+D)
-    x1, Jp, Jfj = proj_points(X1, intrinsics[qj], camera_type, compute_jp=jacobian_p_d, compute_jf=jacobian_f)
+    x1, Jp, Jfj = proj_points(X1, intr_j, camera_type, compute_jp=jacobian_p_d, compute_jf=jacobian_f)
 
     # exclude points too close to camera
     valid = ((X1[..., 2] > BaseCameraModel.MIN_DEPTH) & (X0[..., 2] > BaseCameraModel.MIN_DEPTH)).float()
@@ -269,12 +266,10 @@ def iproj_i_proj_j_disp(
     expanded_indexing = (slice(None),) + (None,) * (n_dot_dim + 1)
 
     if jacobian_p_d:
-        # Ja now becomes d(T*iproj_z)/dGj
-        Ja = rig[qj].inv()[expanded_indexing].adjT(Ja)
         # dproj/dGj = Jp * Ja
         Jj = torch.matmul(Jp, Ja)  # type: ignore
         # dproj/dGi = dproj/dT * Adj_(Rjinv Gj) * -Adj_iinv = -Jj @ Adj(Gij)
-        Ji = -Gij[expanded_indexing].adjT(Jj)  # type: ignore
+        Ji = -T[expanded_indexing].adjT(Jj)  # type: ignore
 
         # d(T*iproj_z)/dz = d(T*iproj_z)/d(iproj_z) * d(iproj_z)/dz
         Jz = T[dot_indexing] * Jz
@@ -289,13 +284,7 @@ def iproj_i_proj_j_disp(
     else:
         Jfi = Jfj = None
 
-    if jacobian_r:
-        # Rig should behave opposite to the poses
-        Jri, Jrj = -Ji, -Jj  # type: ignore
-    else:
-        Jri = Jrj = None
-
-    return x1, valid, (Ji, Jj, Jz), (Jfi, Jfj), (Jri, Jrj)
+    return x1, valid, (Ji, Jj, Jz), (Jfi, Jfj)
 
 
 def frame_distance_dense_disp(
@@ -303,11 +292,8 @@ def frame_distance_dense_disp(
     dense_disps: torch.Tensor,
     intrinsics: torch.Tensor,
     camera_type: CameraType,
-    rig: SE3,
     pi: torch.Tensor,
     pj: torch.Tensor,
-    qi: torch.Tensor,
-    qj: torch.Tensor,
     di: torch.Tensor,
     beta: float,
 ) -> torch.Tensor:
@@ -319,26 +305,19 @@ def frame_distance_dense_disp(
 
     Args:
         poses: (N, ) SE3 of inverse poses
-        dense_disps: (NV, H, W) tensor of disparities
-        intrinsics: (Q, 4+D) tensor of intrinsics
+        dense_disps: (N, H, W) tensor of disparities
+        intrinsics: (4+D,) tensor of shared intrinsics
         camera_type: CameraType to be used
-        rig: (Q, ) SE3 of rig c2w poses
         pi: (M,) tensor of indices for pose_i indexing in N space
         pj: (M,) tensor of indices for pose_j indexing in N space
-        qi: (M,) tensor of indices for intr_qi indexing in Q space
-        qj: (M,) tensor of indices for intr_qj indexing in Q space
-        di: (M,) tensor of indices for dense_disp_i indexing in NV space
+        di: (M,) tensor of indices for dense_disp_i indexing in N space
 
     Returns:
         distance: (M,) tensor of frame distances
     """
-    pinhole_intrinsics = camera_type.build_camera_model(intrinsics).pinhole().intrinsics
-
-    # Expand pose into NQ space
-    poses = (rig.inv().view((1, -1)) * poses.view((-1, 1))).view((-1,))  # type: ignore
-    num_views = rig.shape[0]
-    pi = pi * num_views + qi
-    pj = pj * num_views + qj
+    pinhole_intrinsics = camera_type.build_camera_model(intrinsics.reshape(1, -1)).pinhole().intrinsics
+    qi = torch.zeros_like(pi)
+    qj = torch.zeros_like(pj)
 
     return slam_ext.frame_distance(
         poses.data,

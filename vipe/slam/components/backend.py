@@ -50,7 +50,6 @@ class SLAMBackend:
             itrs=16 if more_iters else 8,
             steps=steps_preintr,
             optimize_intrinsics=self.args.optimize_intrinsics,
-            optimize_rig_rotation=self.args.optimize_rig_rotation,
             solver_verbose=True,
         )
         self.video.update_disps_sens(self.depth_model, frame_idx=None)
@@ -59,7 +58,6 @@ class SLAMBackend:
             itrs=16 if more_iters else 8,
             steps=steps_postintr,
             optimize_intrinsics=False,
-            optimize_rig_rotation=self.args.optimize_rig_rotation,
             solver_verbose=True,
         )
 
@@ -68,7 +66,6 @@ class SLAMBackend:
             itrs=16 if more_iters else 8,
             steps=steps,
             optimize_intrinsics=self.args.optimize_intrinsics,
-            optimize_rig_rotation=self.args.optimize_rig_rotation,
             solver_verbose=True,
         )
 
@@ -84,7 +81,6 @@ class SLAMBackend:
             self.device,
             max_factors=16 * t,
             incremental=False,
-            cross_view=self.args.cross_view,
         )
 
         graph.add_proximity_factors(
@@ -94,11 +90,8 @@ class SLAMBackend:
             beta=self.args.beta,
         )
 
-        if self.args.adaptive_cross_view:
-            self.video.build_adaptive_cross_view_idx()
-
         if len(graph.ii) > 0:
-            more_iters = self.args.optimize_intrinsics or self.args.optimize_rig_rotation
+            more_iters = self.args.optimize_intrinsics
             if self.depth_model is not None:
                 self._iterate_with_depth(graph, steps, more_iters)
             else:
@@ -120,5 +113,5 @@ class SLAMBackend:
 
     @torch.no_grad()
     def run_if_necessary(self, steps: int = 12, log: bool = False):
-        if self.args.optimize_intrinsics or self.args.optimize_rig_rotation:
+        if self.args.optimize_intrinsics:
             self.run(steps=steps, update_depth=True, log=log)

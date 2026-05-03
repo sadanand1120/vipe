@@ -32,13 +32,12 @@ from vipe.ext.lietorch import SE3
 from vipe.priors.depth import DepthEstimationInput, DepthEstimationModel
 from vipe.priors.depth.base import DepthType
 from vipe.utils.cameras import CameraType
-from vipe.utils.logging import pbar
 
 from ..ba.solver import Solver, SparseBlockVector
 from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm
 from ..interface import SLAMMap
 from ..maths import geom
-from ..maths.retractor import DenseDispRetractor, IntrinsicsRetractor, PoseRetractor, RigRotationOnlyRetractor
+from ..maths.retractor import DenseDispRetractor, IntrinsicsRetractor, PoseRetractor
 
 
 logger = logging.getLogger(__name__)
@@ -49,166 +48,66 @@ class GraphBuffer:
         self,
         height: int,
         width: int,
-        n_views: int,
         buffer_size: int,
         init_disp: float,
-        cross_view_idx: list[int] | None,
         ba_config: DictConfig,
         camera_type: CameraType,
         device: torch.device = torch.device("cuda"),
     ):
-        if cross_view_idx is None:
-            cross_view_idx = [(i + 1) % n_views for i in range(n_views)]
-
         self.n_frames: int = 0
 
         self.height = height
         self.width = width
-        self.n_views = n_views
         self.device = device
         self.ba_config = ba_config
         self.camera_type = camera_type
 
         assert self.height % 8 == 0 and self.width % 8 == 0
+        dd_height, dd_width = self.height // 8, self.width // 8
 
-        # timestamp (frame index)
+        # Frame index in the original stream.
         self.tstamp = torch.zeros(buffer_size, device=device, dtype=torch.int)
-        # Original image (full resolution) RGB 0-1.
-        self.images = torch.zeros(
-            buffer_size,
-            self.n_views,
-            3,
-            self.height,
-            self.width,
-            device=device,
-            dtype=torch.float16,
-        )
+
+        # RGB image at resized SLAM resolution, shape: (frame, channel, height, width).
+        self.images = torch.zeros(buffer_size, 3, self.height, self.width, device=device, dtype=torch.float16)
+
         self.dirty = torch.zeros(buffer_size, device=device, dtype=torch.bool)
-        # Rig pose defined as the 0-th view of each frame.
+
+        # World-to-camera pose for each buffered frame.
         self.poses = torch.zeros(buffer_size, 7, device=device, dtype=torch.float)
-        self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.poses.device)
-        # This will be the original intrinsics
-        self.intrinsics = torch.zeros(
-            self.n_views,
-            self.camera_type.intrinsics_dim(),
-            device=device,
-            dtype=torch.float,
-        )
-        # rig pose in a multi-view setting.
-        self.rig = torch.zeros(self.n_views, 7, device=device, dtype=torch.float)
-        self.rig[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.rig.device)
+        self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=device)
 
-        # Inferred inverse depth (resolution / 8)
-        self.disps = (
-            torch.ones(
-                buffer_size,
-                self.n_views,
-                self.height // 8,
-                self.width // 8,
-                device=device,
-                dtype=torch.float,
-            )
-            * init_disp
-        )
+        # Shared pinhole intrinsics for this single stream.
+        self.intrinsics = torch.zeros(self.camera_type.intrinsics_dim(), device=device, dtype=torch.float)
 
-        # Sensor inverse depth (resolution / 8), used to add MSE to BA: |disps - disps_sens|^2.
-        self.disps_sens = torch.zeros(
-            buffer_size,
-            self.n_views,
-            self.height // 8,
-            self.width // 8,
-            device=device,
-            dtype=torch.float,
-        )
+        # Dense disparity tensors at 1/8 SLAM resolution.
+        self.disps = torch.ones(buffer_size, dd_height, dd_width, device=device, dtype=torch.float) * init_disp
+        self.disps_sens = torch.zeros(buffer_size, dd_height, dd_width, device=device, dtype=torch.float)
+        self.masks = torch.zeros(buffer_size, dd_height, dd_width, device=device, dtype=torch.bool)
 
-        # Masks (resolution / 8), 1 = invalid, 0 = valid
-        self.masks = torch.zeros(
-            buffer_size,
-            self.n_views,
-            self.height // 8,
-            self.width // 8,
-            device=device,
-            dtype=torch.bool,
-        )
+        # DROID feature/context state, all at 1/8 SLAM resolution.
+        self.fmaps = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
+        self.nets = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
+        self.inps = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
 
-        # Droid attributes
-        # The updated operator will take the correlation volume of fmaps, the nets, and the inps,
-        # and update the nets (hidden state) to a new one.
-        # - feature maps
-        self.fmaps = torch.zeros(
-            buffer_size,
-            self.n_views,
-            128,
-            self.height // 8,
-            self.width // 8,
-            device=device,
-            dtype=torch.half,
-        )
-        # - GRU update operator initial state
-        self.nets = torch.zeros(
-            buffer_size,
-            self.n_views,
-            128,
-            self.height // 8,
-            self.width // 8,
-            device=device,
-            dtype=torch.half,
-        )
-        # - GRU update operator inputs (context)
-        self.inps = torch.zeros(
-            buffer_size,
-            self.n_views,
-            128,
-            self.height // 8,
-            self.width // 8,
-            device=device,
-            dtype=torch.half,
-        )
-
-        # [..., 0] is time, [..., 1] is view
-        assert len(cross_view_idx) == self.n_views
-        self.cross_view_idx = torch.zeros(buffer_size, self.n_views, 2, device=device, dtype=torch.long)
-        self.cross_view_idx[..., 0] = torch.arange(buffer_size, device=device)[:, None]
-        self.cross_view_idx[..., 1] = torch.tensor(cross_view_idx, device=device).long()[None]
-
-        # Used to store the intrinsics used to compute the sensor depth.
+        # Intrinsics used when disps_sens was last computed.
         self.last_depth_intrinsics: torch.Tensor | None = None
-
-    @property
-    def flattened_disps(self):
-        return rearrange(self.disps, "n v h w -> (n v) h w")
-
-    @property
-    def flattened_disps_sens(self):
-        return rearrange(self.disps_sens, "n v h w -> (n v) h w")
-
-    @property
-    def flattened_fmaps(self):
-        return rearrange(self.fmaps, "n v c h w -> (n v) c h w")
-
-    @property
-    def flattened_nets(self):
-        return rearrange(self.nets, "n v c h w -> (n v) c h w")
-
-    @property
-    def flattened_inps(self):
-        return rearrange(self.inps, "n v c h w -> (n v) c h w")
 
     @property
     def K(self) -> np.ndarray:
         intr_np = self.camera_type.build_camera_model(self.intrinsics).pinhole().intrinsics.cpu().numpy()
-        k_mat = np.eye(3)[None].repeat(self.n_views, axis=0)
-        k_mat[:, 0, 0] = intr_np[:, 0]
-        k_mat[:, 1, 1] = intr_np[:, 1]
-        k_mat[:, 0, 2] = intr_np[:, 2]
-        k_mat[:, 1, 2] = intr_np[:, 3]
+        k_mat = np.eye(3)
+        k_mat[0, 0] = intr_np[0]
+        k_mat[1, 1] = intr_np[1]
+        k_mat[0, 2] = intr_np[2]
+        k_mat[1, 2] = intr_np[3]
         return k_mat
 
     @property
     def K_dense_disp(self) -> np.ndarray:
-        k_mat = self.K
-        k_mat[:, 0] /= 8
-        k_mat[:, 1] /= 8
+        k_mat = self.K.copy()
+        k_mat[0] /= 8
+        k_mat[1] /= 8
         return k_mat
 
     def remove_second_newest(self, ix: int):
@@ -223,142 +122,32 @@ class GraphBuffer:
         self.inps[ix] = self.inps[ix + 1]
         self.fmaps[ix] = self.fmaps[ix + 1]
         self.masks[ix] = self.masks[ix + 1]
-        self.cross_view_idx[ix] = self.cross_view_idx[ix + 1]
         self.n_frames -= 1
 
     def update_disps_sens(self, depth_model: DepthEstimationModel | None, frame_idx: int | None):
         if depth_model is None:
             return
 
-        if frame_idx is not None:
-            # Update only one frame for frontend.
-            frames_to_update = [frame_idx]
-        else:
-            # Update all frames for backend.
+        if frame_idx is None:
             assert self.last_depth_intrinsics is not None
             if torch.allclose(self.last_depth_intrinsics, self.intrinsics):
                 return
             assert depth_model.depth_type == DepthType.METRIC_DEPTH
-            self.disps_sens[: self.n_frames] *= self.last_depth_intrinsics[0][0].item() / self.intrinsics[0][0].item()
+            self.disps_sens[: self.n_frames] *= self.last_depth_intrinsics[0].item() / self.intrinsics[0].item()
+            self.last_depth_intrinsics = self.intrinsics.clone()
             return
 
-        assert self.n_views == 1
-
-        for frame_idx in frames_to_update:
-            depth_input = DepthEstimationInput(
-                rgb=self.images[frame_idx].moveaxis(1, -1).float(),
-                intrinsics=self.intrinsics[0],
-                camera_type=self.camera_type,
-            )
-            disp_sens = depth_model.estimate(depth_input).metric_depth
-            disp_sens = disp_sens[:, 3::8, 3::8]
-            disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
-            self.disps_sens[frame_idx] = disp_sens
-
-        self.last_depth_intrinsics = self.intrinsics.clone()
-
-    def build_adaptive_cross_view_idx(self, valid_thresh: float = 400.0):
-        """
-        Use the current buffer info to update the cross_view_idx, based on reprojection distances.
-        """
-        if self.n_views == 1 or self.n_frames < 2:
-            return
-
-        ix = torch.arange(self.n_frames).to(self.device)
-        jx = torch.arange(self.n_frames).to(self.device)
-
-        ii, jj = torch.meshgrid(ix, jx, indexing="ij")
-        ii, jj = ii.reshape(-1), jj.reshape(-1)
-
-        ds = []
-        for offset in range(1, self.n_views):
-            ds.append(
-                self.frame_distance_dense_disp(ii, jj, beta=1.0, view_offset=offset, bidirectional=False)
-                .reshape(self.n_frames, self.n_frames, -1)
-                .permute(0, 2, 1)  # (source_edge, view, target_edge)
-            )
-        d_total = torch.stack(ds, dim=-1).reshape(self.n_frames, self.n_views, -1)
-        d_min, inds_best = torch.min(d_total, dim=-1)
-        t_best, off_best = inds_best // len(ds), inds_best % len(ds)
-        tgt_view_best = (off_best + 1 + torch.arange(self.n_views, device=self.device)) % self.n_views
-
-        old_inds = self.cross_view_idx[: self.n_frames]
-        new_inds = torch.stack([t_best, tgt_view_best], dim=-1)
-        update_mask = d_min < valid_thresh
-        logger.info(f"Updating {update_mask.sum().item()} cross-view indices out of {update_mask.numel()}.")
-
-        new_inds[~update_mask] = old_inds[~update_mask]
-        self.cross_view_idx[: self.n_frames] = new_inds
-
-    def expand_edge_multiview(
-        self,
-        ii: torch.Tensor,
-        jj: torch.Tensor,
-        cross: bool = True,
-        view_offset: int = 0,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """
-            Expand from edge (ii, jj) to (pi, qi, di, pj, qj, dj) which refers
-        to the actual indices in the flattened buffer.
-            In terms of ii == jj and cross=True this means to create cross-view edges of a single frame,
-        where the number of edges will also be n_views, e.g. (0, 1), (1, 2), (2, 0) for n_views=3.
-
-        Args:
-            ii (torch.Tensor): edge source (M, )
-            jj (torch.Tensor): edge target (M, )
-            cross (bool): whether to create cross-view edges for the same frame
-
-        Returns:
-            pi (torch.Tensor): source pose index (M * n_views, )
-            qi (torch.Tensor): source rig index (M * n_views, )
-            di (torch.Tensor): source dense_disp index (M * n_views, )
-            pj (torch.Tensor): target pose index (M * n_views, )
-            qj (torch.Tensor): target rig index (M * n_views, )
-            dj (torch.Tensor): target dense_disp index (M * n_views, )
-        """
-        qi = torch.arange(self.n_views, device=self.device).reshape(1, -1).to(self.device)
-        qi = qi.repeat(ii.shape[0], 1)
-        pi = ii.reshape(-1, 1).repeat(1, self.n_views).to(self.device)
-        qj = torch.arange(self.n_views, device=self.device).reshape(1, -1).to(self.device)
-        qj = qj.repeat(jj.shape[0], 1)
-        pj = jj.reshape(-1, 1).repeat(1, self.n_views).to(self.device)
-
-        if cross:
-            cross_mask = ii == jj
-            if torch.any(cross_mask):
-                t, v = self.cross_view_idx[pi[cross_mask], qi[cross_mask]].unbind(-1)
-                pj[cross_mask], qj[cross_mask] = t, v
-
-        qj = (qj + view_offset) % self.n_views
-
-        di = pi * self.n_views + qi
-        dj = pj * self.n_views + qj
-
-        return (
-            pi.reshape(-1),
-            qi.reshape(-1),
-            di.reshape(-1),
-            pj.reshape(-1),
-            qj.reshape(-1),
-            dj.reshape(-1),
+        depth_input = DepthEstimationInput(
+            rgb=self.images[frame_idx].moveaxis(0, -1).float(),
+            intrinsics=self.intrinsics,
+            camera_type=self.camera_type,
         )
-
-    def expand_tracks_edges(self, ii: torch.Tensor, tracks_length: int):
-        iis = [ii] * (tracks_length - 1)
-        jjs = [ii - m - 1 for m in range(tracks_length - 1)]
-        ii_cat, jj_cat = torch.cat(iis), torch.cat(jjs)
-        edge_mask = (ii_cat >= 0) & (ii_cat < self.n_frames) & (jj_cat >= 0) & (jj_cat < self.n_frames)
-        ii_cat, jj_cat = ii_cat[edge_mask], jj_cat[edge_mask]
-        pi, qi, di, pj, qj, dj = self.expand_edge_multiview(ii_cat, jj_cat, cross=False)
-        ti = pi - pj - 1
-        return pi, qi, di, pj, qj, dj, ti
+        metric_depth = depth_model.estimate(depth_input).metric_depth
+        assert metric_depth is not None
+        disp_sens = metric_depth[3::8, 3::8]
+        disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
+        self.disps_sens[frame_idx] = disp_sens
+        self.last_depth_intrinsics = self.intrinsics.clone()
 
     def bundle_adjustment(
         self,
@@ -375,33 +164,25 @@ class GraphBuffer:
         motion_only: bool,
         limited_disp: bool,
         optimize_intrinsics: bool,
-        optimize_rig_rotation: bool,
         verbose: bool,
     ):
-        """
-        This function is just an extraction from the factor_graph.
-        They have to be coupled together to work.
-        """
         assert t0 <= t1
         weight_dense_disp = 0.001
 
-        pi, qi, di, pj, qj, dj = self.expand_edge_multiview(ii, jj)
+        di = ii
         di_unique = torch.unique(di)
-        pi_unique = torch.unique(ii)  # Should be equivalent to unique(pi)
+        pose_i_unique = torch.unique(ii)
 
         solver = Solver(compute_energy=verbose)
         solver.add_term(
             DenseDepthFlowTerm(
-                pose_i_inds=pi,
-                pose_j_inds=pj,
-                rig_i_inds=qi,
-                rig_j_inds=qj,
+                pose_i_inds=ii,
+                pose_j_inds=jj,
                 dense_disp_i_inds=di,
                 target=target,
                 weight=weight_dense_disp * weight,
                 intrinsics=None,
                 intrinsics_factor=8.0,
-                rig=None,
                 image_size=(self.height // 8, self.width // 8),
                 camera_type=self.camera_type,
             )
@@ -409,13 +190,13 @@ class GraphBuffer:
 
         solver.set_fixed(
             "pose",
-            (torch.cat([pi_unique[pi_unique < t0], pi_unique[pi_unique >= t1]]) if t0 < t1 else None),
+            (torch.cat([pose_i_unique[pose_i_unique < t0], pose_i_unique[pose_i_unique >= t1]]) if t0 < t1 else None),
         )
         solver.set_retractor("pose", PoseRetractor())
         solver.set_damping("pose", damping=pose_damping, ep=pose_ep)
 
         if not motion_only:
-            disps_sens = rearrange(self.flattened_disps_sens, "nv h w -> nv (h w)")
+            disps_sens = rearrange(self.disps_sens, "n h w -> n (h w)")
             sens_i_inds = di_unique[disps_sens[di_unique].sum(1) > 0.0]
             if len(sens_i_inds) > 0:
                 solver.add_term(
@@ -426,7 +207,7 @@ class GraphBuffer:
                     )
                 )
             solver.set_retractor("dense_disp", DenseDispRetractor())
-            disp_damping = rearrange(disp_damping, "nv h w -> nv (h w)")
+            disp_damping = rearrange(disp_damping, "n h w -> n (h w)")
             solver.set_damping(
                 "dense_disp",
                 damping=SparseBlockVector(
@@ -436,7 +217,7 @@ class GraphBuffer:
                 ep=1e-7,
             )
             if limited_disp:
-                solver.set_fixed("dense_disp", torch.cat([di[pi < t0], di[pi >= t1]]))
+                solver.set_fixed("dense_disp", torch.cat([di[ii < t0], di[ii >= t1]]))
         else:
             solver.set_fixed("dense_disp")
         solver.set_marginilized("dense_disp")
@@ -447,14 +228,7 @@ class GraphBuffer:
         if not optimize_intrinsics:
             solver.set_fixed("intrinsics")
 
-        solver.set_retractor("rig", RigRotationOnlyRetractor())
-        solver.set_damping("rig", damping=1e-4, ep=1e-4)
-        if not optimize_rig_rotation:
-            solver.set_fixed("rig")
-        else:
-            solver.set_fixed("rig", torch.zeros(1, device=self.device).long())
-
-        disps_flattened = rearrange(self.flattened_disps, "nv h w -> nv (h w)")
+        disps_flattened = rearrange(self.disps, "n h w -> n (h w)")
 
         ba_energy = []
         for _ in range(n_iters):
@@ -463,7 +237,6 @@ class GraphBuffer:
                     "pose": SE3(self.poses),
                     "dense_disp": disps_flattened,
                     "intrinsics": self.intrinsics,
-                    "rig": SE3(self.rig),
                 }
             )
             ba_energy.append(cur_energy)
@@ -474,25 +247,21 @@ class GraphBuffer:
         self.disps.clamp_(min=0.001)
 
     def reproject_dense_disp(self, ii: torch.Tensor, jj: torch.Tensor):
-        """project points from ii -> jj. This will be optical flow from ii to jj when subtracted coords0"""
-        ii, jj = ii.reshape(-1), jj.reshape(-1)
-        pi, qi, di, pj, qj, _ = self.expand_edge_multiview(ii, jj)
-        assert self.disps is not None and self.intrinsics is not None
-        coords, valid_mask, _, _, _ = geom.iproj_i_proj_j_disp(
+        """Project each source dense-disparity map from frame ii into frame jj."""
+        ii = ii.reshape(-1).to(device=self.device, dtype=torch.long)
+        jj = jj.reshape(-1).to(device=self.device, dtype=torch.long)
+        intrinsics = self.camera_type.build_camera_model(self.intrinsics).scaled(1 / 8.0).intrinsics
+        coords, valid_mask, _, _ = geom.iproj_i_proj_j_disp(
             SE3(self.poses),
-            self.flattened_disps,
+            self.disps,
             None,
-            self.camera_type.build_camera_model(self.intrinsics).scaled(1 / 8.0).intrinsics,
+            intrinsics,
             self.camera_type,
-            SE3(self.rig),
-            pi,
-            pj,
-            qi,
-            qj,
-            di,
+            ii,
+            jj,
+            ii,
             jacobian_p_d=False,
             jacobian_f=False,
-            jacobian_r=False,
         )
         return coords, valid_mask
 
@@ -502,44 +271,37 @@ class GraphBuffer:
         jj: torch.Tensor,
         beta: float = 0.3,
         bidirectional=True,
-        view_offset: int = 0,
     ):
-        """frame distance metric"""
-        pi, qi, di, pj, qj, dj = self.expand_edge_multiview(ii, jj, cross=False, view_offset=view_offset)
+        ii = ii.reshape(-1).to(device=self.device, dtype=torch.long)
+        jj = jj.reshape(-1).to(device=self.device, dtype=torch.long)
         poses = self.poses[: self.n_frames]
         intrinsics = self.camera_type.build_camera_model(self.intrinsics).scaled(1 / 8.0).intrinsics
 
         d = geom.frame_distance_dense_disp(
             SE3(poses),
-            self.flattened_disps,
+            self.disps[: self.n_frames],
             intrinsics,
             self.camera_type,
-            SE3(self.rig),
-            pi,
-            pj,
-            qi,
-            qj,
-            di,
+            ii,
+            jj,
+            ii,
             beta,
         )
 
         if bidirectional:
             d2 = geom.frame_distance_dense_disp(
                 SE3(poses),
-                self.flattened_disps,
+                self.disps[: self.n_frames],
                 intrinsics,
                 self.camera_type,
-                SE3(self.rig),
-                pj,
-                pi,
-                qj,
-                qi,
-                dj,
+                jj,
+                ii,
+                jj,
                 beta,
             )
             d = 0.5 * (d + d2)
 
-        return d.view(-1, self.n_views)
+        return d
 
     def extract_slam_map(
         self,
@@ -551,45 +313,39 @@ class GraphBuffer:
             t_range = torch.arange(self.n_frames, device=self.device)
 
         c2w_se3 = SE3(self.poses[t_range]).inv()
-        images = rearrange(self.images[t_range][..., 3::8, 3::8], "n v c h w -> n v h w c")
-        n_frames, n_views, ht, wd, _ = images.shape
+        images = self.images[t_range, :, 3::8, 3::8].moveaxis(1, -1)
+        n_frames, _, _ = self.disps[t_range].shape
 
-        pts_list, mask_list = [], []
-        for v in range(self.n_views):
-            c2w_view: SE3 = c2w_se3 * SE3(self.rig[v])[None]  # type: ignore
-            disps_v = self.disps[t_range, v].contiguous()  # (n_frames, ht, wd)
-            camera_model = self.camera_type.build_camera_model(self.intrinsics[v])
-            pts, _, _ = geom.iproj_disp(
-                disps_v,
-                None,
-                camera_model.scaled(1 / 8.0).intrinsics[None].expand((n_frames, -1)),
-                camera_type=self.camera_type,
-            )
-            if not is_local:
-                pts: torch.Tensor = c2w_view[:, None, None].act(pts)  # type: ignore
-            pts = pts[..., :3] / pts[..., 3:]
+        disps = self.disps[t_range].contiguous()
+        camera_model = self.camera_type.build_camera_model(self.intrinsics)
+        pts, _, _ = geom.iproj_disp(
+            disps,
+            None,
+            camera_model.scaled(1 / 8.0).intrinsics[None].expand((n_frames, -1)),
+            camera_type=self.camera_type,
+        )
+        if not is_local:
+            pts = c2w_se3[:, None, None].act(pts)
+        pts = pts[..., :3] / pts[..., 3:]
 
-            # The threshold is applied on the depth differences.
-            filter_thresh_v = filter_thresh * (1.0 / disps_v.mean().item())
-            count = slam_ext.depth_filter(
-                c2w_view.inv().data,
-                disps_v,
-                camera_model.pinhole().intrinsics / 8.0,
-                torch.arange(n_frames, device=self.device),
-                torch.full((n_frames,), filter_thresh_v, device=self.device),
-            )
-            masks = (
-                (count >= min(2, n_frames - 1))
-                & (disps_v > 0.5 * disps_v.mean(dim=[1, 2], keepdim=True))
-                & (~self.masks[t_range, v])
-            )
-            pts_list.append(pts)
-            mask_list.append(masks)
+        filter_thresh_abs = filter_thresh * (1.0 / disps.mean().item())
+        count = slam_ext.depth_filter(
+            c2w_se3.inv().data,
+            disps,
+            camera_model.pinhole().intrinsics / 8.0,
+            torch.arange(n_frames, device=self.device),
+            torch.full((n_frames,), filter_thresh_abs, device=self.device),
+        )
+        masks = (
+            (count >= min(2, n_frames - 1))
+            & (disps > 0.5 * disps.mean(dim=[1, 2], keepdim=True))
+            & (~self.masks[t_range])
+        )
 
         return SLAMMap.from_masked_dense_disp(
-            torch.stack(pts_list, dim=1),
+            pts,
             images,
-            torch.stack(mask_list, dim=1),
+            masks,
             self.tstamp[t_range],
         )
 
@@ -612,27 +368,23 @@ class GraphBuffer:
                 rr.Transform3D(translation=pose_mat[:3, 3], mat3x3=pose_mat[:3, :3]),
             )
 
-            for v in range(self.n_views):
-                rig_mat = SE3(self.rig[v]).matrix().cpu().numpy()
-                dd_ht, dd_wd = self.disps_sens.shape[-2:]
+            dd_ht, dd_wd = self.disps_sens.shape[-2:]
+            pcd_xyz, pcd_rgb = current_map.get_dense_disp_pcd(di)
+            image = self.images[int(didx), :, 3::8, 3::8].moveaxis(0, -1).cpu().numpy()
 
-                pcd_xyz, pcd_rgb = current_map.get_dense_disp_pcd(di, v)
-                image = self.images[int(didx), v, :, 3::8, 3::8].moveaxis(0, -1).cpu().numpy()
-
-                rr.log(
-                    f"world/kf_{didx:04d}/v{v}",
-                    rr.Transform3D(translation=rig_mat[:3, 3], mat3x3=rig_mat[:3, :3]),
-                    rr.Pinhole(
-                        resolution=[dd_wd, dd_ht],
-                        image_from_camera=self.K_dense_disp[v],
-                        camera_xyz=rr.ViewCoordinates.RDF,
-                    ),
-                    rr.Image((image * 255).astype(np.uint8)).compress(),
-                )
-                rr.log(
-                    f"world/kp_{didx:04d}/v{v}",
-                    rr.Points3D(
-                        pcd_xyz.cpu().numpy(),
-                        colors=pcd_rgb.cpu().numpy().astype(np.float32),
-                    ),
-                )
+            rr.log(
+                f"world/kf_{didx:04d}/camera",
+                rr.Pinhole(
+                    resolution=[dd_wd, dd_ht],
+                    image_from_camera=self.K_dense_disp,
+                    camera_xyz=rr.ViewCoordinates.RDF,
+                ),
+                rr.Image((image * 255).astype(np.uint8)).compress(),
+            )
+            rr.log(
+                f"world/kp_{didx:04d}",
+                rr.Points3D(
+                    pcd_xyz.cpu().numpy(),
+                    colors=pcd_rgb.cpu().numpy().astype(np.float32),
+                ),
+            )

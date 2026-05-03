@@ -9,7 +9,6 @@ streams:
   frame_start: 0      # First frame index to read from the sorted frame list.
   frame_end: -1       # Exclusive end index; -1 means read through the end.
   frame_skip: 1       # Read every Nth frame; also divides effective stream FPS by N.
-  cached: false       # Preload all frames before processing; useful for malformed/slow frame sources.
 
 pipeline:
   init:
@@ -47,10 +46,6 @@ pipeline:
     backend_iters: 24                    # Final global backend BA iteration steps.
     init_disp: 1.0                       # Initial disparity value before metric depth is injected.
     optimize_intrinsics: false           # Optimize intrinsics during BA; keep false for fixed GeoCalib intrinsics.
-    optimize_rig_rotation: false         # Optimize multi-view rig rotations; unused for single frame-dir input.
-    cross_view: true                     # Allow cross-view factors when multiple views exist.
-    cross_view_idx: null                 # Per-view cross-view pairing; null chooses the next view cyclically.
-    adaptive_cross_view: false           # Recompute cross-view pairing from reprojection distances in backend BA.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     infill_dense_disp: false             # Also optimize dense disparity for infilled non-keyframes.
     map_filter_thresh: 0.05              # Relative depth-consistency threshold for extracting the SLAM map.
@@ -61,11 +56,10 @@ pipeline:
       intrinsics_damping_scale: 1.0      # Damping multiplier for intrinsics optimization variables.
 
   post:
-    depth_align_model: "mvd_dav3"        # Post-SLAM multiview DAV3 depth; null disables final depth estimation.
+    depth_align_model: "mvd_dav3"        # Post-SLAM DAV3 depth; null disables final depth estimation.
 
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.
-    skip_exists: false                   # Skip streams whose outputs already exist; currently not used by filtering.
     save_artifacts: false                # Save pose/depth/intrinsics/mask/pcd artifacts.
     pcd_fusion_mode: backproject         # Point cloud mode: backproject or tsdf.
     backproject_pcd_max_points: 8000000  # Max saved points for either backproject or sampled TSDF point cloud.

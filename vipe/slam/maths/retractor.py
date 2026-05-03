@@ -15,8 +15,8 @@
 
 import torch
 
-from vipe.ext.lietorch import SE3
 from vipe.utils.cameras import CameraType
+from vipe.ext.lietorch import SE3
 
 
 class BaseRetractor:
@@ -29,23 +29,10 @@ class PoseRetractor(BaseRetractor):
         x.data[inds] = SE3(x.data[inds]).retr(dx).data
 
 
-class RigRotationOnlyRetractor(BaseRetractor):
-    def oplus(self, x: SE3, inds: torch.Tensor, dx: torch.Tensor):
-        dx = dx.clone()
-        dx[:, :3] = 0  # zero out translation part
-        x.data[inds] = SE3(x.data[inds]).retr(dx).data
-
-
 class DenseDispRetractor(BaseRetractor):
     def oplus(self, x: torch.Tensor, inds: torch.Tensor, dx: torch.Tensor):
         dx = torch.where(dx > 10, torch.zeros_like(dx), dx)
         return super().oplus(x, inds, dx)
-
-
-class TracksDispRetractor(BaseRetractor):
-    def oplus(self, x: torch.Tensor, inds: torch.Tensor, dx: torch.Tensor):
-        super().oplus(x, inds, dx)
-        x.clamp_(min=1e-3, max=10)
 
 
 class IntrinsicsRetractor(BaseRetractor):
@@ -53,6 +40,10 @@ class IntrinsicsRetractor(BaseRetractor):
         self.camera_type = camera_type
 
     def oplus(self, x: torch.Tensor, inds: torch.Tensor, dx: torch.Tensor):
+        if x.dim() == 1:
+            x[:2] += dx[:, :1].sum(dim=0)
+            x[4:] += dx[:, 1:].sum(dim=0) * 0.01
+            return
         if len(dx) == 1:
             # Broadcast dx to all intrinsics
             inds = torch.where(x[:, 0] > 0)[0]
