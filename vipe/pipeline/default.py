@@ -38,7 +38,6 @@ from vipe.utils.visualization import save_projection_video
 from .processors import (
     DAV3DepthProcessor,
     GeoCalibIntrinsicsProcessor,
-    TrackAnythingProcessor,
 )
 
 
@@ -58,16 +57,12 @@ class InitAttributeRecorder(FrameProcessor):
         self.recorded_attributes = [
             FrameAttribute.INTRINSICS,
             FrameAttribute.CAMERA_TYPE,
-            FrameAttribute.INSTANCE,
-            FrameAttribute.MASK,
         ]
         self.stream_attributes: dict[FrameAttribute, list] = {attribute: [] for attribute in self.recorded_attributes}
-        self.instance_phrases: list[dict[int, str] | None] = []
 
     def __call__(self, frame_idx: int, frame):
         for attribute in self.recorded_attributes:
             self.stream_attributes[attribute].append(_cpu_value(frame.get_attribute(attribute)))
-        self.instance_phrases.append(None if frame.instance_phrases is None else dict(frame.instance_phrases))
         return frame
 
     def replay_processors(self) -> list[FrameProcessor]:
@@ -76,17 +71,15 @@ class InitAttributeRecorder(FrameProcessor):
             for attribute, values in self.stream_attributes.items()
             if any(value is not None for value in values)
         }
-        return [AssignRecordedInitProcessor(stream_attributes, self.instance_phrases)]
+        return [AssignRecordedInitProcessor(stream_attributes)]
 
 
 class AssignRecordedInitProcessor(FrameProcessor):
     def __init__(
         self,
         stream_attributes: dict[FrameAttribute, list],
-        instance_phrases: list[dict[int, str] | None],
     ) -> None:
         self.stream_attributes = stream_attributes
-        self.instance_phrases = instance_phrases
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes.union(self.stream_attributes.keys())
@@ -94,7 +87,6 @@ class AssignRecordedInitProcessor(FrameProcessor):
     def __call__(self, frame_idx: int, frame):
         for attribute, attribute_values in self.stream_attributes.items():
             frame.set_attribute(attribute, _cuda_value(attribute_values[frame_idx]))
-        frame.instance_phrases = self.instance_phrases[frame_idx]
         return frame
 
 
@@ -160,17 +152,8 @@ class DefaultAnnotationPipeline:
         assert FrameAttribute.INTRINSICS not in frame_stream.attributes()
         assert FrameAttribute.CAMERA_TYPE not in frame_stream.attributes()
         assert FrameAttribute.METRIC_DEPTH not in frame_stream.attributes()
-        assert FrameAttribute.INSTANCE not in frame_stream.attributes()
 
         init_processors.append(GeoCalibIntrinsicsProcessor(frame_stream, camera_type=self.camera_type))
-        if self.init_cfg.instance is not None:
-            init_processors.append(
-                TrackAnythingProcessor(
-                    self.init_cfg.instance.phrases,
-                    add_sky=self.init_cfg.instance.add_sky,
-                    sam_run_gap=int(frame_stream.fps() * self.init_cfg.instance.kf_gap_sec),
-                )
-            )
         recorder = InitAttributeRecorder()
         return InitializedFrameStream(frame_stream, init_processors, recorder)
 

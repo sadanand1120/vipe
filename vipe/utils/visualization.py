@@ -34,10 +34,6 @@ from vipe.utils.misc import unpack_optional
 from .geometry import project_points_to_panorama, project_points_to_pinhole
 
 
-rng = np.random.RandomState(200)
-_palette = ((rng.random((3 * 255)) * 0.7 + 0.3) * 255).astype(np.uint8).tolist()
-_palette = [0, 0, 0] + _palette
-
 POINTS_STENCIL = np.meshgrid(np.arange(-2, 3), np.arange(-2, 3))
 POINTS_STENCIL = np.stack(POINTS_STENCIL, axis=-1).reshape(-1, 2)
 POINTS_STENCIL = POINTS_STENCIL[np.max(np.abs(POINTS_STENCIL), axis=-1) > 1]
@@ -100,14 +96,6 @@ def bbox_with_size(pcd_xyz: torch.Tensor, quantile: float = 0.98):
         vis.text(f"{y_length.item():.2f}m", y_length_pos),
         vis.text(f"{z_length.item():.2f}m", z_length_pos),
     ]
-
-
-def colorize_mask(pred_mask: np.ndarray):
-    save_mask = Image.fromarray(pred_mask.astype(np.uint8))
-    save_mask = save_mask.convert(mode="P")
-    save_mask.putpalette(_palette)
-    save_mask = save_mask.convert(mode="RGB")
-    return np.array(save_mask)
 
 
 def colorize_depth(
@@ -328,7 +316,7 @@ def save_projection_video(
             return na_img
 
         depth_data = frame_data.metric_depth.reciprocal()
-        valid_depth = depth_data[~frame_data.sky_mask & torch.isfinite(depth_data)]
+        valid_depth = depth_data[torch.isfinite(depth_data)]
         if valid_depth.numel() == 0:
             return na_img
 
@@ -341,7 +329,6 @@ def save_projection_video(
         depth_max = depth_middle + depth_scale / 2 * 1.3
 
         depth_data = depth_data.clone()
-        depth_data[frame_data.sky_mask] = depth_min
         depth_data[~torch.isfinite(depth_data)] = depth_min
         depth_data = depth_data[::subsample_factor, ::subsample_factor]
         depth_img = depth_data.cpu().numpy().astype(float)
@@ -398,35 +385,6 @@ def save_projection_video(
         )[0].float()
         return (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-    def get_instance_img(frame_data: FrameData, rgb_img: np.ndarray) -> np.ndarray:
-        if frame_data.instance is None:
-            return na_img
-
-        instance_np = frame_data.instance.cpu().numpy()
-        instance_img = colorize_mask(instance_np.astype(float))
-        if frame_data.instance_phrases is not None:
-            for instance_id, instance_phrase in frame_data.instance_phrases.items():
-                if instance_id <= 0:
-                    continue
-                text_img = image.text(instance_phrase)
-                inst_mask = instance_np == instance_id
-                try:
-                    h_min, h_max = np.where(np.any(inst_mask, axis=1))[0][[0, -1]]
-                    w_min, w_max = np.where(np.any(inst_mask, axis=0))[0][[0, -1]]
-                    instance_img = image.place_image(
-                        text_img,
-                        instance_img,
-                        (w_min + w_max) // 2,
-                        (h_min + h_max) // 2,
-                    )
-                except IndexError:
-                    pass
-
-        if instance_img.dtype == np.float64:
-            instance_img = (instance_img[..., :3] * 255).astype(np.uint8)
-        instance_img = cv2.resize(instance_img, (img_w, img_h))
-        return cv2.addWeighted(rgb_img, 0.5, instance_img, 0.5, 0)
-
     with VideoWriter(video_path, frame_stream.fps()) as vw:
         trajectory_length = 0.0
         last_pose = None
@@ -442,8 +400,6 @@ def save_projection_video(
                         img_row.append(get_depth_img(frame_data))
                     elif attr_name == "pcd":
                         img_row.append(get_pcd_img(frame_data, rgb_img))
-                    elif attr_name == "instance":
-                        img_row.append(get_instance_img(frame_data, rgb_img))
                     elif attr_name == "rectified":
                         img_row.append(get_rectified_img(frame_data))
                     elif attr_name == "empty":

@@ -83,7 +83,6 @@ class GraphBuffer:
         # Dense disparity tensors at 1/8 SLAM resolution.
         self.disps = torch.ones(buffer_size, dd_height, dd_width, device=device, dtype=torch.float) * init_disp
         self.disps_sens = torch.zeros(buffer_size, dd_height, dd_width, device=device, dtype=torch.float)
-        self.masks = torch.zeros(buffer_size, dd_height, dd_width, device=device, dtype=torch.bool)
 
         # DROID feature/context state, all at 1/8 SLAM resolution.
         self.fmaps = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
@@ -121,7 +120,6 @@ class GraphBuffer:
         self.nets[ix] = self.nets[ix + 1]
         self.inps[ix] = self.inps[ix + 1]
         self.fmaps[ix] = self.fmaps[ix + 1]
-        self.masks[ix] = self.masks[ix + 1]
         self.n_frames -= 1
 
     def update_disps_sens(self, depth_model: DepthEstimationModel | None, frame_idx: int | None):
@@ -339,7 +337,6 @@ class GraphBuffer:
         masks = (
             (count >= min(2, n_frames - 1))
             & (disps > 0.5 * disps.mean(dim=[1, 2], keepdim=True))
-            & (~self.masks[t_range])
         )
 
         return SLAMMap.from_masked_dense_disp(

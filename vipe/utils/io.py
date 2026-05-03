@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-import cv2
 import imageio
 import Imath
 import numpy as np
@@ -73,14 +72,6 @@ class ArtifactPath:
     @property
     def camera_type_path(self) -> Path:
         return self.base_path / "intrinsics" / f"{self.artifact_name}_camera.txt"
-
-    @property
-    def mask_path(self) -> Path:
-        return self.base_path / "mask" / f"{self.artifact_name}.zip"
-
-    @property
-    def mask_phrase_path(self) -> Path:
-        return self.base_path / "mask" / f"{self.artifact_name}.txt"
 
     @property
     def meta_info_path(self) -> Path:
@@ -181,33 +172,6 @@ def read_depth_artifacts(zip_file_path: Path) -> Iterator[tuple[int, torch.Tenso
                 yield frame_idx, torch.from_numpy(depth_data.copy()).float()
 
 
-def read_instance_artifacts(
-    zip_file_path: Path,
-) -> Iterator[tuple[int, torch.Tensor]]:
-    """
-    Read instance mask from zipped PNG files.
-    """
-    with zipfile.ZipFile(zip_file_path, "r") as z:
-        for file_name in sorted(z.namelist()):
-            frame_idx = int(file_name.split(".")[0])
-            with z.open(file_name) as f:
-                mask_buffer = np.frombuffer(f.read(), dtype=np.uint8)
-                mask = cv2.imdecode(mask_buffer, cv2.IMREAD_UNCHANGED)
-                yield frame_idx, torch.from_numpy(mask.copy()).byte()
-
-
-def read_instance_phrases(instance_phrase_path: Path) -> dict[int, str]:
-    """
-    Read instance phrases from txt file.
-    """
-    instance_phrases = {}
-    with instance_phrase_path.open("r") as f:
-        for line in f.readlines():
-            idx, phrase = line.split(":")
-            instance_phrases[int(idx)] = phrase.strip()
-    return instance_phrases
-
-
 class ArtifactFrameStream(FrameStream):
     def __init__(self, artifact_path: ArtifactPath) -> None:
         self.artifact_path = artifact_path
@@ -226,11 +190,6 @@ class ArtifactFrameStream(FrameStream):
         self.pose_by_idx: dict[int, SE3] = {}
         self.intrinsics_by_idx: dict[int, torch.Tensor] = {}
         self.camera_type_by_idx: dict[int, CameraType] = {}
-        self.instance_phrases = (
-            read_instance_phrases(artifact_path.mask_phrase_path)
-            if artifact_path.mask_phrase_path.exists()
-            else None
-        )
 
         if artifact_path.pose_path.exists():
             pose_inds, pose_data = read_pose_artifacts(artifact_path.pose_path)
@@ -255,9 +214,6 @@ class ArtifactFrameStream(FrameStream):
         if artifact_path.depth_path.exists():
             self._attributes.add(FrameAttribute.METRIC_DEPTH)
 
-        if artifact_path.mask_path.exists():
-            self._attributes.add(FrameAttribute.INSTANCE)
-
     def frame_size(self) -> tuple[int, int]:
         return self._frame_size
 
@@ -275,13 +231,7 @@ class ArtifactFrameStream(FrameStream):
 
     def __iter__(self):
         depth_iterator = read_depth_artifacts(self.artifact_path.depth_path) if self.artifact_path.depth_path.exists() else None
-        instance_iterator = (
-            read_instance_artifacts(self.artifact_path.mask_path)
-            if self.artifact_path.mask_path.exists()
-            else None
-        )
         next_depth = next(depth_iterator, None) if depth_iterator is not None else None
-        next_instance = next(instance_iterator, None) if instance_iterator is not None else None
 
         for frame_idx, rgb in read_rgb_artifacts(self.artifact_path.rgb_path):
             metric_depth = None
@@ -291,21 +241,12 @@ class ArtifactFrameStream(FrameStream):
                 metric_depth = next_depth[1]
                 next_depth = next(depth_iterator, None)
 
-            instance = None
-            while next_instance is not None and next_instance[0] < frame_idx:
-                next_instance = next(instance_iterator, None)
-            if next_instance is not None and next_instance[0] == frame_idx:
-                instance = next_instance[1]
-                next_instance = next(instance_iterator, None)
-
             yield FrameData(
                 raw_frame_idx=frame_idx,
                 rgb=rgb,
                 pose=self.pose_by_idx.get(frame_idx),
                 camera_type=self.camera_type_by_idx.get(frame_idx),
                 intrinsics=self.intrinsics_by_idx.get(frame_idx),
-                instance=instance,
-                instance_phrases=self.instance_phrases if instance is not None else None,
                 metric_depth=metric_depth,
             )
 
@@ -486,10 +427,7 @@ def save_artifacts(
     pose_list = []
     intrinsics_list = []
     camera_type_list = []
-    instance_phrases_combined: dict[int, str] = {}
-
     depth_zip: zipfile.ZipFile | None = None
-    mask_zip: zipfile.ZipFile | None = None
     if pcd_fusion_mode not in {"backproject", "tsdf"}:
         raise ValueError(f"Invalid pcd_fusion_mode: {pcd_fusion_mode}")
 
@@ -535,17 +473,6 @@ def save_artifacts(
                         exr.close()
                         depth_zip.write(f.name, f"{frame_idx:05d}.exr")
 
-                if frame_data.instance is not None:
-                    if mask_zip is None:
-                        out_path.mask_path.parent.mkdir(exist_ok=True, parents=True)
-                        mask_zip = zipfile.ZipFile(out_path.mask_path, "w", zipfile.ZIP_DEFLATED)
-
-                    _, mask_buffer = cv2.imencode(".png", frame_data.instance.cpu().numpy().astype(np.uint8))
-                    mask_zip.writestr(f"{frame_idx:05d}.png", mask_buffer.tobytes())
-
-                if frame_data.instance_phrases is not None:
-                    instance_phrases_combined.update(frame_data.instance_phrases)
-
                 remaining_points = max_pcd_points - pcd_vertex_count
                 if pcd_fusion_mode == "backproject" and remaining_points > 0:
                     assert pcd_body_file is not None
@@ -567,8 +494,6 @@ def save_artifacts(
     finally:
         if depth_zip is not None:
             depth_zip.close()
-        if mask_zip is not None:
-            mask_zip.close()
 
     if len(pose_list) > 0:
         pose_data = np.stack([pose for _, pose in pose_list], axis=0)
@@ -587,12 +512,6 @@ def save_artifacts(
         with out_path.camera_type_path.open("w") as f:
             for frame_idx, camera_type_data in camera_type_list:
                 f.write(f"{frame_idx}: {camera_type_data.name}\n")
-
-    if len(instance_phrases_combined) > 0:
-        out_path.mask_phrase_path.parent.mkdir(exist_ok=True, parents=True)
-        with out_path.mask_phrase_path.open("w") as f:
-            for idx, phrase in instance_phrases_combined.items():
-                f.write(f"{idx}: {phrase}\n")
 
     try:
         if pcd_fusion_mode == "backproject":

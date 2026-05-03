@@ -26,7 +26,7 @@ from ..networks.droid_net import CorrBlock, DroidNet
 class MotionFilter:
     """
     This class is used to filter incoming frames and extract features.
-    This module re-uses Droid's network to detect scene changes without considering the mask.
+    This module re-uses Droid's network to detect scene changes.
     """
 
     def __init__(
@@ -51,13 +51,12 @@ class MotionFilter:
 
     @torch.amp.autocast("cuda", enabled=True)
     @torch.no_grad()
-    def check(self, images: torch.Tensor, buffer_masks: torch.Tensor | None) -> bool:
+    def check(self, images: torch.Tensor) -> bool:
         """
         main update operation - run on every frame in video
 
         Args:
             image (torch.Tensor): BCHW image RGB 0-1
-            buffer_masks (torch.Tensor): Bhw mask 1-invalid, 0-valid
         """
 
         ht = images.shape[-2] // 8
@@ -71,7 +70,6 @@ class MotionFilter:
             net, inp = self.net.encode_context(images)
             # Store features of the last keyframe.
             self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
-            self.f_mask = buffer_masks
             self.current_frame_idx = 0
             self.last_kf_frame_idx = 0
             self.initialized = True
@@ -89,18 +87,12 @@ class MotionFilter:
             # approximate flow magnitude using 1 update iteration
             _, delta, weight = self.net.update.forward(self.f_net[None], self.f_inp[None], corr)
             dense_flow = delta.norm(dim=-1)[0]
-            if self.f_mask is not None:
-                f_weight = (~self.f_mask).float()
-                dense_motion_score = (dense_flow * f_weight).mean([1, 2]) / (f_weight.mean([1, 2]) + 1e-6)
-            else:
-                dense_motion_score = dense_flow.mean([1, 2])
-            dense_motion_score = dense_motion_score.item()
+            dense_motion_score = dense_flow.mean([1, 2]).item()
 
             # check motion magnitue / add new frame to video
             if dense_motion_score > self.thresh:
                 net, inp = self.net.encode_context(images)
                 self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
-                self.f_mask = buffer_masks
                 self.last_kf_frame_idx = self.current_frame_idx
                 return True
 

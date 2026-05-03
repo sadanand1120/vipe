@@ -32,8 +32,6 @@ class FrameAttribute(Enum):
     POSE = "pose"
     INTRINSICS = "intrinsics"
     CAMERA_TYPE = "camera_type"
-    INSTANCE = "instance"
-    MASK = "mask"
     METRIC_DEPTH = "metric_depth"
     DEPTH_CONFIDENCE = "depth_confidence"
 
@@ -49,24 +47,16 @@ class FrameData:
     - intrinsics: Pinhole intrinsics torch Tensor of shape (4+D,), [fx, fy, cx, cy, ...].
       - For the D part, this will be the distortion coefficients of the camera.
       - For panorama images, this will all be zeros.
-    - instance: Instance segmentation mask of the frame. The shape is (H, W) uint8, with 0 for invalid pixels.
-    - instance_phrases: A dictionary of instance id to phrase mapping.
-    - mask: Binary mask of the frame. The shape is (H, W), with 0 for invalid pixels.
     - metric_depth: The depth map of the frame. The shape is (H, W). Value is in metric scale.
     - depth_confidence: The depth confidence map of the frame. The shape is (H, W).
     - information: Additional information about the frame
     """
-
-    SKY_PROMPT = "sky"
 
     raw_frame_idx: int
     rgb: torch.Tensor
     pose: SE3 | None = None
     camera_type: CameraType | None = None
     intrinsics: torch.Tensor | None = None
-    instance: torch.Tensor | None = None
-    instance_phrases: dict[int, str] | None = None
-    mask: torch.Tensor | None = None
     metric_depth: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
     information: str = ""
@@ -86,10 +76,6 @@ class FrameData:
             attributes.add(FrameAttribute.INTRINSICS)
         if self.camera_type is not None:
             attributes.add(FrameAttribute.CAMERA_TYPE)
-        if self.instance is not None:
-            attributes.add(FrameAttribute.INSTANCE)
-        if self.mask is not None:
-            attributes.add(FrameAttribute.MASK)
         if self.metric_depth is not None:
             attributes.add(FrameAttribute.METRIC_DEPTH)
         if self.depth_confidence is not None:
@@ -104,10 +90,6 @@ class FrameData:
             return self.intrinsics
         if attribute == FrameAttribute.CAMERA_TYPE:
             return self.camera_type
-        if attribute == FrameAttribute.INSTANCE:
-            return self.instance
-        if attribute == FrameAttribute.MASK:
-            return self.mask
         if attribute == FrameAttribute.METRIC_DEPTH:
             return self.metric_depth
         if attribute == FrameAttribute.DEPTH_CONFIDENCE:
@@ -121,10 +103,6 @@ class FrameData:
             self.intrinsics = value
         elif attribute == FrameAttribute.CAMERA_TYPE:
             self.camera_type = value
-        elif attribute == FrameAttribute.INSTANCE:
-            self.instance = value
-        elif attribute == FrameAttribute.MASK:
-            self.mask = value
         elif attribute == FrameAttribute.METRIC_DEPTH:
             self.metric_depth = value
         elif attribute == FrameAttribute.DEPTH_CONFIDENCE:
@@ -138,9 +116,6 @@ class FrameData:
         return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=self.rgb.cpu(),
-            mask=map_cpu(self.mask),
-            instance=map_cpu(self.instance),
-            instance_phrases=self.instance_phrases,
             metric_depth=map_cpu(self.metric_depth),
             depth_confidence=map_cpu(self.depth_confidence),
             pose=map_cpu(self.pose),
@@ -155,9 +130,6 @@ class FrameData:
         return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=self.rgb.cuda(),
-            mask=map_cuda(self.mask),
-            instance=map_cuda(self.instance),
-            instance_phrases=self.instance_phrases,
             metric_depth=map_cuda(self.metric_depth),
             depth_confidence=map_cuda(self.depth_confidence),
             pose=map_cuda(self.pose),
@@ -178,16 +150,6 @@ class FrameData:
             .squeeze(0)
             .permute(1, 2, 0)
         )
-
-        new_mask = None
-        if self.mask is not None:
-            new_mask = torch.nn.functional.interpolate(self.mask[None, None].float(), size, mode="bilinear")[0, 0] > 0.9
-
-        new_instance = None
-        if self.instance is not None:
-            new_instance = torch.nn.functional.interpolate(self.instance[None, None].float(), size, mode="nearest")[
-                0, 0
-            ].byte()
 
         new_metric_depth = None
         if self.metric_depth is not None:
@@ -212,9 +174,6 @@ class FrameData:
         return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=new_rgb,
-            mask=new_mask,
-            instance=new_instance,
-            instance_phrases=self.instance_phrases,
             metric_depth=new_metric_depth,
             depth_confidence=new_depth_confidence,
             pose=self.pose,
@@ -231,14 +190,6 @@ class FrameData:
         right = self.size()[1] - right
 
         new_rgb = self.rgb[top:bottom, left:right]
-
-        new_mask = None
-        if self.mask is not None:
-            new_mask = self.mask[top:bottom, left:right]
-
-        new_instance = None
-        if self.instance is not None:
-            new_instance = self.instance[top:bottom, left:right]
 
         new_metric_depth = None
         if self.metric_depth is not None:
@@ -259,9 +210,6 @@ class FrameData:
         return FrameData(
             raw_frame_idx=self.raw_frame_idx,
             rgb=new_rgb,
-            mask=new_mask,
-            instance=new_instance,
-            instance_phrases=self.instance_phrases,
             metric_depth=new_metric_depth,
             depth_confidence=new_depth_confidence,
             pose=self.pose,
@@ -269,15 +217,6 @@ class FrameData:
             camera_type=new_camera_type,
             information=self.information,
         )
-
-    @property
-    def sky_mask(self):
-        sky_mask = torch.zeros(self.size(), dtype=torch.bool, device=self.device)
-        if self.instance is not None and self.instance_phrases is not None:
-            for instance_id, phrase in self.instance_phrases.items():
-                if self.SKY_PROMPT == phrase:
-                    sky_mask |= self.instance == instance_id
-        return sky_mask
 
     def dav3_conditions(self) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
         dav3_rgb = (self.rgb.cpu().numpy() * 255).astype(np.uint8)

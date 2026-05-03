@@ -21,13 +21,11 @@ import numpy as np
 import torch
 
 from vipe.priors.geocalib import GeoCalib
-from vipe.priors.track_anything import TrackAnythingPipeline
 from vipe.slam.interface import SLAMOutput
 from vipe.streams.base import FrameAttribute, FrameProcessor, FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
-from vipe.utils.morph import erode
 
 logger = logging.getLogger(__name__)
 
@@ -83,44 +81,6 @@ class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
 
         self.fov_y = res["camera"].vfov[0].item()
         self.camera_type = camera_type
-
-
-class TrackAnythingProcessor(FrameProcessor):
-    """
-    A processor that tracks a mask caption in the video.
-    """
-
-    def __init__(
-        self,
-        mask_phrases: list[str],
-        add_sky: bool,
-        sam_run_gap: int = 30,
-        mask_expand: int = 5,
-    ) -> None:
-        self.mask_phrases = mask_phrases
-        self.sam_run_gap = sam_run_gap
-        self.add_sky = add_sky
-
-        if self.add_sky:
-            self.mask_phrases.append(FrameData.SKY_PROMPT)
-
-        self.tracker = TrackAnythingPipeline(self.mask_phrases, sam_points_per_side=50, sam_run_gap=self.sam_run_gap)
-        self.mask_expand = mask_expand
-
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes | {FrameAttribute.INSTANCE, FrameAttribute.MASK}
-
-    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
-        frame.instance, frame.instance_phrases = self.tracker.track(frame)
-        self.last_track_frame = frame.raw_frame_idx
-
-        frame_instance_mask = frame.instance == 0
-        if self.add_sky:
-            # We won't mask out the sky.
-            frame_instance_mask |= frame.sky_mask
-
-        frame.mask = erode(frame_instance_mask, self.mask_expand)
-        return frame
 
 
 class DAV3DepthProcessor(FrameProcessor):

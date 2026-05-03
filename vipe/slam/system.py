@@ -117,7 +117,6 @@ class SLAMSystem:
         self,
         frame_idx: int,
         images: torch.Tensor,
-        buffer_masks: torch.Tensor | None,
         frame_data: FrameData,
         phase: int,
     ):
@@ -128,8 +127,6 @@ class SLAMSystem:
         self.buffer.fmaps[kf_idx] = self.droid_net.encode_features(images)[0]
         net, inp = self.droid_net.encode_context(images)
         self.buffer.nets[kf_idx], self.buffer.inps[kf_idx] = net[0], inp[0]
-        if buffer_masks is not None:
-            self.buffer.masks[kf_idx] = buffer_masks[0]
 
         if kf_idx == 0:
             self.buffer.intrinsics = unpack_optional(frame_data.intrinsics).to(self.device)
@@ -165,20 +162,7 @@ class SLAMSystem:
 
     def _precompute_features(self, frame_data: FrameData):
         images = frame_data.rgb.permute(2, 0, 1)[None]
-        masks = None
-        if frame_data.mask is not None:
-            mask_height, mask_width = frame_data.mask.shape
-            mask_height, mask_width = mask_height // 8, mask_width // 8
-            mask = (
-                torch.nn.functional.interpolate(
-                    frame_data.mask[None, None].float(),
-                    (mask_height, mask_width),
-                    mode="bilinear",
-                )[0, 0]
-                > 0.9
-            )
-            masks = (~mask)[None]
-        return images, masks
+        return images
 
     @torch.no_grad()
     def run(
@@ -211,11 +195,11 @@ class SLAMSystem:
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (1/2)", total=total_n_frames
         ):
-            images, buffer_masks = self._precompute_features(frame_data)
+            images = self._precompute_features(frame_data)
 
-            if self.motion_filter.check(images, buffer_masks) or frame_idx == total_n_frames - 1:
+            if self.motion_filter.check(images) or frame_idx == total_n_frames - 1:
                 is_keyframe = True
-                self._add_keyframe(frame_idx, images, buffer_masks, frame_data, phase=1)
+                self._add_keyframe(frame_idx, images, frame_data, phase=1)
             else:
                 is_keyframe = False
 
@@ -241,8 +225,8 @@ class SLAMSystem:
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (2/2)", total=total_n_frames
         ):
-            images, buffer_masks = self._precompute_features(frame_data)
-            self._add_keyframe(frame_idx, images, buffer_masks, frame_data, phase=2)
+            images = self._precompute_features(frame_data)
+            self._add_keyframe(frame_idx, images, frame_data, phase=2)
             if self.inner_filler.check() or frame_idx == total_n_frames - 1:
                 self.inner_filler.compute()
 

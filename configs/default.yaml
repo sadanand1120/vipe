@@ -14,19 +14,6 @@ pipeline:
   init:
     camera_type: "pinhole"  # Camera model used by SLAM and DAV3; this fork only keeps pinhole.
     intrinsics: "geocalib"  # Intrinsics source label; intrinsics are estimated by GeoCalib.
-    instance:
-      kf_gap_sec: 2.0       # Seconds between expensive SAM/GDINO mask refreshes.
-      phrases:              # Object categories masked out before SLAM/depth where tracked.
-        - person
-        - animal
-        - vehicle
-        - ball
-        - balloon
-        - gun
-        - pet
-        - car
-        - bus
-      add_sky: true         # Include sky as a tracked class but do not invalidate it in the frame mask.
 
   slam:
     buffer: 1024                         # Max number of keyframes kept in the SLAM graph buffer.
@@ -60,7 +47,7 @@ pipeline:
 
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.
-    save_artifacts: false                # Save pose/depth/intrinsics/mask/pcd artifacts.
+    save_artifacts: false                # Save pose/depth/intrinsics/rgb/pcd artifacts.
     pcd_fusion_mode: backproject         # Point cloud mode: backproject or tsdf.
     backproject_pcd_max_points: 8000000  # Max saved points for either backproject or sampled TSDF point cloud.
     backproject_pcd_conf_threshold_coef: 0.75 # DAV3 confidence threshold = mean confidence times this factor.
@@ -71,7 +58,7 @@ pipeline:
     save_slam_map: false                 # Save internal SLAM map tensor artifact.
     save_viz: false                      # Save projection/depth visualization video.
     viz_downsample: 2                    # Downsample factor for visualization rendering.
-    viz_attributes: [["rgb", "instance"], ["depth", "pcd"]] # Visualization panels to render.
+    viz_attributes: [["rgb", "depth"], ["pcd", "empty"]] # Visualization panels to render.
 
 hydra:
   output_subdir: null  # Do not create .hydra metadata directories.

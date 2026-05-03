@@ -75,10 +75,9 @@ args.pipeline.output.pcd_fusion_mode == "tsdf"
 Runtime objects:
 
 ```python
-stream_list = FrameDirStreamList("/toy/scene0000_00/color", fps=2, frame_start=0, frame_end=-1, frame_skip=1)
-len(stream_list) == 1
-video_stream = stream_list[0]
-video_stream.name() == "color"
+frame_stream = FrameDir("/toy/scene0000_00/color", fps=2, frame_start=0, frame_end=-1, frame_skip=1)
+frame_stream.name() == "color"
+pipeline = DefaultAnnotationPipeline(init=args.pipeline.init, slam=args.pipeline.slam, post=args.pipeline.post, output=args.pipeline.output)
 pipeline.out_path == Path("/toy/out")
 ```
 
@@ -107,10 +106,10 @@ All stems are numeric, so sorted order is:
 self.start = 0
 self.end = 10
 self.step = 1
-len(video_stream) == len(range(0, 10, 1)) == 10
-video_stream.fps() == 2.0 / 1 == 2.0
-video_stream.frame_size() == (24, 32)
-video_stream.name() == "color"
+len(frame_stream) == len(range(0, 10, 1)) == 10
+frame_stream.fps() == 2.0 / 1 == 2.0
+frame_stream.frame_size() == (24, 32)
+frame_stream.name() == "color"
 ```
 
 For `0.png`, suppose OpenCV reads BGR pixel `(v=0,u=0)` as `[76, 51, 26]`. After BGR-to-RGB and normalization:
@@ -122,14 +121,14 @@ rgb[0,0] = [26, 51, 76] / 255.0 = [0.1020, 0.2000, 0.2980]
 The first yielded frame is:
 
 ```python
-VideoFrame(
+FrameData(
     raw_frame_idx=0,
     rgb=torch.tensor(shape=(24,32,3), device="cuda", dtype=float32),
 )
 ```
 
 <a id="chunk-3-toy"></a>
-## Chunk 3 Toy: Initial Stream Processors: GeoCalib Intrinsics And Track Anything Masks
+## Chunk 3 Toy: Initial Stream Processors: GeoCalib Intrinsics And Attribute Recording
 
 
 GeoCalib samples toy frames:
@@ -159,72 +158,48 @@ frame.intrinsics = [20.7846, 20.7846, 16.0, 12.0]
 frame.camera_type = PINHOLE
 ```
 
-For Track Anything, toy `sam_run_gap=4`.
-
-Assume frame 0 detections:
+`InitAttributeRecorder` stores CPU copies while this first initialized pass is consumed by SLAM:
 
 ```python
-frame.instance =
-[
-  [0,0,0,0],
-  [0,1,1,0],
-  [0,1,1,0],
-  [2,2,0,0],
-]
+recorder.stream_attributes[FrameAttribute.INTRINSICS][0] = tensor([20.7846,20.7846,16.0,12.0], device="cpu")
+recorder.stream_attributes[FrameAttribute.CAMERA_TYPE][0] = CameraType.PINHOLE
+...
+recorder.stream_attributes[FrameAttribute.INTRINSICS][9] = tensor([20.7846,20.7846,16.0,12.0], device="cpu")
+recorder.stream_attributes[FrameAttribute.CAMERA_TYPE][9] = CameraType.PINHOLE
 ```
 
-This is shown as `4 x 4` for readability; real shape is `24 x 32`.
-
-Assume:
+After the tenth frame has passed through this iterator:
 
 ```python
-frame.instance_phrases = {0: "background", 1: "person", 2: "sky"}
+len(recorder.stream_attributes[FrameAttribute.INTRINSICS]) == 10
+len(recorder.stream_attributes[FrameAttribute.CAMERA_TYPE]) == 10
+init_stream.initialized == True
 ```
 
-Then:
+The replay processor is built from only the attributes that have at least one non-null value:
 
 ```python
-frame.instance == 0 =
-[
-  [1,1,1,1],
-  [1,0,0,1],
-  [1,0,0,1],
-  [0,0,1,1],
-]
-
-frame.sky_mask =
-[
-  [0,0,0,0],
-  [0,0,0,0],
-  [0,0,0,0],
-  [1,1,0,0],
-]
-
-frame_instance_mask before erosion =
-[
-  [1,1,1,1],
-  [1,0,0,1],
-  [1,0,0,1],
-  [1,1,1,1],
-]
+stream_attributes.keys() == {
+    FrameAttribute.INTRINSICS,
+    FrameAttribute.CAMERA_TYPE,
+}
 ```
 
-After erosion, valid regions near the person shrink. The exact output depends on the full `24 x 32` mask and the `5 x 5` window, but the rule is exactly:
+On replay, frame 0 is loaded again from disk and `AssignRecordedInitProcessor` assigns the recorded values back on CUDA:
 
-```text
-output[v,u] = true only if every value in the centered 5 x 5 input patch is true
+```python
+frame.intrinsics = tensor([20.7846,20.7846,16.0,12.0], device="cuda")
+frame.camera_type = CameraType.PINHOLE
 ```
 
 Final initialized toy frame 0:
 
 ```python
-VideoFrame(
+FrameData(
     raw_frame_idx=0,
     rgb.shape=(24,32,3),
     intrinsics=[20.7846,20.7846,16.0,12.0],
     camera_type=PINHOLE,
-    instance.shape=(24,32),
-    mask.shape=(24,32),
 )
 ```
 
@@ -260,22 +235,26 @@ One resized frame entering SLAM:
 
 ```python
 frame.rgb.shape == (384,512,3)
-frame.mask.shape == (384,512)
 frame.intrinsics == [332.5536, 332.5536, 256.0, 192.0]
 ```
 
 SLAM `_precompute_features` converts it to:
 
 ```python
-images.shape == (1,3,384,512)  # V,C,H,W
-buffer_masks.shape == (1,48,64) or None
+images.shape == (1,3,384,512)  # batch,C,H,W
 ```
 
-If a resized valid mask pixel block has `mask[80:88,120:128]` mostly true, then downsampling with bilinear and `>0.9` can mark the corresponding low-res pixel valid. `_precompute_features` appends `~mask`, so:
+The toy `GraphBuffer` dimensions are:
 
-```text
-VideoFrame.mask true  -> valid at original/resized frame
-GraphBuffer.masks true -> invalid at 1/8 SLAM grid
+```python
+buffer.images.shape == (buffer_size,3,384,512)
+buffer.poses.shape == (buffer_size,7)
+buffer.intrinsics.shape == (4,)
+buffer.disps.shape == (buffer_size,48,64)
+buffer.disps_sens.shape == (buffer_size,48,64)
+buffer.fmaps.shape == (buffer_size,128,48,64)
+buffer.nets.shape == (buffer_size,128,48,64)
+buffer.inps.shape == (buffer_size,128,48,64)
 ```
 
 <a id="chunk-5-toy"></a>
@@ -305,7 +284,7 @@ gmap.shape = (1,128,48,64)
 net.shape = (1,128,48,64)
 inp.shape = (1,128,48,64)
 buffer.tstamp[0] = 0
-buffer.intrinsics[0] = [332.5536, 332.5536, 256.0, 192.0]
+buffer.intrinsics = [332.5536, 332.5536, 256.0, 192.0]
 ```
 
 Assume DAV3 keyframe metric depth at resized pixel `(v=3,u=3)` is `2.0 m`. Then:
@@ -315,7 +294,7 @@ disp_sens[0,0] = 1 / 2.0 = 0.5
 buffer.disps_sens[0,0,0,0] = 0.5
 ```
 
-For a toy motion-filter frame, assume the learned `delta` norms over four valid low-res pixels are:
+For a toy motion-filter frame, assume the learned `delta` norms over four low-res pixels are:
 
 ```text
 [1.0, 2.0, 4.0, 5.0]
@@ -329,7 +308,7 @@ dense_motion_score = (1+2+4+5)/4 = 3.0
 
 Since `3.0 > filter_thresh 2.4`, the frame becomes a keyframe.
 
-For a non-keyframe, assume valid norms:
+For a non-keyframe, assume low-res norms:
 
 ```text
 [0.5, 1.2, 2.0, 1.1]
@@ -378,19 +357,49 @@ weight = [0.8, 0.7]
 
 Then:
 
-```text
-new target = coords1 + delta = [11.1, 5.6]
-residual for BA = projected_coords - target
-```
+$$
+\hat{\mathbf{p}}_{01}
+=
+\mathbf{p}^{\text{proj}}_{01} + \Delta
+=
+\begin{bmatrix}11.2 \\ 5.4\end{bmatrix}
++
+\begin{bmatrix}-0.1 \\ 0.2\end{bmatrix}
+=
+\begin{bmatrix}11.1 \\ 5.6\end{bmatrix}.
+$$
+
+BA residual is:
+
+$$
+\mathbf{r}^{\text{flow}}
+=
+\mathbf{p}^{\text{proj}} - \hat{\mathbf{p}}.
+$$
 
 If current BA projection is `[11.2,5.4]`, residual is:
 
-```text
-r = [11.2,5.4] - [11.1,5.6] = [0.1, -0.2]
-weighted squared residual = 0.8*(0.1^2) + 0.7*(-0.2^2)
-                          = 0.008 + 0.028
-                          = 0.036
-```
+$$
+\mathbf{r}^{\text{flow}}
+=
+\begin{bmatrix}11.2 \\ 5.4\end{bmatrix}
+-
+\begin{bmatrix}11.1 \\ 5.6\end{bmatrix}
+=
+\begin{bmatrix}0.1 \\ -0.2\end{bmatrix}.
+$$
+
+The code also multiplies learned weights by `weight_dense_disp = 0.001`, so the dense-flow cost contribution is:
+
+$$
+E_{\text{flow}}
+=
+0.001\left(0.8\cdot 0.1^2 + 0.7\cdot (-0.2)^2\right)
+=
+0.001(0.008 + 0.028)
+=
+0.000036.
+$$
 
 For sensor-depth regularization at the same low-res pixel, suppose:
 
@@ -399,8 +408,23 @@ optimized disparity = 0.45
 DAV3 sensor disparity = 0.50
 dense_disp_alpha = 0.001
 residual = 0.45 - 0.50 = -0.05
-cost contribution = 0.001 * (-0.05)^2 = 0.0000025
 ```
+
+In LaTeX form:
+
+$$
+r^{\text{sens}} = d - d^{\text{DAV3}} = 0.45 - 0.50 = -0.05.
+$$
+
+$$
+E_{\text{sens}}
+=
+\alpha \left(r^{\text{sens}}\right)^2
+=
+0.001(-0.05)^2
+=
+0.0000025.
+$$
 
 <a id="chunk-6-toy"></a>
 ## Chunk 6 Toy: Backend Global BA And SLAM Map Extraction
@@ -416,7 +440,7 @@ K = 9
 Low-res colors per keyframe:
 
 ```python
-images.shape = (9,1,48,64,3)
+images.shape = (9,48,64,3)
 ```
 
 For keyframe 0, low-res coordinate `(u=32, v=24)` with resized intrinsics:
@@ -437,12 +461,11 @@ Camera point = [X/depth? internal homogeneous disparity form resolves to z=2.0 a
 World point with identity c2w = [0.0, 0.0, 2.0]
 ```
 
-If depth consistency count for this pixel is `3`, and `min(2,K-1)=2`, and mask is valid:
+If depth consistency count for this pixel is `3`, and `min(2,K-1)=2`:
 
 ```text
 count >= 2 -> true
 disparity > 0.5 * mean_disparity -> true if mean < 1.0
-~invalid_mask -> true
 ```
 
 The point is retained in `dense_disp_xyz`.
@@ -508,36 +531,33 @@ Final `SLAMOutput` toy:
 
 ```python
 slam_output.trajectory.shape == (10,)  # SE3 batch
-slam_output.intrinsics.shape == (1,4)
-slam_output.intrinsics[0] == [20.7846,20.7846,16.0,12.0]
-slam_output.keyframe_ids == [0,1,2,3,4,5,6,8,9]
+slam_output.intrinsics.shape == (4,)
+slam_output.intrinsics == [20.7846,20.7846,16.0,12.0]
+slam_output.slam_map.dense_disp_frame_inds == [0,1,2,3,4,5,6,8,9]
 ```
 
 <a id="chunk-8-toy"></a>
-## Chunk 8 Toy: Rebuilding The Output Stream And Assigning SLAM Results
+## Chunk 8 Toy: Replaying The Initialized Stream And Assigning SLAM Results
 
 
-After rebuilding, toy raw frame 7 is loaded again from `/toy/scene0000_00/color/7.png`:
+During replay, toy raw frame 7 is loaded again from `/toy/scene0000_00/color/7.png`:
 
 ```python
 frame.rgb.shape == (24,32,3)
 ```
 
-`AssignCachedInitProcessor` restores:
+`AssignRecordedInitProcessor` restores:
 
 ```python
 frame.intrinsics = [20.7846,20.7846,16.0,12.0]
 frame.camera_type = PINHOLE
-frame.instance.shape = (24,32)
-frame.mask.shape = (24,32)
-frame.instance_phrases = {...}
 ```
 
 `AssignAttributesProcessor` then overwrites intrinsics with the recovered SLAM intrinsics:
 
 ```python
 frame.pose = slam_output.trajectory[7]  # c2w
-frame.intrinsics = slam_output.intrinsics[0]
+frame.intrinsics = slam_output.intrinsics
 ```
 
 For the toy:
@@ -547,7 +567,7 @@ frame.pose.translation()[:3] approx [0.7,0,0]
 frame.intrinsics == [20.7846,20.7846,16.0,12.0]
 ```
 
-Then the multiview depth processor will attach:
+Then `DAV3DepthProcessor` attaches:
 
 ```python
 frame.metric_depth.shape == (24,32)
@@ -555,7 +575,7 @@ frame.depth_confidence.shape == (24,32) or None
 ```
 
 <a id="chunk-9-toy"></a>
-## Chunk 9 Toy: Final DAV3 Multiview Depth For Every Frame
+## Chunk 9 Toy: Final DAV3 Depth For Every Frame
 
 
 Toy has exactly 10 frames and `window_size=10`, so pass 1 creates one window:
@@ -575,7 +595,7 @@ frame_idx < keyframes_inds[-1] -> 7 < 9 true
 also append left_idx + 1 = 7  # raw frame 8
 ```
 
-But raw frame 6 and raw frame 8 are already in the current sliding window, so they are removed from extra keyframe context.
+But raw frame 6 and raw frame 8 are already in the current sliding window, so the extra keyframe context list is empty.
 
 DAV3 input list length:
 
@@ -750,13 +770,13 @@ sequenceDiagram
     participant R as Raw frame dir
     participant I as Init processors
     participant S as SLAM
-    participant D as DAV3 MVD
+    participant D as DAV3 depth
     participant O as Output artifacts
     R->>I: 10 RGB frames, each 24x32x3
     I->>I: GeoCalib samples frames 0,2,4
     I->>I: intrinsics [20.7846,20.7846,16,12]
-    I->>I: Track Anything masks frames 0..9
-    I->>S: initialized cached stream
+    I->>I: record intrinsics and camera type for replay
+    I->>S: initialized stream
     S->>S: resize each frame to 384x512
     S->>S: pass 1 keyframes 0,1,2,3,4,5,6,8,9
     S->>S: frontend initialize at 8 keyframes
@@ -764,8 +784,8 @@ sequenceDiagram
     S->>S: pass 2 fills frame 7 pose
     S->>D: c2w poses, intrinsics, keyframe map
     D->>D: sliding window depth for frames 0..9
-    D->>O: final frames with pose, intrinsics, depth, mask
-    O->>O: save RGB, depth, pose, intrinsics, masks
+    D->>O: final frames with pose, intrinsics, depth
+    O->>O: save RGB, depth, pose, intrinsics, camera type
     O->>O: integrate TSDF and write pcd/color_tsdf.ply
 ```
 
@@ -777,9 +797,7 @@ Final toy outputs:
 | `pose/color.npz` | `inds=[0..9]`, `data.shape=(10,4,4)` |
 | `intrinsics/color.npz` | `inds=[0..9]`, `data.shape=(10,4)` |
 | `depth/color.zip` | 10 EXR depth maps, each 24x32 |
-| `mask/color.zip` | 10 PNG instance masks, each 24x32 |
 | `pcd/color_tsdf.ply` | sampled point cloud from TSDF mesh |
-| `vipe/color_vis.mp4` | RGB/instance/depth/internal-SLAM-map projection video |
+| `vipe/color_vis.mp4` | RGB/depth/internal-SLAM-map projection video |
 | `vipe_aux_vis/color_traj.mp4` | optional trajectory plot from post script |
 | `pose_aligned/*.txt` | optional first-pose-aligned predicted c2w matrices |
-

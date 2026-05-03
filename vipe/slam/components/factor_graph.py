@@ -217,7 +217,6 @@ class FactorGraph:
         self.f_net, delta, weight, damping, _ = self.net.update.forward(  # type: ignore
             self.f_net, self.inp, corr, motn, ix=dix
         )
-        weight = weight.masked_fill(self.buffer.masks[self.ii][None, ..., None], 0.0)
 
         with torch.cuda.amp.autocast(enabled=False):
             self.target = coords1 + delta.to(dtype=torch.float)
@@ -296,7 +295,6 @@ class FactorGraph:
                         motn[:, v],
                         ix=dixs,
                     )
-                    weight = weight.masked_fill(self.buffer.masks[iis][None, ..., None], 0.0)
 
                 self.f_net[:, v] = net
                 self.target[:, v] = coords1[:, v] + delta.float()
