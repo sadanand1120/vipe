@@ -14,14 +14,9 @@
 # limitations under the License.
 
 
-import copy
-import importlib
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Sequence
-
-from omegaconf import DictConfig
 
 from vipe.streams.base import MultiviewVideoList, VideoStream
 
@@ -65,16 +60,3 @@ class Pipeline(ABC):
 
     @abstractmethod
     def run(self, video_data: VideoStream | MultiviewVideoList) -> AnnotationPipelineOutput: ...
-
-
-def make_pipeline_cls(config: DictConfig) -> type[Pipeline]:
-    module_path, class_name = config.instance.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
-
-
-def make_pipeline(config: DictConfig) -> Pipeline:
-    config = copy.deepcopy(config)
-    pipeline_cls = make_pipeline_cls(config)
-    del config.instance
-    return pipeline_cls(**config)

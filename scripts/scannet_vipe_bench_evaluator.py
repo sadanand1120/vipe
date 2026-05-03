@@ -73,10 +73,6 @@ def _set_override(overrides: list[str], key: str, value: Any) -> list[str]:
     return [item for item in overrides if not item.startswith(prefix)] + [f"{key}={value}"]
 
 
-def _has_group_override(overrides: list[str], group: str) -> bool:
-    return any(item == group or item.startswith(f"{group}=") for item in overrides)
-
-
 def _image_files(frame_dir: Path) -> list[Path]:
     exts = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
     files: list[Path] = []
@@ -139,11 +135,6 @@ def _prepare_vipe_overrides(args: argparse.Namespace, vipe_overrides: list[str],
     vipe_output_dir = _resolve_vipe_output_dir(args, vipe_overrides, scene)
 
     overrides = list(vipe_overrides)
-    if not _override_value(overrides, "pipeline"):
-        overrides.append("pipeline=default")
-    if not _has_group_override(overrides, "streams"):
-        overrides.append("streams=frame_dir_stream")
-
     overrides = _set_override(overrides, "streams.base_path", frame_dir)
     if _override_value(overrides, "streams.fps") is None:
         overrides = _set_override(overrides, "streams.fps", args.fps)
@@ -156,21 +147,20 @@ def run_vipe(overrides: list[str]) -> None:
     import hydra
 
     from vipe import get_config_path
-    from vipe.pipeline import make_pipeline
-    from vipe.streams.base import StreamList
+    from vipe.runtime import make_annotation_pipeline, make_frame_dir_stream_list
     from vipe.utils.logging import configure_logging
 
     with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
         cfg = hydra.compose("default", overrides=overrides)
 
-    stream_list = StreamList.make(cfg.streams)
+    stream_list = make_frame_dir_stream_list(cfg.streams)
     if len(stream_list) != 1:
         raise ValueError(f"Expected exactly one frame stream, got {len(stream_list)}")
 
     logger = configure_logging()
     stream = stream_list[0]
     logger.info(f"Running ViPE on {stream.name()}")
-    make_pipeline(cfg.pipeline).run(stream)
+    make_annotation_pipeline(cfg.pipeline).run(stream)
 
 
 def _read_depth_zip(depth_path: Path) -> dict[int, np.ndarray]:

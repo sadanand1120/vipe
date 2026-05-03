@@ -1,16 +1,87 @@
 defaults:
-  - _self_
-  - streams: frame_dir_stream
-  - pipeline: ???
-  - override hydra/hydra_logging: none
-  - override hydra/job_logging: disabled
+  - _self_                                # Load this file before Hydra logging overrides.
+  - override hydra/hydra_logging: none    # Disable Hydra's own logging config.
+  - override hydra/job_logging: disabled  # Keep app logging controlled by vipe.utils.logging.
 
-ray: false
-prefilter: false
+streams:
+  base_path: ??       # Required input frame directory.
+  fps: ??             # Required input frame rate.
+  frame_start: 0      # First frame index to read from the sorted frame list.
+  frame_end: -1       # Exclusive end index; -1 means read through the end.
+  frame_skip: 1       # Read every Nth frame; also divides effective stream FPS by N.
+  cached: false       # Preload all frames before processing; useful for malformed/slow frame sources.
+
+pipeline:
+  init:
+    camera_type: "pinhole"  # Camera model used by SLAM and DAV3; this fork only keeps pinhole.
+    intrinsics: "geocalib"  # Intrinsics source label; intrinsics are estimated by GeoCalib.
+    instance:
+      kf_gap_sec: 2.0       # Seconds between expensive SAM/GDINO mask refreshes.
+      phrases:              # Object categories masked out before SLAM/depth where tracked.
+        - person
+        - animal
+        - vehicle
+        - ball
+        - balloon
+        - gun
+        - pet
+        - car
+        - bus
+      add_sky: true         # Include sky as a tracked class but do not invalidate it in the frame mask.
+
+  slam:
+    buffer: 1024                         # Max number of keyframes kept in the SLAM graph buffer.
+    beta: 0.3                            # Translation/rotation blend for graph proximity scoring.
+    filter_thresh: 2.4                   # Dense motion threshold for deciding whether to add a keyframe.
+    warmup: 8                            # Keyframes collected before initializing the frontend graph.
+    keyframe_thresh: 4.0                 # Frontend threshold for pruning redundant keyframes.
+    frontend_thresh: 16.0                # Proximity threshold for frontend graph edge creation.
+    frontend_window: 25                  # Number of recent keyframes considered by frontend optimization.
+    frontend_radius: 2                   # Local radius for forced frontend graph edges.
+    frontend_nms: 1                      # Non-max suppression radius for frontend proximity edges.
+    seq_init: true                       # Initialize frontend with sequential neighbor edges.
+    frontend_backend_iters: [16, 64, 256] # Keyframe counts where intermediate backend BA can run.
+    backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
+    backend_radius: 2                    # Local radius for forced backend graph edges.
+    backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
+    backend_iters: 24                    # Final global backend BA iteration steps.
+    init_disp: 1.0                       # Initial disparity value before metric depth is injected.
+    optimize_intrinsics: false           # Optimize intrinsics during BA; keep false for fixed GeoCalib intrinsics.
+    optimize_rig_rotation: false         # Optimize multi-view rig rotations; unused for single frame-dir input.
+    cross_view: true                     # Allow cross-view factors when multiple views exist.
+    cross_view_idx: null                 # Per-view cross-view pairing; null chooses the next view cyclically.
+    adaptive_cross_view: false           # Recompute cross-view pairing from reprojection distances in backend BA.
+    infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
+    infill_dense_disp: false             # Also optimize dense disparity for infilled non-keyframes.
+    map_filter_thresh: 0.05              # Relative depth-consistency threshold for extracting the SLAM map.
+    visualize: false                     # Enable rerun SLAM visualization during processing.
+    keyframe_depth: dav3                 # Depth backend used to anchor keyframe metric scale.
+    ba:
+      dense_disp_alpha: 0.001            # Weight for sensor/DAV3 depth regularization in BA.
+      intrinsics_damping_scale: 1.0      # Damping multiplier for intrinsics optimization variables.
+
+  post:
+    depth_align_model: "mvd_dav3"        # Post-SLAM multiview DAV3 depth; null disables final depth estimation.
+
+  output:
+    path: vipe_results/                  # Output directory for all saved artifacts.
+    skip_exists: false                   # Skip streams whose outputs already exist; currently not used by filtering.
+    save_artifacts: false                # Save pose/depth/intrinsics/mask/pcd artifacts.
+    pcd_fusion_mode: backproject         # Point cloud mode: backproject or tsdf.
+    backproject_pcd_max_points: 8000000  # Max saved points for either backproject or sampled TSDF point cloud.
+    backproject_pcd_conf_threshold_coef: 0.75 # DAV3 confidence threshold = mean confidence times this factor.
+    backproject_pcd_sample_ratio: 0.015  # Per-frame sampling ratio before max-point downsampling.
+    pcd_tsdf_voxel_length: 0.02          # TSDF voxel size in meters.
+    pcd_tsdf_sdf_trunc: 0.15             # TSDF signed-distance truncation distance in meters.
+    pcd_tsdf_depth_trunc: 5.0            # Ignore TSDF depth samples beyond this distance in meters.
+    save_slam_map: false                 # Save internal SLAM map tensor artifact.
+    save_viz: false                      # Save projection/depth visualization video.
+    viz_downsample: 2                    # Downsample factor for visualization rendering.
+    viz_attributes: [["rgb", "instance"], ["depth", "pcd"]] # Visualization panels to render.
 
 hydra:
-  output_subdir: null
+  output_subdir: null  # Do not create .hydra metadata directories.
   job:
-    chdir: false
+    chdir: false       # Do not change working directory when Hydra launches.
   run:
-    dir: .
+    dir: .             # Keep Hydra run directory at current working directory.

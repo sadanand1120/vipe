@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-import importlib
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -22,7 +20,6 @@ from typing import Any, Iterable, Iterator, Protocol
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
 from torch.utils.data import IterableDataset
 
 from vipe.ext.lietorch import SE3
@@ -535,14 +532,6 @@ class ProcessedVideoStream(VideoStream):
 
 
 class StreamList:
-    @staticmethod
-    def make(config: DictConfig) -> "StreamList":
-        module_path, class_name = config.instance.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        config = copy.deepcopy(config)
-        del config.instance
-        return getattr(module, class_name)(**config)
-
     def __len__(self) -> int:
         raise NotImplementedError
 

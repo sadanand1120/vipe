@@ -4,11 +4,11 @@
   <img src="assets/teaser.gif" alt="teaser"/>
 </p>
 
-**TL;DR: ViPE is a useful open-source spatial AI tool for annotating camera poses and dense depth maps from raw videos!**
+**TL;DR: ViPE is a useful open-source spatial AI tool for annotating camera poses and dense depth maps from frame directories.**
 
 **Contributors**: NVIDIA (Spatial Intelligence Lab, Dynamic Vision Lab, NVIDIA Issac, NVIDIA Research).
 
-**Full Abstract**: Accurate 3D geometric perception is an important prerequisite for a wide range of spatial AI systems. While state-of-the-art methods depend on large-scale training data, acquiring consistent and precise 3D annotations from in-the-wild videos remains a key challenge. In this work, we introduce ViPE, a handy and versatile video processing engine designed to bridge this gap. ViPE efficiently estimates camera intrinsics, camera motion, and dense, near-metric depth maps from unconstrained raw videos. It is robust to diverse scenarios, including dynamic selfie videos, cinematic shots, or dashcams, and supports various camera models such as pinhole, wide-angle, and 360° panoramas. 
+**Full Abstract**: Accurate 3D geometric perception is an important prerequisite for a wide range of spatial AI systems. While state-of-the-art methods depend on large-scale training data, acquiring consistent and precise 3D annotations from in-the-wild videos remains a key challenge. In this work, we introduce ViPE, a handy and versatile video processing engine designed to bridge this gap. This fork keeps the pinhole frame-directory path with DAV3 depth.
 We use ViPE to annotate a large-scale collection of videos. This collection includes around 100K real-world internet videos, 1M high-quality AI-generated videos, and 2K panoramic videos, totaling approximately 96M frames -- all annotated with accurate camera poses and dense depth maps. We open source ViPE and the annotated dataset with the hope to accelerate the development of spatial AI systems.
 
 **[Technical Whitepaper](https://research.nvidia.com/labs/toronto-ai/vipe/assets/paper.pdf), [Project Page](https://research.nvidia.com/labs/toronto-ai/vipe), [Dataset](#downloading-the-dataset)**
@@ -32,36 +32,22 @@ pip3 install faiss-gpu pandas prettytable numba pypose
 pip3 install -e /robodata/smodak/repos/Depth-Anything-3
 ```
 
-Optional cuvslam (for slam sparse tracks = cuvslam instead of default dummy)
-
-```bash
-pip3 install "https://github.com/nvidia-isaac/cuVSLAM/releases/download/v15.0.0/cuvslam-15.0.0%2Bcu12-cp310-cp310-manylinux_2_35_x86_64.whl"
-```
-
 ## Usage
 
 ### Using the ViPE CLI
 
-Once the python package is installed, you can use the `vipe` CLI to process raw videos in mp4 format.
+Once the python package is installed, you can use the `vipe` CLI to process a directory of frames.
 
 ```bash
-# Replace YOUR_VIDEO.mp4 with the path to your video. We provide sample videos in assets/examples.
-vipe infer YOUR_VIDEO.mp4
+vipe infer /path/to/frame_dir --fps 30
 # Additional options:
 #   --output: Output directory (default: vipe_results)
 #   --visualize: Enable visualization of intermediate and final results (default: false)
-#   --pipeline: Pipeline configuration to use (default: default)
 ```
 
 ![vipe-vis](assets/vipe-vis.gif)
 
-Currently, we support the following pipeline configurations:
-- `default`: The default pipeline for pinhole cameras.
-- `lyra`: Configuration for results in the [Lyra](https://github.com/nv-tlabs/lyra) paper.
-- 🔥🔥 `dav3`: Using the newest Depth-Anything-V3 model as depth estimation model.
-- `no_vda`: If running video-depth-anything is too memory-consuming for you, this configuration can produce less temporally-stable depth (but empirically more 3D consistent) maps.
-- `wide_angle`: If your video contains some wide-angle or fisheye distortion.
-- `panorama`: For 360° videos, this is only available in the `panorama` branch for now.
+This fork retains only the `dav3` pipeline.
 
 One can visualize the results that ViPE produces by running (supported by `viser`):
 ```bash
@@ -73,16 +59,16 @@ vipe visualize vipe_results/
 
 ### Using the `run.py` script
 
-The `run.py` script is a more flexible way to run ViPE. Compared to the CLI, the script supports running on multiple videos at once and allows more fine-grained control over the pipeline with `hydra` configs. It also provides an example of using `vipe` as a library in your own project.
+The `run.py` script is a more flexible way to run ViPE. Compared to the CLI, the script supports running on frame directories with more fine-grained control over the pipeline through `hydra` configs. It also provides an example of using `vipe` as a library in your own project.
 
 Example usages:
 
 ```bash
 # Running the full pipeline.
-python run.py pipeline=default streams=raw_mp4_stream streams.base_path=YOUR_VIDEO_OR_DIR_PATH
+python run.py streams.base_path=/path/to/frame_dir streams.fps=30
 
 # Running the pose-only pipeline without depth estimation.
-python run.py pipeline=default streams=raw_mp4_stream streams.base_path=YOUR_VIDEO_OR_DIR_PATH pipeline.post.depth_align_model=null
+python run.py streams.base_path=/path/to/frame_dir streams.fps=30 pipeline.post.depth_align_model=null
 ```
 
 ### Converting to COLMAP format
@@ -125,11 +111,7 @@ vipe visualize YOUR_OUTPUT_DIR
 
 ViPE is built on top of many great open-source research projects and codebases. Some of these include (not exhaustive):
 - [DROID-SLAM](https://github.com/princeton-vl/DROID-SLAM)
-- [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2)
-- [Metric3Dv2](https://github.com/YvanYin/Metric3D)
-- [PriorDA](https://github.com/SpatialVision/Prior-Depth-Anything)
-- [UniDepth](https://github.com/lpiccinelli-eth/UniDepth)
-- [VideoDepthAnything](https://github.com/DepthAnything/Video-Depth-Anything)
+- [Depth Anything 3](https://github.com/DepthAnything/Depth-Anything-3)
 - [GeoCalib](https://github.com/cvg/GeoCalib)
 - [Segment and Track Anything](https://github.com/z-x-yang/Segment-and-Track-Anything)
 
@@ -141,7 +123,6 @@ We thank useful discussions from Aigul Dzhumamuratova, Viktor Kuznetsov, Soha Po
 
 - [x] Initial code released under Apache 2.0 license.
 - [x] Full dataset uploaded to Hugging Face for download.
-- [x] Add instructions to run inference on wide-angle and 360° videos.
 - [ ] Add instructions for benchmarking.
 
 ## Citation

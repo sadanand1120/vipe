@@ -23,7 +23,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from vipe.ext.lietorch import SE3
 from vipe.priors.depth import make_depth_model
-from vipe.priors.depth.adapter import PinholeDepthAdapter
 from vipe.priors.depth.base import DepthType
 from vipe.streams.base import (FrameAttribute, ProcessedVideoStream,
                                StreamProcessor, VideoFrame, VideoStream)
@@ -36,7 +35,6 @@ from .components.buffer import GraphBuffer
 from .components.frontend import SLAMFrontend
 from .components.inner_filler import FilledReturn, InnerFiller
 from .components.motion_filter import MotionFilter
-from .components.sparse_tracks import build_sparse_tracks
 from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
 
@@ -90,7 +88,6 @@ class SLAMSystem:
 
     def _build_components(self):
         self.droid_net = DroidNet().to(self.device)
-        self.sparse_tracks = build_sparse_tracks(self.config.sparse_tracks, self.config.n_views)
         self.buffer = GraphBuffer(
             height=self.config.height,
             width=self.config.width,
@@ -99,14 +96,12 @@ class SLAMSystem:
             init_disp=self.config.init_disp,
             cross_view_idx=self.config.get("cross_view_idx", None),
             ba_config=self.config.ba,
-            sparse_tracks=self.sparse_tracks,
             camera_type=self.config.camera_type,
             device=self.device,
         )
         self.buffer.rig[:] = self.rig.to(self.device).data
         self.motion_filter = MotionFilter(
             self.droid_net,
-            sparse_tracks=self.sparse_tracks,
             thresh=self.config.filter_thresh,
             device=self.device,
         )
@@ -120,13 +115,7 @@ class SLAMSystem:
             This is currently not supported for now."""
 
             self.metric_depth = make_depth_model(self.config.keyframe_depth)
-            if self.config.camera_type not in self.metric_depth.supported_camera_types:
-                self.metric_depth = PinholeDepthAdapter(self.metric_depth)
-
-            assert self.metric_depth.depth_type in [
-                DepthType.METRIC_DEPTH,
-                DepthType.MODEL_METRIC_DEPTH,
-            ]
+            assert self.metric_depth.depth_type == DepthType.METRIC_DEPTH
 
         else:
             self.metric_depth = None
@@ -257,8 +246,6 @@ class SLAMSystem:
         ):
             images, buffer_masks = self._precompute_features(frame_data_list)
 
-            self.sparse_tracks.track_image(frame_data_list)
-
             if self.motion_filter.check(images, buffer_masks) or frame_idx == total_n_frames - 1:
                 is_keyframe = True
                 self._add_keyframe(frame_idx, images, buffer_masks, frame_data_list, phase=1)
@@ -275,10 +262,6 @@ class SLAMSystem:
             # to avoid large errors and local minima.
             if self.buffer.n_frames in self.config.frontend_backend_iters and is_keyframe:
                 self.backend.run_if_necessary(5, log=self.visualize)
-
-        # Tracks can be determined earlier since it's fixed after frontend.
-        if self.visualize:
-            self.buffer.log_tracks()
 
         # Run the backend to perform a global BA over the keyframes.
         self.backend.run(7, log=self.visualize)

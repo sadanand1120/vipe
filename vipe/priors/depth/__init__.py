@@ -17,30 +17,9 @@ from .base import DepthEstimationInput, DepthEstimationModel, DepthEstimationRes
 
 
 def make_depth_model(model: str):
-    if "-" not in model:
-        model_name, model_sub = model, ""
-    else:
-        model_name, model_sub = model.split("-")
+    if model != "dav3":
+        raise ValueError(f"Only dav3 depth is supported, got {model}")
 
-    if model_name == "metric3d":
-        from .metric3d import Metric3DDepthModel
+    from .dav3 import DepthAnything3Model
 
-        return Metric3DDepthModel(version=2, model=model_sub)
-
-    elif model_name == "unidepth":
-        from .unidepth import UniDepth2Model
-
-        return UniDepth2Model(type=model_sub)
-
-    elif model_name == "moge":
-        from .moge import MogeModel
-
-        return MogeModel()
-
-    elif model_name == "dav3":
-        from .dav3 import DepthAnything3Model
-
-        return DepthAnything3Model()
-
-    else:
-        raise ValueError(f"Unknown depth model: {model}")
+    return DepthAnything3Model()

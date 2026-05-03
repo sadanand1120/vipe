@@ -20,10 +20,6 @@ from typing import Iterator
 import numpy as np
 import torch
 
-from vipe.priors.depth import DepthEstimationInput, make_depth_model
-from vipe.priors.depth.alignment import align_inv_depth_to_depth
-from vipe.priors.depth.priorda import PriorDAModel
-from vipe.priors.depth.videodepthanything import VideoDepthAnythingDepthModel
 from vipe.priors.geocalib import GeoCalib
 from vipe.priors.track_anything import TrackAnythingPipeline
 from vipe.slam.interface import SLAMOutput
@@ -47,7 +43,6 @@ class IntrinsicEstimationProcessor(StreamProcessor):
         self.sample_frame_inds = [0, gap_frame, gap_frame * 2]
         self.fov_y = -1.0
         self.camera_type = CameraType.PINHOLE
-        self.distortion: list[float] = []
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.INTRINSICS}
@@ -57,7 +52,7 @@ class IntrinsicEstimationProcessor(StreamProcessor):
         frame_height, frame_width = frame.size()
         fx = fy = frame_height / (2 * np.tan(self.fov_y / 2))
         frame.intrinsics = torch.as_tensor(
-            [fx, fy, frame_width / 2, frame_height / 2] + self.distortion,
+            [fx, fy, frame_width / 2, frame_height / 2],
         ).float()
         frame.camera_type = self.camera_type
         return frame
@@ -71,36 +66,18 @@ class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
         camera_type: CameraType = CameraType.PINHOLE,
     ) -> None:
         super().__init__(video_stream, gap_sec)
+        assert camera_type == CameraType.PINHOLE, "Only pinhole camera intrinsics are supported"
 
-        is_pinhole = camera_type == CameraType.PINHOLE
-        weights = "pinhole" if is_pinhole else "distorted"
-
-        model = GeoCalib(weights=weights).cuda()
+        model = GeoCalib(weights="pinhole").cuda()
         indexable_stream = CachedVideoStream(video_stream)
-
-        if is_pinhole:
-            sample_frames = torch.stack([indexable_stream[i].rgb.moveaxis(-1, 0) for i in self.sample_frame_inds])
-            res = model.calibrate(
-                sample_frames,
-                shared_intrinsics=True,
-            )
-        else:
-            # Use first frame for calibration
-            camera_model = {
-                CameraType.PINHOLE: "pinhole",
-                CameraType.MEI: "simple_mei",
-            }[camera_type]
-            res = model.calibrate(
-                indexable_stream[self.sample_frame_inds[0]].rgb.moveaxis(-1, 0)[None],
-                camera_model=camera_model,
-            )
+        sample_frames = torch.stack([indexable_stream[i].rgb.moveaxis(-1, 0) for i in self.sample_frame_inds])
+        res = model.calibrate(
+            sample_frames,
+            shared_intrinsics=True,
+        )
 
         self.fov_y = res["camera"].vfov[0].item()
         self.camera_type = camera_type
-
-        if not is_pinhole:
-            # Assign distortion parameter
-            self.distortion = [res["camera"].dist[0, 0].item()]
 
 
 class TrackAnythingProcessor(StreamProcessor):
@@ -141,181 +118,10 @@ class TrackAnythingProcessor(StreamProcessor):
         return frame
 
 
-class AdaptiveDepthProcessor(StreamProcessor):
-    """
-    Compute projection of the SLAM map onto the current frames.
-    If it's well-distributed, then use the fast map-prompted video depth model.
-    If not, then use the slow metric depth + video depth alignment model.
-    """
-
-    def __init__(
-        self,
-        slam_output: SLAMOutput,
-        view_idx: int = 0,
-        model: str = "adaptive_unidepth-l_svda",
-        share_depth_model: bool = False,
-        video_chunk_size: int = 32,
-    ):
-        super().__init__()
-        self.slam_output = slam_output
-        self.infill_target_pose = self.slam_output.get_view_trajectory(view_idx)
-        assert view_idx == 0, "Adaptive depth processor only supports view_idx=0"
-        assert not share_depth_model, "Adaptive depth processor does not support shared depth model"
-        self.require_cache = True
-        self.model = model
-        self.video_chunk_size = video_chunk_size
-
-        try:
-            prefix, metric_model, video_model = model.split("_")
-            assert video_model in ["svda", "vda"]
-            self.video_depth_model = VideoDepthAnythingDepthModel(model="vits" if video_model == "svda" else "vitl")
-
-        except ValueError:
-            prefix, metric_model = model.split("_")
-            video_model = None
-            self.video_depth_model = None
-
-        assert prefix == "adaptive", "Model name should start with 'adaptive_'"
-
-        self.depth_model = make_depth_model(metric_model)
-        self.prompt_model = PriorDAModel()
-        self.update_momentum = 0.99
-
-    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
-        raise NotImplementedError("AdaptiveDepthProcessor should not be called directly.")
-
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes | {FrameAttribute.METRIC_DEPTH}
-
-    def _compute_uv_score(self, depth: torch.Tensor, patch_count: int = 10) -> float:
-        h_shape = depth.size(0) // patch_count
-        w_shape = depth.size(1) // patch_count
-        depth_crop = (depth > 0)[: h_shape * patch_count, : w_shape * patch_count]
-        depth_crop = depth_crop.reshape(patch_count, h_shape, patch_count, w_shape)
-        depth_exist = depth_crop.any(dim=(1, 3))
-        return depth_exist.float().mean().item()
-
-    def _compute_video_da(self, frame_list: list[VideoFrame]) -> torch.Tensor:
-        rgb_list = [frame.rgb.cpu().numpy() for frame in frame_list]
-        return unpack_optional(
-            self.video_depth_model.estimate(DepthEstimationInput(video_frame_list=rgb_list)).relative_inv_depth
-        )
-
-    def _align_frame_depth(
-        self,
-        frame_idx: int,
-        frame: VideoFrame,
-        min_uv_score: float,
-        video_depth_inv_depth: torch.Tensor | None,
-    ) -> VideoFrame:
-        frame = frame.cuda()
-
-        if min_uv_score < 0.3:
-            prompt_result = self.depth_model.estimate(
-                DepthEstimationInput(
-                    rgb=frame.rgb.float().cuda(), intrinsics=frame.intrinsics, camera_type=frame.camera_type
-                )
-            ).metric_depth
-            frame.information = f"uv={min_uv_score:.2f}(Metric)"
-        else:
-            depth_map = self.slam_output.slam_map.project_map(
-                frame_idx,
-                0,
-                frame.size(),
-                unpack_optional(frame.intrinsics),
-                self.infill_target_pose[frame_idx],
-                unpack_optional(frame.camera_type),
-                infill=False,
-            )
-            if frame.mask is not None:
-                depth_map = depth_map * frame.mask.float()
-            prompt_result = self.prompt_model.estimate(
-                DepthEstimationInput(
-                    rgb=frame.rgb.float().cuda(),
-                    prompt_metric_depth=depth_map,
-                )
-            ).metric_depth
-            frame.information = f"uv={min_uv_score:.2f}(SLAM)"
-
-        if video_depth_inv_depth is not None:
-            align_mask = video_depth_inv_depth > 1e-3
-            if frame.mask is not None:
-                align_mask = align_mask & frame.mask & (~frame.sky_mask)
-
-            try:
-                _, scale, bias = align_inv_depth_to_depth(
-                    unpack_optional(video_depth_inv_depth),
-                    prompt_result,
-                    align_mask,
-                )
-            except RuntimeError:
-                scale, bias = unpack_optional(self.cache_scale_bias)
-
-            if self.cache_scale_bias is None:
-                self.cache_scale_bias = (scale, bias)
-            scale = self.cache_scale_bias[0] * self.update_momentum + scale * (1 - self.update_momentum)
-            bias = self.cache_scale_bias[1] * self.update_momentum + bias * (1 - self.update_momentum)
-            self.cache_scale_bias = (scale, bias)
-
-            video_inv_depth = video_depth_inv_depth * scale + bias
-            video_inv_depth[video_inv_depth < 1e-3] = 1e-3
-            frame.metric_depth = video_inv_depth.reciprocal()
-        else:
-            frame.metric_depth = prompt_result
-
-        return frame
-
-    def update_iterator(self, previous_iterator: Iterator[VideoFrame], pass_idx: int) -> Iterator[VideoFrame]:
-        # Determine the percentage score of the SLAM map.
-
-        self.cache_scale_bias = None
-        min_uv_score: float = 1.0
-        chunk_frames: list[VideoFrame] = []
-        chunk_start_idx = 0
-
-        def flush_chunk(start_idx: int, frames: list[VideoFrame]) -> Iterator[VideoFrame]:
-            video_depth_result = self._compute_video_da(frames) if self.video_depth_model is not None else None
-            for local_idx, chunk_frame in enumerate(frames):
-                video_depth_inv_depth = None if video_depth_result is None else video_depth_result[local_idx]
-                yield self._align_frame_depth(start_idx + local_idx, chunk_frame, min_uv_score, video_depth_inv_depth)
-
-        for frame_idx, frame in pbar(enumerate(previous_iterator), desc="Aligning depth"):
-            if frame_idx == 0:
-                for test_frame_idx in range(self.slam_output.trajectory.shape[0]):
-                    if test_frame_idx % 10 != 0:
-                        continue
-                    depth_infilled = self.slam_output.slam_map.project_map(
-                        test_frame_idx,
-                        0,
-                        frame.size(),
-                        unpack_optional(frame.intrinsics),
-                        self.infill_target_pose[test_frame_idx],
-                        unpack_optional(frame.camera_type),
-                        infill=False,
-                    )
-                    uv_score = self._compute_uv_score(depth_infilled)
-                    if uv_score < min_uv_score:
-                        min_uv_score = uv_score
-
-                logger.info(f"Minimum UV score: {min_uv_score:.4f}")
-
-            if len(chunk_frames) == 0:
-                chunk_start_idx = frame_idx
-            chunk_frames.append(frame)
-
-            if len(chunk_frames) >= self.video_chunk_size:
-                yield from flush_chunk(chunk_start_idx, chunk_frames)
-                chunk_frames = []
-
-        if len(chunk_frames) > 0:
-            yield from flush_chunk(chunk_start_idx, chunk_frames)
-
-
 class MultiviewDepthProcessor(StreamProcessor):
     """
-    Use multi-view depth model (e.g. DAv3, MapAnything, CAPA) to estimate depth map for each frame.
-    To ensure that the depth maps are consistent with the SLAM map/pose (metric), we condition the depth model either with
-    (a) sparse points, or (b) camera poses & intrinsics.
+    Use DAV3 multi-view depth to estimate depth for each frame.
+    Depth is conditioned on camera poses and intrinsics from SLAM.
 
     Depth is estimated in a sliding-window manner, and overlapped frames are linearly averaged to sharp transitions.
     To create enough parallex to improve estimation confidence, for each window we optionally also include
@@ -345,18 +151,20 @@ class MultiviewDepthProcessor(StreamProcessor):
         # Need two passes for this iterator to work.
         self.n_passes_required = 2
 
-        if self.model == "mvd_dav3":
-            try:
-                from depth_anything_3.api import DepthAnything3
-                from depth_anything_3.api import logger as dav3_logger
-            except ModuleNotFoundError:
-                raise ModuleNotFoundError(
-                    "depth-anything-3 not found. Please reinstall vipe with `pip install --no-build-isolation -e .[dav3]`"
-                )
+        if self.model != "mvd_dav3":
+            raise ValueError(f"Only mvd_dav3 is supported, got {self.model}")
 
-            dav3_logger.level = 0  # Disable logging timing information
-            self.dav3_api = DepthAnything3.from_pretrained("depth-anything/DA3-GIANT")
-            self.dav3_api = self.dav3_api.cuda().eval()
+        try:
+            from depth_anything_3.api import DepthAnything3
+            from depth_anything_3.api import logger as dav3_logger
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError(
+                "depth-anything-3 not found. Please reinstall vipe with `pip install --no-build-isolation -e .[dav3]`"
+            )
+
+        dav3_logger.level = 0  # Disable logging timing information
+        self.dav3_api = DepthAnything3.from_pretrained("depth-anything/DA3-GIANT")
+        self.dav3_api = self.dav3_api.cuda().eval()
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.METRIC_DEPTH, FrameAttribute.DEPTH_CONFIDENCE}

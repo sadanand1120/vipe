@@ -21,7 +21,6 @@
 import torch
 
 from ..networks.droid_net import CorrBlock, DroidNet
-from .sparse_tracks import SparseTracks
 
 
 class MotionFilter:
@@ -34,14 +33,12 @@ class MotionFilter:
     def __init__(
         self,
         droid_net: DroidNet,
-        sparse_tracks: SparseTracks,
         thresh: float,
         device: torch.device = torch.device("cuda"),
     ):
         self.net = droid_net
         self.thresh = thresh
         self.device = device
-        self.sparse_tracks = sparse_tracks
         self.initialized = False
 
     @staticmethod
@@ -64,7 +61,6 @@ class MotionFilter:
             buffer_masks (torch.Tensor): Vhw mask 1-invalid, 0-valid
         """
 
-        num_views = images.shape[0]
         ht = images.shape[-2] // 8
         wd = images.shape[-1] // 8
 
@@ -80,7 +76,6 @@ class MotionFilter:
             self.f_mask = buffer_masks
             self.current_frame_idx = 0
             self.last_kf_frame_idx = 0
-            self.last_n_sparse_tracks = 0
             self.initialized = True
             return True
 
@@ -109,41 +104,12 @@ class MotionFilter:
             # Across views [max is the most conservative, while min don't add a lot of KFs]
             dense_motion_score = dense_motion_score.min().item()
 
-            # Mask for sparse tracks is already considered during tracking.
-            sparse_motion_score: float = 0.0
-            if self.sparse_tracks.enabled:
-                n_sparse_tracks: int = 0
-
-                for view_idx in range(num_views):
-                    kp_idx = self.sparse_tracks.get_correspondences(
-                        view_idx, self.current_frame_idx, self.last_kf_frame_idx
-                    )
-                    n_sparse_tracks += len(kp_idx)
-                    current_kp = self.sparse_tracks.get_observations(view_idx, self.current_frame_idx, kp_idx)
-                    last_kp = self.sparse_tracks.get_observations(view_idx, self.last_kf_frame_idx, kp_idx)
-                    sparse_delta = (current_kp - last_kp).norm(dim=-1).mean().item()
-                    sparse_motion_score += sparse_delta
-
-                # If smaller than 0, either new kps are added or this is the next frame after kp is inserted
-                sparse_tracks_diff = n_sparse_tracks - self.last_n_sparse_tracks
-                # Force add keyframe if 20% of the sparse tracks are diminished
-                if sparse_tracks_diff < 0 and self.last_n_sparse_tracks > 0:
-                    diff_ratio = -sparse_tracks_diff / self.last_n_sparse_tracks
-                    if diff_ratio > 0.2:
-                        sparse_motion_score += 100.0  # Arbitrary large number
-
-                self.last_n_sparse_tracks = n_sparse_tracks
-
             # check motion magnitue / add new frame to video
-            if (
-                dense_motion_score > self.thresh
-                or sparse_motion_score > self.thresh * 2  # Larger threshold since we don't avg across pixels
-            ):
+            if dense_motion_score > self.thresh:
                 net, inp = self.net.encode_context(images)
                 self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
                 self.f_mask = buffer_masks
                 self.last_kf_frame_idx = self.current_frame_idx
-                self.last_n_sparse_tracks = 0
                 return True
 
             else:

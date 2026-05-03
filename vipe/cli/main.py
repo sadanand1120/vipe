@@ -18,9 +18,8 @@ from pathlib import Path
 import click
 import hydra
 
-from vipe import get_config_path, make_pipeline
-from vipe.streams.base import ProcessedVideoStream
-from vipe.streams.frame_dir_stream import FrameDirStream
+from vipe import get_config_path
+from vipe.runtime import make_annotation_pipeline, make_frame_dir_stream_list
 from vipe.utils.logging import configure_logging
 from vipe.utils.viser import run_viser
 
@@ -40,17 +39,14 @@ from vipe.utils.viser import run_viser
     help="Output directory (default: current directory)",
     default=Path.cwd() / "vipe_results",
 )
-@click.option("--pipeline", "-p", default="default", help="Pipeline configuration to use (default: 'default')")
 @click.option("--visualize", "-v", is_flag=True, help="Enable visualization of intermediate results")
-def infer(frame_dir: Path, fps: float, output: Path, pipeline: str, visualize: bool):
+def infer(frame_dir: Path, fps: float, output: Path, visualize: bool):
     """Run inference on a directory of image frames."""
     logger = configure_logging()
 
     overrides = [
-        f"pipeline={pipeline}",
         f"pipeline.output.path={output}",
         "pipeline.output.save_artifacts=true",
-        "streams=frame_dir_stream",
         f"streams.base_path={frame_dir}",
         f"streams.fps={fps}",
     ]
@@ -64,8 +60,8 @@ def infer(frame_dir: Path, fps: float, output: Path, pipeline: str, visualize: b
         args = hydra.compose("default", overrides=overrides)
 
     logger.info(f"Processing frame directory {frame_dir}...")
-    vipe_pipeline = make_pipeline(args.pipeline)
-    video_stream = ProcessedVideoStream(FrameDirStream(frame_dir, fps=fps), [])
+    vipe_pipeline = make_annotation_pipeline(args.pipeline)
+    video_stream = make_frame_dir_stream_list(args.streams)[0]
     vipe_pipeline.run(video_stream)
     logger.info("Finished")
 

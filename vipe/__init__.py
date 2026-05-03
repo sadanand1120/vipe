@@ -15,18 +15,9 @@
 
 from pathlib import Path
 
-from omegaconf import OmegaConf
-
-from vipe.pipeline import make_pipeline
-
 
 __version__ = "0.1.1"
 __version_info__ = (0, 1, 1)
-
-if not OmegaConf.has_resolver("eq"):
-    OmegaConf.register_new_resolver("eq", lambda a, b: a == b)
-if not OmegaConf.has_resolver("neq"):
-    OmegaConf.register_new_resolver("neq", lambda a, b: a != b)
 
 
 def get_config_path() -> Path:

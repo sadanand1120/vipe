@@ -33,14 +33,12 @@ from vipe.priors.depth import DepthEstimationInput, DepthEstimationModel
 from vipe.priors.depth.base import DepthType
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
-from vipe.utils.visualization import POINTS_STENCIL, draw_lines_batch, draw_points_batch
 
 from ..ba.solver import Solver, SparseBlockVector
 from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm
 from ..interface import SLAMMap
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, IntrinsicsRetractor, PoseRetractor, RigRotationOnlyRetractor
-from .sparse_tracks import SparseTracks
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +54,6 @@ class GraphBuffer:
         init_disp: float,
         cross_view_idx: list[int] | None,
         ba_config: DictConfig,
-        sparse_tracks: SparseTracks,
         camera_type: CameraType,
         device: torch.device = torch.device("cuda"),
     ):
@@ -70,7 +67,6 @@ class GraphBuffer:
         self.n_views = n_views
         self.device = device
         self.ba_config = ba_config
-        self.sparse_tracks = sparse_tracks
         self.camera_type = camera_type
 
         assert self.height % 8 == 0 and self.width % 8 == 0
@@ -242,15 +238,9 @@ class GraphBuffer:
             assert self.last_depth_intrinsics is not None
             if torch.allclose(self.last_depth_intrinsics, self.intrinsics):
                 return
-            # If we can update in an easier way, do it.
-            if depth_model.depth_type == DepthType.METRIC_DEPTH:
-                # Depth is already estimated and we can simply do the scaling
-                self.disps_sens[: self.n_frames] *= (
-                    self.last_depth_intrinsics[0][0].item() / self.intrinsics[0][0].item()
-                )
-                return
-
-            frames_to_update = pbar(range(self.n_frames), desc="Update depth")
+            assert depth_model.depth_type == DepthType.METRIC_DEPTH
+            self.disps_sens[: self.n_frames] *= self.last_depth_intrinsics[0][0].item() / self.intrinsics[0][0].item()
+            return
 
         assert self.n_views == 1
 
@@ -393,9 +383,7 @@ class GraphBuffer:
         They have to be coupled together to work.
         """
         assert t0 <= t1
-        weight_dense_disp, weight_tracks = 0.001, 0.001
-        # weight_dense_disp, weight_tracks = 0.001, 0.0
-        # weight_dense_disp, weight_tracks = 0.0, 0.001
+        weight_dense_disp = 0.001
 
         pi, qi, di, pj, qj, dj = self.expand_edge_multiview(ii, jj)
         di_unique = torch.unique(di)
@@ -418,46 +406,6 @@ class GraphBuffer:
                 camera_type=self.camera_type,
             )
         )
-
-        if self.sparse_tracks.enabled:
-            # This does not support cross-view tracking yet.
-            sparse_target, sparse_weight = self.sparse_tracks.compute_dense_disp_target_weight(
-                source_view_inds=qi,
-                source_frame_inds=self.tstamp[pi],
-                target_view_inds=qj,
-                target_frame_inds=self.tstamp[pj],
-                image_size=(self.height, self.width),
-                dense_disp_size=(self.height // 8, self.width // 8),
-            )
-            sparse_target = sparse_target.flatten(1, 2)
-            sparse_weight = sparse_weight.flatten(1, 2)
-            solver.add_term(
-                DenseDepthFlowTerm(
-                    pose_i_inds=pi,
-                    pose_j_inds=pj,
-                    rig_i_inds=qi,
-                    rig_j_inds=qj,
-                    dense_disp_i_inds=di,
-                    target=sparse_target,
-                    weight=weight_tracks * sparse_weight,
-                    intrinsics=None,
-                    intrinsics_factor=8.0,
-                    rig=None,
-                    image_size=(self.height // 8, self.width // 8),
-                    camera_type=self.camera_type,
-                )
-            )
-
-        # self.debug_visualize_target_weight(
-        #     target,
-        #     weight,
-        #     pi,
-        #     pj,
-        #     qi,
-        #     qj,
-        #     # other_target=sparse_target,
-        #     # other_weight=sparse_weight,
-        # )
 
         solver.set_fixed(
             "pose",
@@ -644,64 +592,6 @@ class GraphBuffer:
             torch.stack(mask_list, dim=1),
             self.tstamp[t_range],
         )
-
-    def log_tracks(self):
-        if not self.sparse_tracks.enabled:
-            return
-
-        # Note that this vis does not reflect the factors we use
-        frame_indices = self.tstamp[: self.n_frames].cpu().numpy()
-
-        for kf_idx in range(self.n_frames):
-            rr.set_time_sequence("frame", int(frame_indices[kf_idx]))
-
-            for v in range(self.n_views):
-                canvas = self.images[kf_idx, v].moveaxis(0, -1).cpu().numpy().astype(np.float32)
-                canvas = (canvas * 255).astype(np.uint8)
-
-                for delta_kf_cnt in range(10):
-                    skf_idx = kf_idx - delta_kf_cnt
-                    if (tkf_idx := kf_idx - delta_kf_cnt - 1) < 0:
-                        break
-
-                    kp_indices = self.sparse_tracks.get_correspondences(
-                        v, frame_indices[kf_idx], frame_indices[tkf_idx]
-                    )
-                    kp_indices_subset = self.sparse_tracks.get_correspondences(
-                        v, frame_indices[skf_idx], frame_indices[tkf_idx]
-                    )  # Some immediate ones might be masked out.
-                    kp_indices = torch.tensor(
-                        list(set(kp_indices.numpy().tolist()).intersection(set(kp_indices_subset.numpy().tolist()))),
-                    )
-                    if len(kp_indices) == 0:
-                        break
-
-                    source = self.sparse_tracks.get_observations(v, frame_indices[skf_idx], kp_indices)
-                    target = self.sparse_tracks.get_observations(v, frame_indices[tkf_idx], kp_indices)
-
-                    bright_green = max(255 - 20 * delta_kf_cnt, 0)
-                    dim_green = max(255 - 20 * (delta_kf_cnt + 1), 0)
-
-                    canvas = draw_points_batch(
-                        canvas,
-                        source.cpu().numpy(),
-                        (0, bright_green, 0),
-                        stencil=POINTS_STENCIL,
-                    )
-                    canvas = draw_points_batch(
-                        canvas,
-                        target.cpu().numpy(),
-                        (0, dim_green, 0),
-                        stencil=POINTS_STENCIL,
-                    )
-                    canvas = draw_lines_batch(
-                        canvas,
-                        source.cpu().numpy(),
-                        target.cpu().numpy(),
-                        (0, bright_green, 0),
-                    )
-
-                rr.log(f"world/tracks_v{v}", rr.Image(canvas).compress())  # type: ignore
 
     def log(self, vis_thresh: float):
         (dirty_index,) = torch.where(self.dirty)

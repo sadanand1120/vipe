@@ -17,7 +17,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 
-import numpy as np
 import torch
 
 from vipe.utils.cameras import CameraType
@@ -28,20 +27,8 @@ class DepthType(Enum):
     Type of depth estimated.
     """
 
-    # Inverse metric depth (DepthPro, Metric3D), scale is determined by focal.
+    # DAV3 metric depth is proportional to focal length.
     METRIC_DEPTH = "metric_depth"
-
-    # Metric depth (UniDepth), scale is determined by focal but require re-running the model.
-    MODEL_METRIC_DEPTH = "model_metric_depth"
-
-    # Metric distance, scale is determined by focal but require re-running the model.
-    MODEL_METRIC_DISTANCE = "model_metric_distance"
-
-    # Affine-invariant inverse depth (DepthAnything, MoGE), affine needs to be solved per-estimation.
-    AFFINE_DISP = "affine_disp"
-
-    # Scale-invariant depth (DUSt3R), scale needs to be solved per-estimation.
-    SCALE_DISP = "scale_disp"
 
 
 @dataclass(slots=True, kw_only=True)
@@ -49,13 +36,10 @@ class DepthEstimationResult:
     """
     Dataclass for depth estimation results.
 
-    - relative_inv_depth: The estimated inverse depth map ([B,], H, W) in relative scale.
-        One has to estimate scale and offset of such estimation
     - metric_depth: The estimated depth map ([B,], H, W) in metric scale.
     - confidence: The confidence map ([B,], H, W).
     """
 
-    relative_inv_depth: torch.Tensor | None = None
     metric_depth: torch.Tensor | None = None
     confidence: torch.Tensor | None = None
 
@@ -66,15 +50,11 @@ class DepthEstimationInput:
     Dataclass for depth estimation inputs.
 
     - rgb: The source image ([B,], H, W, 3), should be within 0-1 float.
-    - video_frame_list: The list of video frames (H, W, 3), should be within 0-1 float, length is T.
-        we use numpy here mainly to enforce CPU tensor.
     - intrinsics: The intrinsics of the camera.
     - camera_type: The type of camera.
     """
 
     rgb: torch.Tensor | None = None
-    video_frame_list: list[np.ndarray] | None = None
-    prompt_metric_depth: torch.Tensor | None = None
     intrinsics: torch.Tensor | None = None
     camera_type: CameraType = CameraType.PINHOLE
 
@@ -91,24 +71,8 @@ class DepthEstimationModel(ABC):
         """
         raise NotImplementedError
 
-    @property
-    def supported_camera_types(self) -> list[CameraType]:
-        """
-        Supported camera types.
-        """
-        return [CameraType.PINHOLE]
-
     @abstractmethod
     def estimate(self, src: DepthEstimationInput) -> DepthEstimationResult:
         """
         Estimate a single optical flow result from two images.
         """
-
-
-class DummyDepthModel(DepthEstimationModel):
-    """
-    Dummy model that would not predict anything.
-    """
-
-    def estimate(self, src: DepthEstimationInput) -> DepthEstimationResult:
-        return DepthEstimationResult()
