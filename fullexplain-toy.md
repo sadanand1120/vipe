@@ -2,6 +2,8 @@
 
 Open this beside [fullexplain.md](./fullexplain.md). The chunk numbers match one-to-one with the main explanation.
 
+Each toy chunk follows the same flow as the matching chunk in `fullexplain.md`: it states what object arrives from the previous chunk, computes the concrete toy values, and ends by stating what object is handed to the next chunk. If you keep both files open side by side, read one chunk in `fullexplain.md` first, then read the same-numbered toy chunk here to see the exact values carried by that code path.
+
 ## Toy Sequence Used Throughout
 
 Every chunk below uses the same toy sequence. The numeric values are intentionally small, but the data flow and tensor transformations match the current code.
@@ -54,6 +56,7 @@ The toy network outputs are illustrative. They show exact shapes, exact formulas
 <a id="chunk-1-toy"></a>
 ## Chunk 1 Toy: Shell, Hydra Config, And Runtime Construction
 
+This corresponds to [fullexplain.md Chunk 1](./fullexplain.md#chunk-1-shell-hydra-config-and-runtime-construction). The input is only a shell command plus config overrides. The output of this chunk is two live Python objects: one `FrameDir` source and one `DefaultAnnotationPipeline`.
 
 Toy CLI:
 
@@ -81,9 +84,12 @@ pipeline = DefaultAnnotationPipeline(init=args.pipeline.init, slam=args.pipeline
 pipeline.out_path == Path("/toy/out")
 ```
 
+So after chunk 1, nothing has read image pixels yet. The only concrete state is: `frame_stream` knows where `/toy/scene0000_00/color` is, and `pipeline` knows it should write to `/toy/out` with TSDF PCD output. Chunk 2 now asks `FrameDir` to enumerate the actual image files and yield `FrameData` objects.
+
 <a id="chunk-2-toy"></a>
 ## Chunk 2 Toy: Frame Directory Stream And Frame Ordering
 
+This corresponds to [fullexplain.md Chunk 2](./fullexplain.md#chunk-2-frame-directory-source-and-frame-ordering). The input is the `FrameDir` object from chunk 1. The output is a re-iterable stream of bare `FrameData` objects containing only `raw_frame_idx` and CUDA RGB tensors.
 
 Input files:
 
@@ -127,9 +133,12 @@ FrameData(
 )
 ```
 
+At the end of chunk 2, every yielded frame is just RGB plus its sorted-file index. There is still no camera model, pose, depth, or point cloud. Chunk 3 attaches the first required geometric attribute: shared pinhole intrinsics from GeoCalib.
+
 <a id="chunk-3-toy"></a>
 ## Chunk 3 Toy: Initial Stream Processors: GeoCalib Intrinsics And Attribute Recording
 
+This corresponds to [fullexplain.md Chunk 3](./fullexplain.md#chunk-3-initial-stream-processors-geocalib-intrinsics-and-attribute-recording). The input is the RGB-only `FrameData` stream from chunk 2. The output is an initialized stream where each frame has `intrinsics` and `camera_type`, plus a recorder that can recreate those attributes when the raw directory is replayed later.
 
 GeoCalib samples toy frames:
 
@@ -203,9 +212,12 @@ FrameData(
 )
 ```
 
+So chunk 3 turns image-only frames into camera-calibrated frames. SLAM consumes this initialized stream once, and the recorder preserves the same raw-resolution intrinsics for later replay. Chunk 4 now takes these calibrated frames into SLAM, where they are resized and placed into the graph buffer.
+
 <a id="chunk-4-toy"></a>
 ## Chunk 4 Toy: SLAM Standard Resize, Graph Buffer, And Model Setup
 
+This corresponds to [fullexplain.md Chunk 4](./fullexplain.md#chunk-4-slam-standard-resize-graph-buffer-and-model-setup). The input is calibrated original-resolution frames from chunk 3. The output is the resized/cropped representation and a `GraphBuffer` layout ready to store keyframes, features, poses, disparities, and DAV3 keyframe depth anchors.
 
 Toy raw frame size is `(24,32)`.
 
@@ -257,9 +269,12 @@ buffer.nets.shape == (buffer_size,128,48,64)
 buffer.inps.shape == (buffer_size,128,48,64)
 ```
 
+At the end of chunk 4, the important concrete conversion is: raw `24 x 32` frames become SLAM `384 x 512` frames, and the dense optimization grid becomes `48 x 64`. Chunk 5 now iterates the sequence, decides which resized frames enter the keyframe buffer, and runs frontend BA over those keyframes.
+
 <a id="chunk-5-toy"></a>
 ## Chunk 5 Toy: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
 
+This corresponds to [fullexplain.md Chunk 5](./fullexplain.md#chunk-5-slam-pass-1-motion-filtering-keyframe-addition-and-frontend-ba). The input is the resized stream and empty graph buffer from chunk 4. The output is an initialized frontend keyframe graph: toy keyframes `0,1,2,3,4,5,6,8,9`, optimized keyframe poses, optimized keyframe disparities, and DAV3 sensor disparity anchors for those keyframes.
 
 Toy pass-1 motion decisions:
 
@@ -426,9 +441,24 @@ E_{\text{sens}}
 0.0000025.
 $$
 
+This is the concrete meaning of the frontend BA loop in the main explanation: for every graph edge and every low-res pixel, ViPE compares the current geometric projection to the learned DROID target, weights that residual, and also keeps optimized disparity close to DAV3 inverse depth where available. Repeating this over all active edges updates the keyframe poses and dense disparities stored in `GraphBuffer`.
+
+The final state after chunk 5 is:
+
+```python
+buffer.tstamp[:9] == [0,1,2,3,4,5,6,8,9]
+buffer.n_frames == 9
+buffer.poses[:9]       # optimized world-to-camera keyframe poses
+buffer.disps[:9]       # optimized 48x64 keyframe disparities
+buffer.disps_sens[:9]  # DAV3 inverse-depth anchors for keyframes
+```
+
+Frame 7 is still missing from the keyframe graph because it failed the motion threshold in pass 1. Chunk 6 now runs backend global BA over these keyframes and extracts the internal low-resolution SLAM map from the optimized keyframe disparities.
+
 <a id="chunk-6-toy"></a>
 ## Chunk 6 Toy: Backend Global BA And SLAM Map Extraction
 
+This corresponds to [fullexplain.md Chunk 6](./fullexplain.md#chunk-6-backend-global-ba-and-slam-map-extraction). The input is the pass-1 keyframe graph from chunk 5. The output is a globally refined keyframe graph plus `slam_map`, a packed point map made from the optimized keyframe disparities.
 
 Pass 1 toy keyframes:
 
@@ -478,9 +508,12 @@ count = 1
 
 It is filtered out because `1 < 2`.
 
+After chunk 6, `slam_map` is the object that later tells DAV3 which frames are keyframes and gives visualization a low-resolution point map to project. It is not the final saved TSDF/backproject PLY. The sequence still needs poses for non-keyframe raw frames, so chunk 7 fills frame 7 and any other missing non-keyframes.
+
 <a id="chunk-7-toy"></a>
 ## Chunk 7 Toy: SLAM Pass 2 And Non-Keyframe Pose Infill
 
+This corresponds to [fullexplain.md Chunk 7](./fullexplain.md#chunk-7-slam-pass-2-and-non-keyframe-pose-infill). The input is the optimized keyframe trajectory from chunk 6. The output is a full length-`N` `SLAMOutput.trajectory`, where every raw frame has a camera-to-world pose.
 
 Toy keyframes after pass 1:
 
@@ -536,9 +569,12 @@ slam_output.intrinsics == [20.7846,20.7846,16.0,12.0]
 slam_output.slam_map.dense_disp_frame_inds == [0,1,2,3,4,5,6,8,9]
 ```
 
+At the end of chunk 7, SLAM has produced the geometric backbone needed by the rest of the pipeline: one pose per original frame, one recovered raw-resolution intrinsic vector, and the internal keyframe map. Chunk 8 now replays the original RGB frames and attaches those SLAM outputs to each original-resolution `FrameData`.
+
 <a id="chunk-8-toy"></a>
 ## Chunk 8 Toy: Replaying The Initialized Stream And Assigning SLAM Results
 
+This corresponds to [fullexplain.md Chunk 8](./fullexplain.md#chunk-8-replaying-the-initialized-stream-and-assigning-slam-results). The input is `SLAMOutput` from chunk 7 plus the recorded initialization attributes from chunk 3. The output is an original-resolution stream where every frame has RGB, camera type, recovered intrinsics, and its final SLAM pose.
 
 During replay, toy raw frame 7 is loaded again from `/toy/scene0000_00/color/7.png`:
 
@@ -574,9 +610,12 @@ frame.metric_depth.shape == (24,32)
 frame.depth_confidence.shape == (24,32) or None
 ```
 
+Chunk 8 is the handoff from SLAM-space back to artifact-space. The RGB is original `24 x 32`, the pose is the full-frame camera-to-world pose, and the intrinsics are raw-resolution intrinsics. Chunk 9 uses exactly these per-frame values to run final DAV3 depth over posed windows.
+
 <a id="chunk-9-toy"></a>
 ## Chunk 9 Toy: Final DAV3 Depth For Every Frame
 
+This corresponds to [fullexplain.md Chunk 9](./fullexplain.md#chunk-9-final-dav3-depth-for-every-frame). The input is the replayed original-resolution stream from chunk 8. The output is the same stream with `metric_depth` and optional `depth_confidence` attached to every yielded frame.
 
 Toy has exactly 10 frames and `window_size=10`, so pass 1 creates one window:
 
@@ -634,8 +673,12 @@ frame.depth_confidence[12,16] = 0.92
 
 Because this toy has one last window, all 10 frames are yielded and `trailing_depth` is empty at the end.
 
+After chunk 9, each frame has all data needed for persistence: RGB, pose, intrinsics, camera type, final metric depth, and confidence. Chunk 10 consumes this final stream once to write artifacts and build the selected point cloud.
+
 <a id="chunk-10-toy"></a>
 ## Chunk 10 Toy: Artifact Saving, PCD Fusion, And Visualization
+
+This corresponds to [fullexplain.md Chunk 10](./fullexplain.md#chunk-10-artifact-saving-pcd-fusion-and-visualization). The input is the final stream from chunk 9. The output is saved files under the output directory: RGB video, pose npz, intrinsics npz, depth zip, one PCD file, and visualization video.
 
 ### Backprojection Formula
 
@@ -718,9 +761,12 @@ After all toy frames integrate, the volume extracts a mesh at the zero-crossing 
 
 For a 10-frame toy scene, the mesh likely has far fewer meaningful triangles than 8M points, but Open3D's sampler still attempts to return the requested number by sampling triangle areas with replacement-like distribution over the mesh surface.
 
+So chunk 10 turns per-frame predictions into files you can inspect. In the command’s `tsdf` mode, the saved PCD is built from final DAV3 depth plus SLAM pose/intrinsics via TSDF fusion. Chunk 11 is separate from this computation: it reads the saved poses after the run and optionally aligns them to GT for visualization/export.
+
 <a id="chunk-11-toy"></a>
 ## Chunk 11 Toy: Optional Trajectory Comparison And Pose Export
 
+This corresponds to [fullexplain.md Chunk 11](./fullexplain.md#chunk-11-optional-trajectory-comparison-and-pose-export). The input is `pose/color.npz` from chunk 10 plus an external GT pose directory. The output is an auxiliary trajectory video and, if `--export` is set, aligned pose text files.
 
 Toy predicted poses:
 
@@ -761,6 +807,8 @@ pose_aligned/0.txt
 pose_aligned/1.txt
 pose_aligned/2.txt
 ```
+
+This post-script does not feed back into ViPE. It only reads the saved trajectory, computes the requested alignment, and writes auxiliary visualization/export files.
 
 <a id="end-to-end-toy-trace-summary"></a>
 ## End-To-End Toy Trace Summary
