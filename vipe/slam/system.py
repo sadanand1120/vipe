@@ -13,14 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import uuid
-
 import numpy as np
-import rerun as rr
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from vipe.ext.lietorch import SE3
 from vipe.priors.depth import make_depth_model
 from vipe.priors.depth.base import DepthType
 from vipe.streams.base import FrameAttribute, ProcessedFrameStream, FrameProcessor, FrameData, FrameStream
@@ -31,7 +27,7 @@ from vipe.utils.misc import unpack_optional
 from .components.backend import SLAMBackend
 from .components.buffer import GraphBuffer
 from .components.frontend import SLAMFrontend
-from .components.inner_filler import FilledReturn, InnerFiller
+from .components.inner_filler import InnerFiller
 from .components.motion_filter import MotionFilter
 from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
@@ -80,7 +76,6 @@ class SLAMSystem:
 
     def __init__(self, device: torch.device, config: DictConfig) -> None:
         self.device = device
-        self.visualize = config.visualize
         self.config = config.copy()
         OmegaConf.set_struct(self.config, False)
 
@@ -111,8 +106,6 @@ class SLAMSystem:
         else:
             self.metric_depth = None
 
-        self.backend.depth_model = self.metric_depth
-
     def _add_keyframe(
         self,
         frame_idx: int,
@@ -134,7 +127,6 @@ class SLAMSystem:
         if frame_data.metric_depth is not None:
             disp_sens = frame_data.metric_depth[3::8, 3::8]
             disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
-            assert not self.config.optimize_intrinsics
             self.buffer.disps_sens[kf_idx] = disp_sens
 
         if frame_data.pose is not None and phase == 1:
@@ -143,22 +135,6 @@ class SLAMSystem:
         if phase == 1:
             self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx)
         self.buffer.n_frames += 1
-
-    def _log_final(self, frame_stream: FrameStream, filled_return: FilledReturn):
-        trajectory = filled_return.poses.inv()
-        for frame_idx, frame_data in enumerate(frame_stream):
-            pose_mat = trajectory[frame_idx].matrix().cpu().numpy()
-            rr.set_time_sequence("frame", frame_idx)
-            image = frame_data.rgb.cpu().numpy()
-            rr.log(
-                "world/camera",
-                rr.Transform3D(translation=pose_mat[:3, 3], mat3x3=pose_mat[:3, :3]),
-                rr.Pinhole(
-                    resolution=[image.shape[1], image.shape[0]],
-                    image_from_camera=self.buffer.K,
-                ),
-                rr.Image((image * 255).astype(np.uint8)).compress(),
-            )
 
     def _precompute_features(self, frame_data: FrameData):
         images = frame_data.rgb.permute(2, 0, 1)[None]
@@ -186,10 +162,6 @@ class SLAMSystem:
 
         self._build_components()
 
-        if self.visualize:
-            rr.init("ViPE Visualization", spawn=True, recording_id=uuid.uuid4())
-            rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
-
         # Run frontend to get attributes initialization. This will also populate attribute buffers.
         frame_idx: int = 0
         for frame_idx, frame_data in pbar(
@@ -198,27 +170,15 @@ class SLAMSystem:
             images = self._precompute_features(frame_data)
 
             if self.motion_filter.check(images) or frame_idx == total_n_frames - 1:
-                is_keyframe = True
                 self._add_keyframe(frame_idx, images, frame_data, phase=1)
-            else:
-                is_keyframe = False
 
             self.frontend.run()
 
-            if self.visualize:
-                self.buffer.log(self.config.map_filter_thresh)
-                self.frontend.graph.log()
-
-            # Run the backend in between to correct intrinsics and extrinsics in advance
-            # to avoid large errors and local minima.
-            if self.buffer.n_frames in self.config.frontend_backend_iters and is_keyframe:
-                self.backend.run_if_necessary(5, log=self.visualize)
-
         # Run the backend to perform a global BA over the keyframes.
-        self.backend.run(7, log=self.visualize)
+        self.backend.run(7)
 
         # Run backend again with a new graph and cleared GRU states.
-        self.backend.run(self.config.backend_iters, update_depth=False, log=self.visualize)
+        self.backend.run(self.config.backend_iters)
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.set_start_idx(self.buffer.n_frames)
@@ -235,9 +195,6 @@ class SLAMSystem:
         # This means the iterator is exhausted early than expected in the above loop.
         if filled_return.poses.shape[0] != total_n_frames:
             raise ValueError("Your video might be malformed or unreadable.")
-
-        if self.visualize:
-            self._log_final(frame_stream, filled_return)
 
         slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
         slam_map.backend_graph = self.backend.last_graph

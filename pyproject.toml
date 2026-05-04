@@ -23,7 +23,6 @@ dependencies = [
     "einops",
     "omegaconf",
     "tqdm",
-    "rerun-sdk",
     "imageio[ffmpeg]",
     "opencv-python",
     "python-pycg",

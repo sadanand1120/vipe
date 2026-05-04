@@ -922,9 +922,8 @@ Default `warmup=8`.
    ```python
    self.video.disps[self.t1] = self.video.disps[self.t1 - 4:self.t1].mean()
    ```
-7. Mark all warmup frames dirty for visualization.
-8. Set `self.is_initialized=True`.
-9. Remove factors older than `warmup - 4`, storing them as inactive:
+7. Set `self.is_initialized=True`.
+8. Remove factors older than `warmup - 4`, storing them as inactive:
    ```python
    self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
    ```
@@ -1106,7 +1105,7 @@ $$
 With `dense_disp_alpha = 0.001`, the BA objective for one solve is:
 
 $$
-\min_{\{P_i\},\{d_i\},K}
+\min_{\{P_i\},\{d_i\}}
 \sum_{(i,j)\in\mathcal{E}}
 \sum_{\mathbf{p}\in\Omega}
 \left[
@@ -1121,7 +1120,7 @@ $$
 \left(d_i(\mathbf{p}) - d^{\text{DAV3}}_i(\mathbf{p})\right)^2.
 $$
 
-In your command, `optimize_intrinsics=false`, so $K$ is fixed during this minimization. When `motion_only=True`, dense disparity is also fixed, so the solve only updates poses.
+$K$ is fixed during this minimization. When `motion_only=True`, dense disparity is also fixed, so the solve only updates poses.
 
 Each nonlinear iteration linearizes residuals around the current state:
 
@@ -1186,9 +1185,8 @@ The solver:
    | --- | --- |
    | `pose` | SE3 pose retraction |
    | `dense_disp` | dense disparity additive/retracted update |
-   | `intrinsics` | fixed in your command |
 
-Because `pipeline.slam.optimize_intrinsics=false`, the frontend does not optimize intrinsics. They remain the GeoCalib estimate at resized scale during SLAM.
+Intrinsics remain the GeoCalib estimate at resized scale during SLAM.
 
 ### Toy Trace
 
@@ -1229,8 +1227,8 @@ flowchart TD
 After pass 1:
 
 ```python
-self.backend.run(7, log=self.visualize)
-self.backend.run(self.config.backend_iters, update_depth=False, log=self.visualize)
+self.backend.run(7)
+self.backend.run(self.config.backend_iters)
 ```
 
 Default:
@@ -1279,28 +1277,19 @@ beta = 0.3
 
 ### Backend Batch Update
 
-If the graph has edges and `self.depth_model is not None`, the backend calls `_iterate_with_depth`.
+If the graph has edges, the backend calls `_iterate`.
 
-Current config has keyframe DAV3 depth, so backend uses `_iterate_with_depth`.
-
-`_iterate_with_depth(graph, steps, more_iters)`:
+`_iterate(graph, steps)`:
 
 ```python
-steps_preintr = steps // 2
-steps_postintr = steps - steps_preintr
-graph.update_batch(..., steps=steps_preintr, optimize_intrinsics=self.args.optimize_intrinsics)
-self.video.update_disps_sens(self.depth_model, frame_idx=None)
-graph.update_batch(..., steps=steps_postintr, optimize_intrinsics=False)
+graph.update_batch(
+    itrs=8,
+    steps=steps,
+    solver_verbose=True,
+)
 ```
 
-Because your command has `optimize_intrinsics=false`, both backend halves keep intrinsics fixed. `update_disps_sens(frame_idx=None)` checks whether intrinsics changed. If they did not change, it returns early:
-
-```python
-if torch.allclose(self.last_depth_intrinsics, self.intrinsics):
-    return
-```
-
-The second call `backend.run(..., update_depth=False)` still enters `_iterate_with_depth` because the current code ignores the `update_depth` argument. In practice the DAV3 sensor depth recomputation usually short-circuits when intrinsics are unchanged.
+The backend does not recompute DAV3 keyframe depth. DAV3 sensor disparities are already stored in `buffer.disps_sens` when each pass-1 keyframe is added, and `GraphBuffer.bundle_adjustment` uses those stored values through `DispSensRegularizationTerm`.
 
 `FactorGraph.update_batch` uses `AltCorrBlock` instead of materializing all correlation volumes:
 
@@ -2366,8 +2355,6 @@ The end-to-end toy sequence diagram and final toy output table are in [fullexpla
 | Frame input type | frame directory | Reads sorted images directly from `streams.base_path`. |
 | Camera type | `pinhole` | GeoCalib and DAV3 path assume pinhole. |
 | Initial poses | absent | SLAM estimates poses from scratch. |
-| `optimize_intrinsics` | `false` | GeoCalib intrinsics are fixed during BA. |
-| `visualize` | `false` | No Rerun live visualization. |
 | `keyframe_depth` | `dav3` | DAV3 metric depth regularizes keyframe disparities. |
 | `post.depth_align_model` | `mvd_dav3` | Final dense depth comes from DAV3 posed multi-frame inference. |
 | `save_artifacts` | `true` in your command | RGB/pose/depth/intrinsics/camera-type/PCD artifacts are written. |

@@ -26,21 +26,17 @@ pipeline:
     frontend_radius: 2                   # Local radius for forced frontend graph edges.
     frontend_nms: 1                      # Non-max suppression radius for frontend proximity edges.
     seq_init: true                       # Initialize frontend with sequential neighbor edges.
-    frontend_backend_iters: [16, 64, 256] # Keyframe counts where intermediate backend BA can run.
     backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
     backend_radius: 2                    # Local radius for forced backend graph edges.
     backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
     backend_iters: 24                    # Final global backend BA iteration steps.
     init_disp: 1.0                       # Initial disparity value before metric depth is injected.
-    optimize_intrinsics: false           # Optimize intrinsics during BA; keep false for fixed GeoCalib intrinsics.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     infill_dense_disp: false             # Also optimize dense disparity for infilled non-keyframes.
     map_filter_thresh: 0.05              # Relative depth-consistency threshold for extracting the SLAM map.
-    visualize: false                     # Enable rerun SLAM visualization during processing.
     keyframe_depth: dav3                 # Depth backend used to anchor keyframe metric scale.
     ba:
       dense_disp_alpha: 0.001            # Weight for sensor/DAV3 depth regularization in BA.
-      intrinsics_damping_scale: 1.0      # Damping multiplier for intrinsics optimization variables.
 
   post:
     depth_align_model: "mvd_dav3"        # Post-SLAM DAV3 depth; null disables final depth estimation.

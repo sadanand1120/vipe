@@ -40,8 +40,8 @@ from vipe.utils.viser import run_viser
     help="Output directory (default: current directory)",
     default=Path.cwd() / "vipe_results",
 )
-@click.option("--visualize", "-v", is_flag=True, help="Enable visualization of intermediate results")
-def infer(frame_dir: Path, fps: float, output: Path, visualize: bool):
+@click.option("--save-viz", is_flag=True, help="Save projection/depth visualization video")
+def infer(frame_dir: Path, fps: float, output: Path, save_viz: bool):
     """Run inference on a directory of image frames."""
     logger = configure_logging()
 
@@ -51,9 +51,8 @@ def infer(frame_dir: Path, fps: float, output: Path, visualize: bool):
         f"streams.base_path={frame_dir}",
         f"streams.fps={fps}",
     ]
-    if visualize:
+    if save_viz:
         overrides.append("pipeline.output.save_viz=true")
-        overrides.append("pipeline.slam.visualize=true")
     else:
         overrides.append("pipeline.output.save_viz=false")
 

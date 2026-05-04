@@ -15,7 +15,6 @@
 
 import torch
 
-from vipe.utils.cameras import CameraType
 from vipe.ext.lietorch import SE3
 
 
@@ -33,21 +32,3 @@ class DenseDispRetractor(BaseRetractor):
     def oplus(self, x: torch.Tensor, inds: torch.Tensor, dx: torch.Tensor):
         dx = torch.where(dx > 10, torch.zeros_like(dx), dx)
         return super().oplus(x, inds, dx)
-
-
-class IntrinsicsRetractor(BaseRetractor):
-    def __init__(self, camera_type: CameraType):
-        self.camera_type = camera_type
-
-    def oplus(self, x: torch.Tensor, inds: torch.Tensor, dx: torch.Tensor):
-        if x.dim() == 1:
-            x[:2] += dx[:, :1].sum(dim=0)
-            x[4:] += dx[:, 1:].sum(dim=0) * 0.01
-            return
-        if len(dx) == 1:
-            # Broadcast dx to all intrinsics
-            inds = torch.where(x[:, 0] > 0)[0]
-            dx = dx.repeat(len(inds), 1)
-        x[inds, :2] += dx[..., :1]
-        # Use smaller learning rate for the distortion parameters
-        x[inds, 4:] += dx[..., 1:] * 0.01

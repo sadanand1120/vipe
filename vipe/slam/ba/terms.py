@@ -108,7 +108,7 @@ class DenseDepthFlowTerm(SolverTerm):
         dense_disp_i_inds: torch.Tensor,
         target: torch.Tensor,
         weight: torch.Tensor,
-        intrinsics: torch.Tensor | None,
+        intrinsics: torch.Tensor,
         intrinsics_factor: float,
         image_size: tuple[int, int],
         camera_type: CameraType,
@@ -130,36 +130,30 @@ class DenseDepthFlowTerm(SolverTerm):
 
         self.target = target.reshape(self.n_terms, n_pixels, 2)  # (n_terms, H*W, 2)
         self.weight = weight.reshape(self.n_terms, n_pixels, 2)  # (n_terms, H*W, 2)
-        self.intrinsics = intrinsics.reshape(-1, 4) if intrinsics is not None else None  # (Q, 4)
+        self.intrinsics = intrinsics.reshape(-1, 4)  # (Q, 4)
         self.intrinsics_factor = intrinsics_factor
 
     def group_names(self) -> set[str]:
-        names = {"pose", "dense_disp"}
-        if self.intrinsics is None:
-            names.add("intrinsics")
-        return names
+        return {"pose", "dense_disp"}
 
     def forward(self, variables: dict[str, Any], jacobian: bool = True) -> TermEvalReturn:
         """
         variables contain:
             - pose: (n_var, ) SE3 of poses
             - dense_disp: (n_var, H*W) tensor of disparities
-            - intrinsics: (Q, 4) tensor of intrinsics (optional)
+            - intrinsics are fixed and stored in this term
 
         # TODO: To accelerate, you can return a PrecomputedTermEvalReturn with kernels from Droid-SLAM.
         """
         pose, dense_disp = variables["pose"], variables["dense_disp"]
-        if optimize_intrinsics := self.intrinsics is None:
-            intrinsics = variables["intrinsics"]
-        else:
-            intrinsics = self.intrinsics
+        intrinsics = self.intrinsics
 
         assert isinstance(pose, SE3) and isinstance(dense_disp, torch.Tensor)
         assert dense_disp.shape[1] == self.image_size[0] * self.image_size[1]
 
         camera_model_cls = self.camera_type.camera_model_cls()
 
-        coords, valid, (Ji, Jj, Jz), (Jfi, Jfj) = geom.iproj_i_proj_j_disp(
+        coords, valid, (Ji, Jj, Jz), _ = geom.iproj_i_proj_j_disp(
             pose,
             dense_disp.view(-1, self.image_size[0], self.image_size[1]),
             None,
@@ -169,7 +163,7 @@ class DenseDepthFlowTerm(SolverTerm):
             self.pose_j_inds,
             self.dense_disp_i_inds,
             jacobian_p_d=jacobian,
-            jacobian_f=jacobian and optimize_intrinsics,
+            jacobian_f=False,
         )
         coords = rearrange(coords, "n h w c -> n (h w) c", c=2)
         weight = rearrange(valid, "n h w 1 -> n (h w) 1") * self.weight  # (n_terms, H*W, 2)
@@ -194,20 +188,6 @@ class DenseDepthFlowTerm(SolverTerm):
                     data=Jz,
                 ),
             }
-            if optimize_intrinsics:
-                assert Jfi is not None and Jfj is not None
-                Jfi = rearrange(Jfi, "n h w c d -> n (h w c) d", c=2)
-                Jfj = rearrange(Jfj, "n h w c d -> n (h w c) d", c=2)
-                intr_inds = torch.zeros(self.n_terms, dtype=torch.long, device=term_inds.device)
-                J_dict["intrinsics"] = SparseDenseBlockMatrix(
-                    i_inds=torch.cat([term_inds, term_inds]),
-                    j_inds=torch.cat([intr_inds, intr_inds]),
-                    data=camera_model_cls.J_scale(
-                        1.0 / self.intrinsics_factor,
-                        torch.cat([Jfi, Jfj], dim=0),
-                    ),
-                )
-
         return ConcreteTermEvalReturn(
             J=J_dict,
             w=weight,

@@ -118,9 +118,6 @@ class SLAMFrontend:
             self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 1].mean()
 
-        # update visualization
-        self.video.dirty[self.graph.ii.min() : self.t1] = True
-
     def __initialize(self):
         """initialize the SLAM system with keyframes idx [t0, t1)"""
 
@@ -138,7 +135,6 @@ class SLAMFrontend:
         if not self.has_init_pose:
             self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 4 : self.t1].mean()
-        self.video.dirty[: self.t1] = True
 
         # initialization complete
         self.is_initialized = True

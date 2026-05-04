@@ -21,12 +21,9 @@
 import warnings
 
 import numpy as np
-import rerun as rr
 import torch
 
 from einops import rearrange
-
-from vipe.ext.lietorch import SE3
 
 from ..networks.droid_net import AltCorrBlock, CorrBlock, DroidNet
 from .buffer import GraphBuffer
@@ -249,7 +246,6 @@ class FactorGraph:
                 pose_ep=0.1,
                 motion_only=motion_only,
                 limited_disp=limited_disp,
-                optimize_intrinsics=False,
                 verbose=False,
             )
 
@@ -260,7 +256,6 @@ class FactorGraph:
         self,
         itrs: int,
         steps: int,
-        optimize_intrinsics: bool,
         solver_verbose: bool = False,
     ):
         if self.incremental:
@@ -318,7 +313,6 @@ class FactorGraph:
                 pose_ep=1e-2,
                 motion_only=False,
                 limited_disp=False,
-                optimize_intrinsics=optimize_intrinsics,
                 verbose=solver_verbose,
             )
 
@@ -391,10 +385,3 @@ class FactorGraph:
             return
         ii, jj = torch.as_tensor(es, device=self.device).unbind(dim=-1)
         self.add_factors(ii, jj, remove)
-
-    def log(self):
-        center_pos = SE3(self.buffer.poses).inv().translation()[:, :3]
-        active_edges = torch.stack([center_pos[self.ii], center_pos[self.jj]], dim=1)
-        inactive_edges = torch.stack([center_pos[self.ii_inac], center_pos[self.jj_inac]], dim=1)
-        rr.log("world/active_edges", rr.LineStrips3D(active_edges.cpu().numpy()))
-        rr.log("world/inactive_edges", rr.LineStrips3D(inactive_edges.cpu().numpy()))

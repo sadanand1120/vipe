@@ -22,8 +22,6 @@ import torch
 
 from omegaconf import DictConfig
 
-from vipe.priors.depth import DepthEstimationModel
-
 from ..networks.droid_net import DroidNet
 from .buffer import GraphBuffer
 from .factor_graph import FactorGraph
@@ -34,8 +32,6 @@ class SLAMBackend:
     Mainly used to run a pretty dense bundle adjustment for all the frames in the graph.
     """
 
-    depth_model: DepthEstimationModel | None = None
-
     def __init__(self, net: DroidNet, video: GraphBuffer, args: DictConfig, device: torch.device):
         self.net = net
         self.video = video
@@ -43,34 +39,15 @@ class SLAMBackend:
         self.device = device
         self.last_graph: torch.Tensor | None = None
 
-    def _iterate_with_depth(self, graph: FactorGraph, steps: int, more_iters: bool):
-        steps_preintr = steps // 2
-        steps_postintr = steps - steps_preintr
+    def _iterate(self, graph: FactorGraph, steps: int):
         graph.update_batch(
-            itrs=16 if more_iters else 8,
-            steps=steps_preintr,
-            optimize_intrinsics=self.args.optimize_intrinsics,
-            solver_verbose=True,
-        )
-        self.video.update_disps_sens(self.depth_model, frame_idx=None)
-        # Don't update intrinsics again!
-        graph.update_batch(
-            itrs=16 if more_iters else 8,
-            steps=steps_postintr,
-            optimize_intrinsics=False,
-            solver_verbose=True,
-        )
-
-    def _iterate_without_depth(self, graph: FactorGraph, steps: int, more_iters: bool):
-        graph.update_batch(
-            itrs=16 if more_iters else 8,
+            itrs=8,
             steps=steps,
-            optimize_intrinsics=self.args.optimize_intrinsics,
             solver_verbose=True,
         )
 
     @torch.no_grad()
-    def run(self, steps: int = 12, update_depth: bool = True, log: bool = False):
+    def run(self, steps: int = 12):
         """main update (reset GRU state)"""
 
         t = self.video.n_frames
@@ -91,11 +68,7 @@ class SLAMBackend:
         )
 
         if len(graph.ii) > 0:
-            more_iters = self.args.optimize_intrinsics
-            if self.depth_model is not None:
-                self._iterate_with_depth(graph, steps, more_iters)
-            else:
-                self._iterate_without_depth(graph, steps, more_iters)
+            self._iterate(graph, steps)
         else:
             # Empty graph with only one keyframe, assign sensor depth
             self.video.disps[0] = torch.where(
@@ -104,14 +77,4 @@ class SLAMBackend:
                 self.video.disps[0],
             )
 
-        self.video.dirty[:t] = True
         self.last_graph = torch.stack([graph.ii, graph.jj], dim=-1)
-
-        if log:
-            self.video.log(self.args.map_filter_thresh)
-            graph.log()
-
-    @torch.no_grad()
-    def run_if_necessary(self, steps: int = 12, log: bool = False):
-        if self.args.optimize_intrinsics:
-            self.run(steps=steps, update_depth=True, log=log)

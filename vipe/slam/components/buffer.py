@@ -20,8 +20,6 @@
 
 import logging
 
-import numpy as np
-import rerun as rr
 import torch
 
 from einops import rearrange
@@ -37,7 +35,7 @@ from ..ba.solver import Solver, SparseBlockVector
 from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm
 from ..interface import SLAMMap
 from ..maths import geom
-from ..maths.retractor import DenseDispRetractor, IntrinsicsRetractor, PoseRetractor
+from ..maths.retractor import DenseDispRetractor, PoseRetractor
 
 
 logger = logging.getLogger(__name__)
@@ -71,8 +69,6 @@ class GraphBuffer:
         # RGB image at resized SLAM resolution, shape: (frame, channel, height, width).
         self.images = torch.zeros(buffer_size, 3, self.height, self.width, device=device, dtype=torch.float16)
 
-        self.dirty = torch.zeros(buffer_size, device=device, dtype=torch.bool)
-
         # World-to-camera pose for each buffered frame.
         self.poses = torch.zeros(buffer_size, 7, device=device, dtype=torch.float)
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=device)
@@ -89,26 +85,6 @@ class GraphBuffer:
         self.nets = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
         self.inps = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
 
-        # Intrinsics used when disps_sens was last computed.
-        self.last_depth_intrinsics: torch.Tensor | None = None
-
-    @property
-    def K(self) -> np.ndarray:
-        intr_np = self.camera_type.build_camera_model(self.intrinsics).pinhole().intrinsics.cpu().numpy()
-        k_mat = np.eye(3)
-        k_mat[0, 0] = intr_np[0]
-        k_mat[1, 1] = intr_np[1]
-        k_mat[0, 2] = intr_np[2]
-        k_mat[1, 2] = intr_np[3]
-        return k_mat
-
-    @property
-    def K_dense_disp(self) -> np.ndarray:
-        k_mat = self.K.copy()
-        k_mat[0] /= 8
-        k_mat[1] /= 8
-        return k_mat
-
     def remove_second_newest(self, ix: int):
         assert ix == self.n_frames - 2
         self.tstamp[ix] = self.tstamp[ix + 1]
@@ -116,23 +92,13 @@ class GraphBuffer:
         self.poses[ix] = self.poses[ix + 1]
         self.disps[ix] = self.disps[ix + 1]
         self.disps_sens[ix] = self.disps_sens[ix + 1]
-        self.dirty[ix] = True
         self.nets[ix] = self.nets[ix + 1]
         self.inps[ix] = self.inps[ix + 1]
         self.fmaps[ix] = self.fmaps[ix + 1]
         self.n_frames -= 1
 
-    def update_disps_sens(self, depth_model: DepthEstimationModel | None, frame_idx: int | None):
+    def update_disps_sens(self, depth_model: DepthEstimationModel | None, frame_idx: int):
         if depth_model is None:
-            return
-
-        if frame_idx is None:
-            assert self.last_depth_intrinsics is not None
-            if torch.allclose(self.last_depth_intrinsics, self.intrinsics):
-                return
-            assert depth_model.depth_type == DepthType.METRIC_DEPTH
-            self.disps_sens[: self.n_frames] *= self.last_depth_intrinsics[0].item() / self.intrinsics[0].item()
-            self.last_depth_intrinsics = self.intrinsics.clone()
             return
 
         depth_input = DepthEstimationInput(
@@ -145,7 +111,6 @@ class GraphBuffer:
         disp_sens = metric_depth[3::8, 3::8]
         disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
         self.disps_sens[frame_idx] = disp_sens
-        self.last_depth_intrinsics = self.intrinsics.clone()
 
     def bundle_adjustment(
         self,
@@ -161,7 +126,6 @@ class GraphBuffer:
         pose_ep: float,
         motion_only: bool,
         limited_disp: bool,
-        optimize_intrinsics: bool,
         verbose: bool,
     ):
         assert t0 <= t1
@@ -179,7 +143,7 @@ class GraphBuffer:
                 dense_disp_i_inds=di,
                 target=target,
                 weight=weight_dense_disp * weight,
-                intrinsics=None,
+                intrinsics=self.intrinsics,
                 intrinsics_factor=8.0,
                 image_size=(self.height // 8, self.width // 8),
                 camera_type=self.camera_type,
@@ -220,12 +184,6 @@ class GraphBuffer:
             solver.set_fixed("dense_disp")
         solver.set_marginilized("dense_disp")
 
-        solver.set_retractor("intrinsics", IntrinsicsRetractor(self.camera_type))
-        intrinsics_damping_scale = self.ba_config.get("intrinsics_damping_scale", 1.0)
-        solver.set_damping("intrinsics", damping=1e-6 * intrinsics_damping_scale, ep=1e-6 * intrinsics_damping_scale)
-        if not optimize_intrinsics:
-            solver.set_fixed("intrinsics")
-
         disps_flattened = rearrange(self.disps, "n h w -> n (h w)")
 
         ba_energy = []
@@ -234,7 +192,6 @@ class GraphBuffer:
                 {
                     "pose": SE3(self.poses),
                     "dense_disp": disps_flattened,
-                    "intrinsics": self.intrinsics,
                 }
             )
             ba_energy.append(cur_energy)
@@ -345,43 +302,3 @@ class GraphBuffer:
             masks,
             self.tstamp[t_range],
         )
-
-    def log(self, vis_thresh: float):
-        (dirty_index,) = torch.where(self.dirty)
-        self.dirty[dirty_index] = False
-
-        dirty_index = dirty_index[dirty_index < self.n_frames]
-        if len(dirty_index) == 0:
-            return
-
-        current_map = self.extract_slam_map(filter_thresh=vis_thresh, t_range=dirty_index, is_local=False)
-
-        for di, didx in enumerate(dirty_index.cpu().numpy().tolist()):
-            rr.set_time_sequence("frame", int(self.tstamp[int(didx)].item()))
-
-            pose_mat = SE3(self.poses[int(didx)]).inv().matrix().cpu().numpy()
-            rr.log(
-                f"world/kf_{didx:04d}",
-                rr.Transform3D(translation=pose_mat[:3, 3], mat3x3=pose_mat[:3, :3]),
-            )
-
-            dd_ht, dd_wd = self.disps_sens.shape[-2:]
-            pcd_xyz, pcd_rgb = current_map.get_dense_disp_pcd(di)
-            image = self.images[int(didx), :, 3::8, 3::8].moveaxis(0, -1).cpu().numpy()
-
-            rr.log(
-                f"world/kf_{didx:04d}/camera",
-                rr.Pinhole(
-                    resolution=[dd_wd, dd_ht],
-                    image_from_camera=self.K_dense_disp,
-                    camera_xyz=rr.ViewCoordinates.RDF,
-                ),
-                rr.Image((image * 255).astype(np.uint8)).compress(),
-            )
-            rr.log(
-                f"world/kp_{didx:04d}",
-                rr.Points3D(
-                    pcd_xyz.cpu().numpy(),
-                    colors=pcd_rgb.cpu().numpy().astype(np.float32),
-                ),
-            )
