@@ -2,7 +2,8 @@ import hydra
 from omegaconf import DictConfig
 
 from vipe.pipeline.default import DefaultAnnotationPipeline
-from vipe.streams.base import FrameDir
+from vipe.pipeline.processors import ScanNetGTProcessor
+from vipe.streams.base import FrameDir, ProcessedFrameStream
 from vipe.utils.logging import configure_logging
 
 
@@ -16,14 +17,30 @@ def run(args: DictConfig) -> None:
         frame_end=args.streams.frame_end,
         frame_skip=args.streams.frame_skip,
     )
+    output_stream = frame_stream
+    if args.pipeline.use_gt_pose or args.pipeline.use_gt_depth:
+        output_stream = ProcessedFrameStream(
+            frame_stream,
+            [
+                ScanNetGTProcessor(
+                    frame_stream.frame_files,
+                    frame_stream.path.parent,
+                    use_gt_pose=args.pipeline.use_gt_pose,
+                    use_gt_depth=args.pipeline.use_gt_depth,
+                )
+            ],
+        )
+
     pipeline = DefaultAnnotationPipeline(
         init=args.pipeline.init,
         slam=args.pipeline.slam,
         post=args.pipeline.post,
         output=args.pipeline.output,
+        use_gt_pose=args.pipeline.use_gt_pose,
+        use_gt_depth=args.pipeline.use_gt_depth,
     )
     logger.info(f"Processing {frame_stream.name()}")
-    pipeline.run(frame_stream)
+    pipeline.run(output_stream, source_frame_dir=frame_stream.path)
     logger.info(f"Finished processing {frame_stream.name()}")
 
 

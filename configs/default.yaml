@@ -11,6 +11,9 @@ streams:
   frame_skip: 1       # Read every Nth frame; also divides effective stream FPS by N.
 
 pipeline:
+  use_gt_pose: false   # If true, read ScanNet pose/<frame>.txt and use those camera-to-world poses.
+  use_gt_depth: false  # If true, read ScanNet depth/<frame>.png as metric depth in meters.
+
   init:
     camera_type: "pinhole"  # Camera model used by SLAM and DAV3; this fork only keeps pinhole.
     intrinsics: "geocalib"  # Intrinsics source label; intrinsics are estimated by GeoCalib.

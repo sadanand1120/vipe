@@ -15,8 +15,10 @@
 
 
 import logging
+from pathlib import Path
 from typing import Iterator
 
+import cv2
 import numpy as np
 import torch
 
@@ -24,10 +26,54 @@ from vipe.priors.geocalib import GeoCalib
 from vipe.slam.interface import SLAMOutput
 from vipe.streams.base import FrameAttribute, FrameProcessor, FrameData, FrameStream
 from vipe.utils.cameras import CameraType
+from vipe.utils.geometry import se3_matrix_to_se3
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
 
 logger = logging.getLogger(__name__)
+
+
+class ScanNetGTProcessor(FrameProcessor):
+    def __init__(
+        self,
+        frame_files: list[Path],
+        scene_dir: Path,
+        use_gt_pose: bool,
+        use_gt_depth: bool,
+    ) -> None:
+        self.frame_files = frame_files
+        self.pose_dir = scene_dir / "pose"
+        self.depth_dir = scene_dir / "depth"
+        self.use_gt_pose = use_gt_pose
+        self.use_gt_depth = use_gt_depth
+
+    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
+        attributes = set(previous_attributes)
+        if self.use_gt_pose:
+            attributes.add(FrameAttribute.POSE)
+        if self.use_gt_depth:
+            attributes.add(FrameAttribute.METRIC_DEPTH)
+        return attributes
+
+    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
+        frame_id = self.frame_files[frame.raw_frame_idx].stem
+
+        if self.use_gt_pose:
+            pose_path = self.pose_dir / f"{frame_id}.txt"
+            pose = np.loadtxt(pose_path, dtype=np.float32)
+            frame.pose = se3_matrix_to_se3(pose).cuda()
+
+        if self.use_gt_depth:
+            depth_path = self.depth_dir / f"{frame_id}.png"
+            depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                raise FileNotFoundError(f"Could not read ScanNet depth: {depth_path}")
+            depth = depth.astype(np.float32) / 1000.0
+            if depth.shape != frame.size():
+                depth = cv2.resize(depth, (frame.size()[1], frame.size()[0]), interpolation=cv2.INTER_NEAREST)
+            frame.metric_depth = torch.from_numpy(depth).float().cuda()
+
+        return frame
 
 
 class IntrinsicEstimationProcessor(FrameProcessor):

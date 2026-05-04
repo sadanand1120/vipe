@@ -19,6 +19,7 @@ import pickle
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from omegaconf import DictConfig
@@ -33,6 +34,8 @@ from vipe.streams.base import (
 )
 from vipe.utils import io
 from vipe.utils.cameras import CameraType
+from vipe.utils.geometry import se3_matrix_to_se3
+from vipe.utils.logging import pbar
 from vipe.utils.visualization import save_projection_video
 
 from .processors import (
@@ -135,11 +138,21 @@ class InitializedFrameStream(FrameStream):
 
 
 class DefaultAnnotationPipeline:
-    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig) -> None:
+    def __init__(
+        self,
+        init: DictConfig,
+        slam: DictConfig,
+        post: DictConfig,
+        output: DictConfig,
+        use_gt_pose: bool = False,
+        use_gt_depth: bool = False,
+    ) -> None:
         self.init_cfg = init
         self.slam_cfg = slam
         self.post_cfg = post
         self.out_cfg = output
+        self.use_gt_pose = use_gt_pose
+        self.use_gt_depth = use_gt_depth
         self.out_path = Path(self.out_cfg.path)
         self.out_path.mkdir(exist_ok=True, parents=True)
         self.camera_type = CameraType(self.init_cfg.camera_type)
@@ -151,11 +164,24 @@ class DefaultAnnotationPipeline:
         # Otherwise it will be overwritten by the processors.
         assert FrameAttribute.INTRINSICS not in frame_stream.attributes()
         assert FrameAttribute.CAMERA_TYPE not in frame_stream.attributes()
-        assert FrameAttribute.METRIC_DEPTH not in frame_stream.attributes()
 
         init_processors.append(GeoCalibIntrinsicsProcessor(frame_stream, camera_type=self.camera_type))
         recorder = InitAttributeRecorder()
         return InitializedFrameStream(frame_stream, init_processors, recorder)
+
+    def _gt_slam_output(self, frame_stream: FrameStream) -> SLAMOutput:
+        pose_list = []
+        intrinsics = None
+        for frame in pbar(frame_stream, desc="Loading GT pose stream", total=len(frame_stream)):
+            if frame.pose is None:
+                raise ValueError("pipeline.use_gt_pose=true requires ScanNet pose files for every frame")
+            pose_list.append(frame.pose.matrix().detach().cpu().numpy())
+            if intrinsics is None:
+                intrinsics = frame.intrinsics.detach().cpu()
+        if intrinsics is None:
+            raise ValueError("Intrinsics initialization failed")
+        trajectory = se3_matrix_to_se3(np.stack(pose_list, axis=0)).cuda()
+        return SLAMOutput(trajectory=trajectory, intrinsics=intrinsics)
 
     def _add_post_processors(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> ProcessedFrameStream:
         post_processors: list[FrameProcessor] = [
@@ -166,16 +192,27 @@ class DefaultAnnotationPipeline:
                 }
             )
         ]
-        if (depth_align_model := self.post_cfg.depth_align_model) is not None:
+        if not self.use_gt_depth and (depth_align_model := self.post_cfg.depth_align_model) is not None:
             post_processors.append(DAV3DepthProcessor(slam_output, model=depth_align_model))
         return ProcessedFrameStream(frame_stream, post_processors)
 
-    def run(self, frame_stream: FrameStream) -> SLAMOutput:
+    def run(self, frame_stream: FrameStream, source_frame_dir: Path | None = None) -> SLAMOutput:
         artifact_path = io.ArtifactPath(self.out_path, frame_stream.name())
         init_stream = self._add_init_processors(frame_stream)
+        source_frame_dir = source_frame_dir if source_frame_dir is not None else frame_stream.path
 
-        slam_pipeline = SLAMSystem(device=torch.device("cuda"), config=self.slam_cfg)
-        slam_output = slam_pipeline.run(init_stream, camera_type=self.camera_type)
+        skip_slam = self.use_gt_pose and (self.use_gt_depth or self.post_cfg.depth_align_model is None)
+        if skip_slam:
+            slam_output = self._gt_slam_output(init_stream)
+        else:
+            slam_cfg = self.slam_cfg.copy()
+            if self.use_gt_depth:
+                slam_cfg.keyframe_depth = None
+            slam_pipeline = SLAMSystem(device=torch.device("cuda"), config=slam_cfg)
+            slam_output = slam_pipeline.run(init_stream, camera_type=self.camera_type)
+            if self.use_gt_pose:
+                gt_output = self._gt_slam_output(init_stream.replay())
+                slam_output.trajectory = gt_output.trajectory
 
         output_stream = self._add_post_processors(init_stream.replay(), slam_output)
 
@@ -185,6 +222,7 @@ class DefaultAnnotationPipeline:
             io.save_artifacts(
                 artifact_path,
                 output_stream,
+                source_frame_dir=source_frame_dir,
                 pcd_fusion_mode=self.out_cfg.pcd_fusion_mode,
                 max_pcd_points=self.out_cfg.backproject_pcd_max_points,
                 pcd_conf_threshold_coef=self.out_cfg.backproject_pcd_conf_threshold_coef,
