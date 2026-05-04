@@ -70,25 +70,6 @@ class ArtifactPath:
         return self.base_path / "intrinsics" / f"{self.artifact_name}.npz"
 
     @property
-    def camera_type_path(self) -> Path:
-        return self.base_path / "intrinsics" / f"{self.artifact_name}_camera.txt"
-
-    @property
-    def meta_info_path(self) -> Path:
-        return self.base_path / "vipe" / f"{self.artifact_name}_info.pkl"
-
-    @classmethod
-    def glob_artifacts(cls, base_path: Path, use_video: bool = False) -> Iterator["ArtifactPath"]:
-        if use_video:
-            for artifact_path in (base_path / "rgb").glob("*.mp4"):
-                artifact_name = artifact_path.stem
-                yield cls(base_path, artifact_name)
-        else:
-            for artifact_path in (base_path / "vipe").glob("*_info.pkl"):
-                artifact_name = artifact_path.stem.replace("_info", "")
-                yield cls(base_path, artifact_name)
-
-    @property
     def meta_vis_path(self) -> Path:
         return self.base_path / "vipe" / f"{self.artifact_name}_vis.mp4"
 
@@ -113,20 +94,10 @@ def read_pose_artifacts_benchmark(npz_file_path: Path) -> dict:
     )
 
 
-def read_intrinsics_artifacts(
-    intr_file_path: Path, camera_file_path: Path | None = None
-) -> tuple[np.ndarray, torch.Tensor, list[CameraType]]:
+def read_intrinsics_artifacts(intr_file_path: Path) -> tuple[np.ndarray, torch.Tensor]:
     data = np.load(intr_file_path)
     inds, intrinsics = data["inds"], torch.from_numpy(data["data"])
-    if camera_file_path is None or not camera_file_path.exists():
-        assert intrinsics.shape[1] == 4
-        camera_types = [CameraType.PINHOLE] * intrinsics.shape[0]
-
-    else:
-        with camera_file_path.open("r") as f:
-            camera_types = [CameraType[line.split(":")[1].strip()] for line in f.readlines()]
-
-    return inds, intrinsics, camera_types
+    return inds, intrinsics
 
 
 def read_rgb_artifacts(rgb_file_path: Path) -> Iterator[tuple[int, torch.Tensor]]:
@@ -188,23 +159,15 @@ class ArtifactFrameStream(FrameStream):
 
         self.pose_by_idx: dict[int, SE3] = {}
         self.intrinsics_by_idx: dict[int, torch.Tensor] = {}
-        self.camera_type_by_idx: dict[int, CameraType] = {}
 
         if artifact_path.pose_path.exists():
             pose_inds, pose_data = read_pose_artifacts(artifact_path.pose_path)
             self.pose_by_idx = {int(frame_idx): pose_data[list_idx] for list_idx, frame_idx in enumerate(pose_inds.tolist())}
 
         if artifact_path.intrinsics_path.exists():
-            intr_inds, intrinsics_data, camera_types = read_intrinsics_artifacts(
-                artifact_path.intrinsics_path,
-                artifact_path.camera_type_path,
-            )
+            intr_inds, intrinsics_data = read_intrinsics_artifacts(artifact_path.intrinsics_path)
             self.intrinsics_by_idx = {
                 int(frame_idx): intrinsics_data[list_idx]
-                for list_idx, frame_idx in enumerate(intr_inds.tolist())
-            }
-            self.camera_type_by_idx = {
-                int(frame_idx): camera_types[list_idx]
                 for list_idx, frame_idx in enumerate(intr_inds.tolist())
             }
 
@@ -236,7 +199,7 @@ class ArtifactFrameStream(FrameStream):
                 raw_frame_idx=frame_idx,
                 rgb=rgb,
                 pose=self.pose_by_idx.get(frame_idx),
-                camera_type=self.camera_type_by_idx.get(frame_idx),
+                camera_type=CameraType.PINHOLE if frame_idx in self.intrinsics_by_idx else None,
                 intrinsics=self.intrinsics_by_idx.get(frame_idx),
                 metric_depth=metric_depth,
             )
@@ -417,7 +380,6 @@ def save_artifacts(
 
     pose_list = []
     intrinsics_list = []
-    camera_type_list = []
     depth_zip: zipfile.ZipFile | None = None
     if pcd_fusion_mode not in {"backproject", "tsdf"}:
         raise ValueError(f"Invalid pcd_fusion_mode: {pcd_fusion_mode}")
@@ -443,9 +405,6 @@ def save_artifacts(
 
                 if frame_data.intrinsics is not None:
                     intrinsics_list.append((frame_idx, frame_data.intrinsics.cpu().numpy()))
-
-                if frame_data.camera_type is not None:
-                    camera_type_list.append((frame_idx, frame_data.camera_type))
 
                 rgb_writer.write((frame_data.rgb.cpu().numpy() * 255).astype(np.uint8))
 
@@ -497,12 +456,6 @@ def save_artifacts(
         intrinsics_inds = np.array([frame_idx for frame_idx, _ in intrinsics_list])
         out_path.intrinsics_path.parent.mkdir(exist_ok=True, parents=True)
         np.savez(out_path.intrinsics_path, data=intrinsics_data, inds=intrinsics_inds)
-
-    if len(camera_type_list) > 0:
-        out_path.camera_type_path.parent.mkdir(exist_ok=True, parents=True)
-        with out_path.camera_type_path.open("w") as f:
-            for frame_idx, camera_type_data in camera_type_list:
-                f.write(f"{frame_idx}: {camera_type_data.name}\n")
 
     try:
         if pcd_fusion_mode == "backproject":

@@ -147,7 +147,7 @@ def run_vipe(overrides: list[str]) -> None:
     import hydra
 
     from vipe import get_config_path
-    from vipe.pipeline.default import DefaultAnnotationPipeline
+    from vipe.pipeline.default import VipePipeline
     from vipe.streams.base import FrameDir
     from vipe.utils.logging import configure_logging
 
@@ -162,7 +162,7 @@ def run_vipe(overrides: list[str]) -> None:
         frame_end=cfg.streams.frame_end,
         frame_skip=cfg.streams.frame_skip,
     )
-    pipeline = DefaultAnnotationPipeline(
+    pipeline = VipePipeline(
         slam=cfg.pipeline.slam,
         output=cfg.pipeline.output,
     )

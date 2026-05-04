@@ -66,10 +66,10 @@ Source files:
 | --- | --- |
 | `run.py` | Hydra entrypoint, direct frame-dir source construction, and pipeline launch |
 | `configs/default.yaml` | Single config file |
-| `vipe/pipeline/default.py` | `DefaultAnnotationPipeline` |
+| `vipe/pipeline/default.py` | `VipePipeline` |
 | `vipe/streams/base.py` | `FrameDir`, `FrameData`, `FrameStream`, `ProcessedFrameStream` |
 
-Stage context: this is the sequence-once setup part of Stage 1. It constructs config-backed Python objects only. It does not read the whole image sequence, does not run GeoCalib yet, and does not run SLAM. The handoff is one `FrameDir` source plus one `DefaultAnnotationPipeline`.
+Stage context: this is the sequence-once setup part of Stage 1. It constructs config-backed Python objects only. It does not read the whole image sequence, does not run GeoCalib yet, and does not run SLAM. The handoff is one `FrameDir` source plus one `VipePipeline`.
 
 ### Diagram
 
@@ -80,7 +80,7 @@ flowchart TD
     C --> D[configs/default.yaml]
     D --> E[DictConfig args]
     E --> F[FrameDir args.streams.base_path/fps/start/end/skip]
-    E --> G[DefaultAnnotationPipeline args.pipeline]
+    E --> G[VipePipeline args.pipeline]
     F --> H[frame_stream]
     G --> I[pipeline]
     H --> J[pipeline.run(frame_stream)]
@@ -131,7 +131,7 @@ frame_stream = FrameDir(
 Then it constructs one pipeline directly:
 
 ```python
-pipeline = DefaultAnnotationPipeline(
+pipeline = VipePipeline(
     init=config.init,
     slam=config.slam,
     post=config.post,
@@ -328,7 +328,7 @@ flowchart TD
 
 ### Pipeline Construction
 
-`DefaultAnnotationPipeline._add_init_processors(frame_stream)` first asserts that the raw frame stream has none of these attributes:
+`VipePipeline._add_init_processors(frame_stream)` first asserts that the raw frame stream has none of these attributes:
 
 ```python
 FrameAttribute.INTRINSICS

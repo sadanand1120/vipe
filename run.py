@@ -1,7 +1,7 @@
 import hydra
 from omegaconf import DictConfig
 
-from vipe.pipeline.default import DefaultAnnotationPipeline
+from vipe.pipeline.default import VipePipeline
 from vipe.streams.base import FrameDir
 from vipe.utils.logging import configure_logging
 
@@ -16,7 +16,7 @@ def run(args: DictConfig) -> None:
         frame_end=args.streams.frame_end,
         frame_skip=args.streams.frame_skip,
     )
-    pipeline = DefaultAnnotationPipeline(
+    pipeline = VipePipeline(
         slam=args.pipeline.slam,
         output=args.pipeline.output,
     )

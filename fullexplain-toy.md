@@ -66,7 +66,7 @@ The toy network outputs are illustrative. They show exact shapes, exact formulas
 <a id="chunk-1-1-toy"></a>
 ## Chunk 1.1 Toy: Shell, Hydra Config, And Runtime Construction
 
-This corresponds to [fullexplain.md Chunk 1.1](./fullexplain.md#chunk-1-1). This is Stage 1 sequence-once object construction. The input is only a shell command plus config overrides. The output of this chunk is two live Python objects: one `FrameDir` source and one `DefaultAnnotationPipeline`.
+This corresponds to [fullexplain.md Chunk 1.1](./fullexplain.md#chunk-1-1). This is Stage 1 sequence-once object construction. The input is only a shell command plus config overrides. The output of this chunk is two live Python objects: one `FrameDir` source and one `VipePipeline`.
 
 Toy CLI:
 
@@ -90,7 +90,7 @@ Runtime objects:
 ```python
 frame_stream = FrameDir("/toy/scene0000_00/color", fps=2, frame_start=0, frame_end=-1, frame_skip=1)
 frame_stream.name() == "color"
-pipeline = DefaultAnnotationPipeline(init=args.pipeline.init, slam=args.pipeline.slam, post=args.pipeline.post, output=args.pipeline.output)
+pipeline = VipePipeline(slam=args.pipeline.slam, output=args.pipeline.output)
 pipeline.out_path == Path("/toy/out")
 ```
 

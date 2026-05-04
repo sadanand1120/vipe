@@ -87,7 +87,7 @@ class SLAMOutputFrameStream(FrameStream):
             yield frame
 
 
-class DefaultAnnotationPipeline:
+class VipePipeline:
     def __init__(self, slam: DictConfig, output: DictConfig) -> None:
         self.slam_cfg = slam
         self.out_cfg = output

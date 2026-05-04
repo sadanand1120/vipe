@@ -88,15 +88,6 @@ class FactorGraph:
 
         return ii[keep], jj[keep]
 
-    def get_edges_np(self) -> tuple[np.ndarray, np.ndarray]:
-        ii = self.ii.cpu().numpy()
-        jj = self.jj.cpu().numpy()
-        w = torch.mean(self.weight, dim=[0, 2, 3, 4]).cpu().numpy()
-
-        ix = np.argsort(ii)
-        ii, jj, w = ii[ix], jj[ix], w[ix]
-        return np.stack([ii, jj], axis=1), w
-
     @torch.amp.autocast("cuda", enabled=True)
     def add_factors(self, ii, jj, remove=False):
         if not isinstance(ii, torch.Tensor):
