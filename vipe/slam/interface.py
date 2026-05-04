@@ -175,10 +175,6 @@ class SLAMOutput:
 
     slam_map: SLAMMap | None = None
 
-    # Residual of BA (unit is pixel/diagonal) -- average num of pixels/diagonal between predicted and observed flows
-    # Should be of range [0, 1]
-    ba_residual: float = 0.0
-
     @property
     def keyframe_ids(self) -> np.ndarray:
         assert self.slam_map is not None, "SLAM map not available."

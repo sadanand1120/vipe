@@ -64,7 +64,6 @@ class SLAMFrontend:
         self.frontend_window = args.frontend_window
         self.frontend_thresh = args.frontend_thresh
         self.frontend_radius = args.frontend_radius
-        self.has_init_pose = args.has_init_pose
 
     def __init_pose(self):
         assert self.t1 > 1
@@ -97,7 +96,7 @@ class SLAMFrontend:
         )
 
         for _ in range(self.iters1):
-            self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+            self.graph.update(use_inactive=True)
 
         # remove frame t1-2 if it is too close to t1-3, so the new keyframes will be [t1-3, t1-1]
         d = self.video.frame_distance_dense_disp(
@@ -111,11 +110,10 @@ class SLAMFrontend:
             self.t1 -= 1
         else:
             for _ in range(self.iters2):
-                self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+                self.graph.update(use_inactive=True)
 
         # set pose for next itration
-        if not self.has_init_pose:
-            self.__init_pose()
+        self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 1].mean()
 
     def __initialize(self):
@@ -125,15 +123,14 @@ class SLAMFrontend:
 
         self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
         for _ in range(8):
-            self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose)
+            self.graph.update(t0=1, use_inactive=True)
 
         if not self.args.seq_init:
             self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
             for _ in range(8):
-                self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose)
+                self.graph.update(t0=1, use_inactive=True)
 
-        if not self.has_init_pose:
-            self.__init_pose()
+        self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 4 : self.t1].mean()
 
         # initialization complete

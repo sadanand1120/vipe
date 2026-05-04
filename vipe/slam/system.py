@@ -170,7 +170,6 @@ class SLAMSystem:
             {
                 "height": frame_size[0],
                 "width": frame_size[1],
-                "has_init_pose": False,
                 "camera_type": camera_type,
             }
         )
@@ -196,19 +195,19 @@ class SLAMSystem:
         self.backend.run(self.config.backend_iters)
 
         # Infill poses and attributes for non-keyframe frames.
-        self.inner_filler.set_start_idx(self.buffer.n_frames)
+        self.inner_filler.start_after_keyframes(self.buffer.n_frames)
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (2/2)", total=total_n_frames
         ):
             images = self._rgb_bchw(frame_data)
             self._add_infill_frame(frame_idx, images, frame_data)
-            if self.inner_filler.check() or frame_idx == total_n_frames - 1:
-                self.inner_filler.compute()
+            if self.inner_filler.chunk_ready() or frame_idx == total_n_frames - 1:
+                self.inner_filler.fill_pending_chunk()
 
-        filled_return = self.inner_filler.get_result()
+        infill_result = self.inner_filler.get_result()
 
         # This means the iterator is exhausted early than expected in the above loop.
-        if filled_return.poses.shape[0] != total_n_frames:
+        if infill_result.poses.shape[0] != total_n_frames:
             raise ValueError("Your video might be malformed or unreadable.")
 
         slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
@@ -217,7 +216,7 @@ class SLAMSystem:
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics)
 
         return SLAMOutput(
-            trajectory=filled_return.poses.inv(),
+            trajectory=infill_result.poses.inv(),
             intrinsics=original_intrinsics,
             slam_map=slam_map,
         )

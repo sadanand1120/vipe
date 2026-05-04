@@ -406,10 +406,9 @@ def save_projection_video(
                         img_row.append(na_img)
                     else:
                         raise ValueError(f"Unknown visualization attribute: {attr_name}")
-                img_rows.append(np.concatenate(img_row, axis=1))
+            img_rows.append(np.concatenate(img_row, axis=1))
             img_final = np.concatenate(img_rows, axis=0)
             text_desc = f"Frame {frame_idx:03d}"
-            # text_desc += f" | BA {slam_output.ba_residual:.4f}"
             if frame_data.intrinsics is not None:
                 focal = frame_data.intrinsics[0].item()
                 if focal > 1e-6:  # Pano has focal 0

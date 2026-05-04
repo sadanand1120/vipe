@@ -15,7 +15,6 @@
 
 
 import logging
-import pickle
 
 from pathlib import Path
 from typing import Iterator
@@ -105,22 +104,19 @@ class DefaultAnnotationPipeline:
 
         output_stream = DAV3DepthStream(SLAMOutputFrameStream(frame_stream, slam_output), slam_output)
 
-        artifact_path.meta_info_path.parent.mkdir(exist_ok=True, parents=True)
         if self.out_cfg.save_artifacts:
             logger.info(f"Saving artifacts to {artifact_path}")
             io.save_artifacts(
                 artifact_path,
                 output_stream,
                 pcd_fusion_mode=self.out_cfg.pcd_fusion_mode,
-                max_pcd_points=self.out_cfg.backproject_pcd_max_points,
-                pcd_conf_threshold_coef=self.out_cfg.backproject_pcd_conf_threshold_coef,
-                pcd_sample_ratio=self.out_cfg.backproject_pcd_sample_ratio,
+                max_pcd_points=self.out_cfg.pcd_max_points,
+                pcd_conf_threshold_coef=self.out_cfg.pcd_conf_threshold_coef,
+                pcd_sample_ratio=self.out_cfg.pcd_sample_ratio,
                 pcd_tsdf_voxel_length=self.out_cfg.pcd_tsdf_voxel_length,
                 pcd_tsdf_sdf_trunc=self.out_cfg.pcd_tsdf_sdf_trunc,
                 pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
             )
-            with artifact_path.meta_info_path.open("wb") as f:
-                pickle.dump({"ba_residual": slam_output.ba_residual}, f)
 
         if self.out_cfg.save_viz:
             viz_stream = io.ArtifactFrameStream(artifact_path) if self.out_cfg.save_artifacts else output_stream

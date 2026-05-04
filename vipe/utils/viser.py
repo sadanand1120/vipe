@@ -31,7 +31,6 @@ from matplotlib import cm
 from PIL import Image
 from rich.logging import RichHandler
 
-from vipe.utils.cameras import CameraType
 from vipe.utils.depth import reliable_depth_mask_range
 from vipe.utils.io import (
     ArtifactPath,
@@ -258,14 +257,10 @@ class ClientClosures:
                     torch.arange(frame_width).float()[::spatial_subsample],
                     indexing="ij",
                 )
-                if camera_type == CameraType.PANORAMA:
-                    disp_v = disp_v / (frame_height - 1)
-                    disp_u = disp_u / (frame_width - 1)
                 disp = torch.ones_like(disp_v)
                 pts, _, _ = camera_model.iproj_disp(disp, disp_u, disp_v)
                 rays = pts[..., :3].numpy()
-                if camera_type != CameraType.PANORAMA:
-                    rays /= rays[..., 2:3]
+                rays /= rays[..., 2:3]
 
             if depth is not None:
                 pcd = rays * depth.numpy()[::spatial_subsample, ::spatial_subsample, None]

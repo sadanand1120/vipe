@@ -121,7 +121,6 @@ class GraphBuffer:
         pose_damping: float,
         pose_ep: float,
         motion_only: bool,
-        limited_disp: bool,
         verbose: bool,
     ):
         assert t0 <= t1
@@ -174,8 +173,6 @@ class GraphBuffer:
                 ),
                 ep=1e-7,
             )
-            if limited_disp:
-                solver.set_fixed("dense_disp", torch.cat([di[ii < t0], di[ii >= t1]]))
         else:
             solver.set_fixed("dense_disp")
         solver.set_marginilized("dense_disp")

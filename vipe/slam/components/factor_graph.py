@@ -190,12 +190,9 @@ class FactorGraph:
         itrs: int = 3,
         use_inactive: bool = False,
         motion_only: bool = False,
-        fixed_motion: bool = False,
-        limited_disp: bool = False,
     ):
         assert self.incremental
         assert self.corr is not None and self.inp is not None and self.f_net is not None
-        assert not (motion_only and fixed_motion)
 
         if t0 is None:
             t0 = int(max(1, self.ii.min().item() + 1))
@@ -240,12 +237,11 @@ class FactorGraph:
                 ii=ii,
                 jj=jj,
                 t0=t0,
-                t1=t1 if not fixed_motion else t0,
+                t1=t1,
                 n_iters=itrs,
                 pose_damping=1e-3,
                 pose_ep=0.1,
                 motion_only=motion_only,
-                limited_disp=limited_disp,
                 verbose=False,
             )
 
@@ -312,7 +308,6 @@ class FactorGraph:
                 pose_damping=1e-5,
                 pose_ep=1e-2,
                 motion_only=False,
-                limited_disp=False,
                 verbose=solver_verbose,
             )
 

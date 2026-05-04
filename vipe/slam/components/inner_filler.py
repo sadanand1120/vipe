@@ -33,7 +33,7 @@ from .factor_graph import FactorGraph
 
 
 @dataclass
-class FilledReturn:
+class PoseInfillResult:
     poses: SE3  # Inverse of c2w
 
     def scale(self, factor: float):
@@ -52,14 +52,14 @@ class InnerFiller:
 
         self.filled_poses = []
 
-    def set_start_idx(self, start_idx: int):
+    def start_after_keyframes(self, start_idx: int):
         self.start_idx = start_idx
 
-    def check(self) -> bool:
+    def chunk_ready(self) -> bool:
         assert self.start_idx >= 0
         return self.video.n_frames - self.start_idx >= self.args.infill_chunk_size
 
-    def compute(self):
+    def fill_pending_chunk(self):
         total_frames = self.video.n_frames
 
         # Setup initial value (for pose and disp)
@@ -96,7 +96,6 @@ class InnerFiller:
                 self.start_idx,
                 total_frames,
                 motion_only=True,
-                limited_disp=True,
             )
 
         current_poses = SE3(self.video.poses[self.start_idx : total_frames].clone())
@@ -104,7 +103,7 @@ class InnerFiller:
 
         self.video.n_frames = self.start_idx
 
-    def get_result(self) -> FilledReturn:
-        return FilledReturn(
+    def get_result(self) -> PoseInfillResult:
+        return PoseInfillResult(
             poses=lt.cat(self.filled_poses, dim=0),
         )
