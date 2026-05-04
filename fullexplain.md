@@ -1,6 +1,6 @@
 # Full Computation Walkthrough For The Current Standalone ViPE Run
 
-This document explains the current standalone ViPE path. It covers the computation started by `run.py` and the optional trajectory comparison command that you run after it.
+This document explains the current standalone ViPE path started by `run.py`.
 
 The standalone run is:
 
@@ -19,69 +19,46 @@ python run.py \
   pipeline.output.pcd_fusion_mode=tsdf
 ```
 
-The optional command after that is:
-
-```bash
-python3 scripts/make_traj_compare_video.py \
-  outputs/scene00_dav3tsdf \
-  --gt-pose-dir /robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/pose \
-  --fps 30 \
-  --alignment first \
-  --export
-```
-
 ## Side-By-Side Toy Trace
 
 The complete numeric toy trace has been split into [fullexplain-toy.md](./fullexplain-toy.md). Keep it open next to this file; chunk numbers and names match this explanation.
 
 ## High-Level Runtime Flow
 
+The current standalone run is easiest to read as five computation stages. Each stage hands one explicit object/state bundle to the next stage. There is no iterative feedback from a later stage back into an earlier stage.
+
+The implementation details below are still split into smaller chunks because the code has separate classes for stream construction, initialization, SLAM frontend, backend BA, infill, DAV3 depth, and artifact writing. Those chunks should be read under this five-stage lens.
+
 ```mermaid
-flowchart TD
-    A[Shell environment and Hydra overrides] --> B[run.py]
-    B --> C[FrameDir]
-    C --> D[sorted image files]
-    D --> E[Initialization processors]
-    E --> E1[GeoCalib shared intrinsics]
-    E1 --> F[InitializedFrameStream]
-    F --> G[SLAMSystem]
-    G --> G1[Standard resize and crop]
-    G1 --> G2[DROID features and motion filter]
-    G2 --> G3[Pass 1: keyframe graph]
-    G3 --> G4[Frontend incremental BA]
-    G4 --> G5[Backend global BA]
-    G5 --> G6[Pass 2: non-keyframe pose infill]
-    G6 --> H[SLAMOutput]
-    H --> H1[Trajectory: c2w poses]
-    H --> H2[Recovered original-size intrinsics]
-    H --> H3[SLAM keyframe map]
-    H --> I[Replayed initialized stream]
-    I --> J[Post processors]
-    J --> J1[Assign pose and intrinsics to each original frame]
-    J --> J2[DAV3 final depth]
-    J2 --> K[save_artifacts]
-    K --> K1[RGB mp4, pose npz, intrinsics npz, depth zip]
-    K --> K2{pcd_fusion_mode}
-    K2 -->|backproject| K3[color_backproject.ply]
-    K2 -->|tsdf| K4[color_tsdf.ply]
-    J2 --> L[save_projection_video]
-    L --> M[color_vis.mp4]
-    K1 --> N[make_traj_compare_video.py optional]
-    N --> N1[trajectory comparison mp4]
-    N --> N2[pose_aligned txt export]
+flowchart LR
+    S1[Stage 1: initialization and stream setup] -->|InitializedFrameStream with shared GeoCalib intrinsics logic| S2[Stage 2: SLAM pass 1 frontend loop]
+    S2 -->|keyframe buffer: poses, DROID features, disparities, DAV3 keyframe depth anchors| S3[Stage 3: backend global BA over keyframes]
+    S3 -->|refined keyframe poses/disparities and backend graph| S4[Stage 4: SLAM pass 2 pose infill loop]
+    S4 -->|SLAMOutput: pose for every frame, recovered intrinsics, SLAM keyframe map| S5[Stage 5: replay, final DAV3 depth, artifact/PCD/viz writing]
 ```
 
-The important separation is:
+The execution grain is:
 
 | Stage | What it computes |
 | --- | --- |
-| Initialization | Shared pinhole intrinsics and camera type |
-| SLAM | Camera poses, keyframe disparity map, and low-resolution keyframe point map |
-| Post depth | Final dense metric depth for every original frame |
-| Artifacts | Persist RGB, poses, intrinsics, depth, and one selected PCD output |
-| Trajectory script | Passive visualization and aligned pose export only |
+| Stage 1: initialization and stream setup | Creates one `FrameDir`, estimates one shared pinhole FOV from three sampled frames with GeoCalib, builds one `InitializedFrameStream`, and records initialization attributes during the first full stream pass. |
+| Stage 2: SLAM pass 1 frontend loop | Loops over frames once, resizes each frame for SLAM, decides whether each frame becomes a keyframe, computes DROID features/context only for accepted keyframes, stores DAV3 metric depth anchors for keyframes, and runs incremental frontend BA as keyframes arrive. |
+| Stage 3: backend global BA | Runs twice over the complete pass-1 keyframe set: first with `steps=7`, then with `steps=backend_iters`. Each call builds a fresh non-incremental factor graph and optimizes all keyframes as a sequence-level solve. |
+| Stage 4: SLAM pass 2 pose infill loop | Loops over every frame again, appends frames in chunks, initializes non-keyframe poses from neighboring keyframes, optimizes those appended poses motion-only, returns one pose per original frame, and extracts the internal low-resolution keyframe map. |
+| Stage 5: final DAV3 depth and outputs | Replays original-resolution frames, assigns final SLAM pose/intrinsics, runs final DAV3 depth in a two-pass stream, writes artifacts, writes exactly one configured PCD, and optionally writes `color_vis.mp4`. |
 
-## Chunk 1: Shell, Hydra Config, And Runtime Construction
+The detailed chunks map to the five stages like this:
+
+| Detailed chunks | Stage | Loop or sequence-once? | Handoff produced |
+| --- | --- | --- | --- |
+| Chunks 1.1-1.3 | Stage 1 | `FrameDir` construction once; GeoCalib samples three frames once; initialization attributes are attached per frame during first stream consumption. | `InitializedFrameStream` plus recorded intrinsics/camera type after first full pass. |
+| Chunks 2.1-2.2 | Stage 2 | Per-frame SLAM pass-1 loop with incremental updates as keyframes arrive. | Optimized frontend keyframe buffer. |
+| Chunk 3.1 | Stage 3 | Sequence-level backend BA over all keyframes, not a per-frame loop. | Refined keyframe poses/disparities and `backend.last_graph`. |
+| Chunk 4.1 | Stage 4 | Per-frame pass-2 loop plus chunked infill solves. | `SLAMOutput` containing full-frame trajectory, recovered intrinsics, and `SLAMMap`. |
+| Chunks 5.1-5.3 | Stage 5 | Replays original frames; DAV3 uses two stream passes; artifact writing loops once over final yielded frames. | Saved artifacts, one PCD, optional `color_vis.mp4`. |
+
+<a id="chunk-1-1"></a>
+## Chunk 1.1: Shell, Hydra Config, And Runtime Construction
 
 Source files:
 
@@ -91,6 +68,8 @@ Source files:
 | `configs/default.yaml` | Single config file |
 | `vipe/pipeline/default.py` | `DefaultAnnotationPipeline` |
 | `vipe/streams/base.py` | `FrameDir`, `FrameData`, `FrameStream`, `ProcessedFrameStream` |
+
+Stage context: this is the sequence-once setup part of Stage 1. It constructs config-backed Python objects only. It does not read the whole image sequence, does not run GeoCalib yet, and does not run SLAM. The handoff is one `FrameDir` source plus one `DefaultAnnotationPipeline`.
 
 ### Diagram
 
@@ -193,9 +172,10 @@ logger.info(f"Finished processing {frame_stream.name()}")
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-1-toy) for the matching numeric example for this chunk.
 
-## Chunk 2: Frame Directory Source And Frame Ordering
+<a id="chunk-1-2"></a>
+## Chunk 1.2: Frame Directory Source And Frame Ordering
 
 Source files:
 
@@ -203,6 +183,8 @@ Source files:
 | --- | --- |
 | `vipe/streams/base.py` | `FrameDir`, `FrameData`, `FrameStream`, `ProcessedFrameStream` |
 | `vipe/utils/misc.py` | Numeric-vs-lexicographic image sorting |
+
+Stage context: this is the frame-source part of Stage 1. The file list and image size are computed once in `FrameDir.__init__`. Actual pixel tensors are produced lazily each time the stream is iterated, so later stages can re-read the same directory without caching a full frame list in memory.
 
 ### Diagram
 
@@ -315,9 +297,10 @@ FrameData(
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-2-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-2-toy) for the matching numeric example for this chunk.
 
-## Chunk 3: Initial Stream Processors: GeoCalib Intrinsics And Attribute Recording
+<a id="chunk-1-3"></a>
+## Chunk 1.3: Initial Stream Processors: GeoCalib Intrinsics And Attribute Recording
 
 Source files:
 
@@ -326,6 +309,8 @@ Source files:
 | `vipe/pipeline/default.py` | Builds the initialization processors |
 | `vipe/pipeline/processors.py` | `GeoCalibIntrinsicsProcessor` |
 | `vipe/priors/geocalib/*` | GeoCalib model and LM optimizer |
+
+Stage context: this completes Stage 1. GeoCalib samples three frames once and stores one shared vertical FOV. During the first full stream pass, each frame receives intrinsics and camera type, and the recorder stores those attributes for later replay. The one-time handoff to Stage 2 is an `InitializedFrameStream` whose first iteration produces calibrated frames and whose later replay restores the recorded initialization attributes.
 
 ### Diagram
 
@@ -505,13 +490,14 @@ frame.intrinsics = recorded_intrinsics[frame_idx].cuda()
 frame.camera_type = recorded_camera_type[frame_idx]
 ```
 
-This gives post-processing and artifact writing original-resolution RGB frames with the recorded raw-resolution intrinsics. After SLAM, those intrinsics are overwritten by the recovered SLAM intrinsics in chunk 8.
+This gives post-processing and artifact writing original-resolution RGB frames with the recorded raw-resolution intrinsics. After SLAM, those intrinsics are overwritten by the recovered SLAM intrinsics in chunk 5.1.
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-3-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-3-toy) for the matching numeric example for this chunk.
 
-## Chunk 4: SLAM Standard Resize, Graph Buffer, And Model Setup
+<a id="chunk-2-1"></a>
+## Chunk 2.1: SLAM Standard Resize, Graph Buffer, And Model Setup
 
 Source files:
 
@@ -521,6 +507,8 @@ Source files:
 | `vipe/slam/components/buffer.py` | Persistent keyframe graph state |
 | `vipe/slam/networks/droid_net.py` | DROID feature/context/update networks |
 | `vipe/priors/depth/dav3.py` | DAV3 metric depth used on SLAM keyframes |
+
+Stage context: this is the sequence-once setup for Stage 2. It wraps the initialized stream in the SLAM resize processor, computes the resized SLAM frame size, builds the DROID network, allocates the keyframe `GraphBuffer`, and loads the DAV3 metric-depth model used only for keyframe scale anchors. The handoff is an empty but fully allocated SLAM state ready for the pass-1 frame loop.
 
 ### Diagram
 
@@ -680,9 +668,10 @@ This keyframe model is separate from the final post-processing multiview DAV3 mo
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-4-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-2-1-toy) for the matching numeric example for this chunk.
 
-## Chunk 5: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
+<a id="chunk-2-2"></a>
+## Chunk 2.2: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
 
 Source files:
 
@@ -695,6 +684,8 @@ Source files:
 | `vipe/slam/components/buffer.py` | Dense BA call and frame-distance metric |
 | `vipe/slam/ba/*` | Sparse solver and residual terms |
 | `vipe/slam/maths/geom.py` | Inverse projection, projection, SE3 transforms |
+
+Stage context: this is the per-frame loop of Stage 2. It consumes the initialized stream once at SLAM resolution. Every frame runs the motion filter; only accepted frames are added as keyframes and get DROID feature/context tensors plus DAV3 keyframe depth anchors. Frontend BA runs incrementally as keyframes arrive. The handoff to Stage 3 is the keyframe buffer with frontend-optimized poses and disparities.
 
 ### Diagram
 
@@ -1190,9 +1181,10 @@ Intrinsics remain the GeoCalib estimate at resized scale during SLAM.
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-2-2-toy) for the matching numeric example for this chunk.
 
-## Chunk 6: Backend Global BA And SLAM Map Extraction
+<a id="chunk-3-1"></a>
+## Chunk 3.1: Backend Global BA Over Keyframes
 
 Source files:
 
@@ -1200,8 +1192,9 @@ Source files:
 | --- | --- |
 | `vipe/slam/components/backend.py` | Global BA over keyframes |
 | `vipe/slam/components/factor_graph.py` | Batch graph update with low-memory correlation |
-| `vipe/slam/components/buffer.py` | Global frame-distance graph and map extraction |
-| `vipe/slam/interface.py` | `SLAMMap`, `SLAMOutput` |
+| `vipe/slam/components/buffer.py` | Global frame-distance graph state |
+
+Stage context: this is Stage 3. It is a sequence-level solve over the pass-1 keyframes. It does not loop over raw frames. The handoff into this chunk is the complete keyframe buffer from Stage 2. The handoff out is the same keyframe buffer with globally refined keyframe poses/disparities plus `backend.last_graph`.
 
 ### Diagram
 
@@ -1216,10 +1209,8 @@ flowchart TD
     F --> H[Dense BA over all keyframes]
     H --> I[backend.run steps=backend_iters]
     I --> J[Another global BA pass]
-    J --> K[extract_slam_map]
-    K --> L[Inverse project optimized keyframe disparities]
-    L --> M[Depth consistency filtering]
-    M --> N[SLAMMap with xyz, rgb, packinfo, keyframe frame ids]
+    J --> K[Refined keyframe poses and disparities]
+    K --> L[backend.last_graph stores final keyframe graph edges]
 ```
 
 ### Backend Graph Creation
@@ -1307,64 +1298,12 @@ For each batch step:
 6. Update target coordinates, weights, and damping.
 7. Run dense BA over all keyframes.
 
-### SLAM Map Extraction
-
-After backend and pass 2 infill later, `SLAMSystem.run` extracts a keyframe map:
-
-```python
-slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
-slam_map.backend_graph = self.backend.last_graph
-```
-
-Default:
-
-```text
-map_filter_thresh = 0.05
-```
-
-`GraphBuffer.extract_slam_map`:
-
-1. Chooses all keyframe buffer indices if `t_range is None`.
-2. Converts stored world-to-camera poses to camera-to-world:
-   ```python
-   c2w_se3 = SE3(self.poses[t_range]).inv()
-   ```
-3. Takes low-res colors:
-   ```python
-   images = self.images[t_range, :, 3::8, 3::8].moveaxis(1, -1)
-   ```
-   Toy shape: `(K,48,64,3)`.
-4. Build a camera model from resized intrinsics.
-5. Scale intrinsics by `1/8`.
-6. Inverse project every low-res disparity pixel into camera coordinates.
-7. Transform points into world coordinates.
-8. Compute consistency count with `slam_ext.depth_filter`.
-9. Build the valid point mask:
-   ```python
-   masks = (
-       (count >= min(2, n_frames - 1))
-       & (disps > 0.5 * disps.mean(dim=[1,2], keepdim=True))
-   )
-   ```
-10. Pack only valid points into `SLAMMap.from_masked_dense_disp`.
-
-`SLAMMap` stores:
-
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `dense_disp_xyz` | `(M,3)` | world-space keyframe map points |
-| `dense_disp_rgb` | `(M,3)` | RGB colors in `0..1` |
-| `dense_disp_packinfo` | `(K,2)` | for each keyframe: start offset and count in packed point arrays |
-| `dense_disp_frame_inds` | list length `K` | raw frame ids of keyframes |
-| `backend_graph` | `(Q,2)` or `None` | final backend keyframe graph edges |
-
-This SLAM map is not the final saved TSDF/backproject point cloud. It is an internal low-resolution keyframe map used for visualization and DAV3 depth conditioning.
-
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-6-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-3-1-toy) for the matching numeric example for this chunk.
 
-## Chunk 7: SLAM Pass 2 And Non-Keyframe Pose Infill
+<a id="chunk-4-1"></a>
+## Chunk 4.1: SLAM Pass 2 And Non-Keyframe Pose Infill
 
 Source files:
 
@@ -1373,6 +1312,10 @@ Source files:
 | `vipe/slam/system.py` | Pass 2 loop |
 | `vipe/slam/components/inner_filler.py` | Pose interpolation and optimization for every original frame |
 | `vipe/slam/components/factor_graph.py` | Infill graph updates |
+| `vipe/slam/components/buffer.py` | SLAM keyframe map extraction after pass 2 |
+| `vipe/slam/interface.py` | `SLAMMap`, `SLAMOutput` |
+
+Stage context: this is Stage 4. It loops over the original sequence again; its primary purpose is to produce poses for frames that were not retained as pass-1 keyframes. After that loop, it extracts the internal keyframe map and returns `SLAMOutput`. The handoff into this chunk is the globally refined keyframe buffer from Stage 3. The handoff out is `SLAMOutput`: camera-to-world pose for every original frame, recovered original-resolution intrinsics, and the internal low-resolution `SLAMMap`.
 
 ### Diagram
 
@@ -1391,6 +1334,9 @@ flowchart TD
     J --> K[Append filled poses]
     K --> L[Reset buffer.n_frames back to keyframe count]
     L --> M[get_result returns poses for all N frames]
+    M --> N[extract_slam_map from refined keyframes]
+    N --> O[recover original-resolution intrinsics]
+    O --> P[Return SLAMOutput]
 ```
 
 ### Computation
@@ -1496,7 +1442,7 @@ motion_only = not self.args.infill_dense_disp  # true
 `InnerFiller.compute` builds a temporary incremental `FactorGraph`:
 
 ```python
-graph = FactorGraph(..., max_factors=-1, incremental=True, cross_view=False)
+graph = FactorGraph(..., max_factors=-1, incremental=True)
 ```
 
 For each infill frame, it adds:
@@ -1542,6 +1488,57 @@ filled_return = self.inner_filler.get_result()
 
 `filled_return.poses` has one world-to-camera pose for every original frame.
 
+After `filled_return` is available, `SLAMSystem.run` extracts the internal keyframe map:
+
+```python
+slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
+slam_map.backend_graph = self.backend.last_graph
+```
+
+Default:
+
+```text
+map_filter_thresh = 0.05
+```
+
+`GraphBuffer.extract_slam_map`:
+
+1. Chooses all keyframe buffer indices if `t_range is None`.
+2. Converts stored world-to-camera poses to camera-to-world:
+   ```python
+   c2w_se3 = SE3(self.poses[t_range]).inv()
+   ```
+3. Takes low-res colors:
+   ```python
+   images = self.images[t_range, :, 3::8, 3::8].moveaxis(1, -1)
+   ```
+   Toy shape: `(K,48,64,3)`.
+4. Build a camera model from resized intrinsics.
+5. Scale intrinsics by `1/8`.
+6. Inverse project every low-res disparity pixel into camera coordinates.
+7. Transform points into world coordinates.
+8. Compute consistency count with `slam_ext.depth_filter`.
+9. Build the valid point mask:
+   ```python
+   masks = (
+       (count >= min(2, n_frames - 1))
+       & (disps > 0.5 * disps.mean(dim=[1,2], keepdim=True))
+   )
+   ```
+10. Pack only valid points into `SLAMMap.from_masked_dense_disp`.
+
+`SLAMMap` stores:
+
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `dense_disp_xyz` | `(M,3)` | world-space keyframe map points |
+| `dense_disp_rgb` | `(M,3)` | RGB colors in `0..1` |
+| `dense_disp_packinfo` | `(K,2)` | for each keyframe: start offset and count in packed point arrays |
+| `dense_disp_frame_inds` | list length `K` | raw frame ids of keyframes |
+| `backend_graph` | `(Q,2)` or `None` | final backend keyframe graph edges |
+
+This SLAM map is not the final saved TSDF/backproject point cloud. It is an internal low-resolution keyframe map used for the saved projection video and for DAV3 depth conditioning.
+
 Then `SLAMSystem.run` returns:
 
 ```python
@@ -1573,9 +1570,10 @@ original_intrinsics = [20.7846, 20.7846, 16.0, 12.0]
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-7-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-4-1-toy) for the matching numeric example for this chunk.
 
-## Chunk 8: Replaying The Initialized Stream And Assigning SLAM Results
+<a id="chunk-5-1"></a>
+## Chunk 5.1: Replaying The Initialized Stream And Assigning SLAM Results
 
 Source files:
 
@@ -1583,6 +1581,8 @@ Source files:
 | --- | --- |
 | `vipe/pipeline/default.py` | `InitializedFrameStream.replay`, `_add_post_processors` call site |
 | `vipe/streams/base.py` | `AssignRecordedInitProcessor`, `AssignAttributesProcessor`, `ProcessedFrameStream` |
+
+Stage context: this starts Stage 5. `run.py` has already received `SLAMOutput` from Stage 4. The pipeline now replays the original frame directory, restores initialization attributes, overwrites intrinsics with recovered SLAM intrinsics, assigns final camera-to-world poses, and wraps the stream with DAV3 final-depth processing.
 
 ### Diagram
 
@@ -1722,9 +1722,10 @@ The important consequence is that artifact writing receives original-resolution 
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-8-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-1-toy) for the matching numeric example for this chunk.
 
-## Chunk 9: Final DAV3 Depth For Every Frame
+<a id="chunk-5-2"></a>
+## Chunk 5.2: Final DAV3 Depth For Every Frame
 
 Source files:
 
@@ -1732,6 +1733,8 @@ Source files:
 | --- | --- |
 | `vipe/pipeline/processors.py` | `DAV3DepthProcessor` |
 | `vipe/streams/base.py` | `FrameData.dav3_conditions` |
+
+Stage context: this is the depth-estimation part of Stage 5. It is not a single global DAV3 call over the entire scene. It uses a two-pass stream: pass 0 records the keyframe frames needed as context; pass 1 runs posed DAV3-GIANT over sliding windows and yields final original-resolution frames with metric depth and confidence.
 
 ### Diagram
 
@@ -1891,9 +1894,10 @@ Default normal window yields `10 - 3 = 7` frames and keeps 3 trailing frames for
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-9-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-2-toy) for the matching numeric example for this chunk.
 
-## Chunk 10: Artifact Saving, PCD Fusion, And Visualization
+<a id="chunk-5-3"></a>
+## Chunk 5.3: Artifact Saving, PCD Fusion, And Visualization
 
 Source files:
 
@@ -1902,6 +1906,8 @@ Source files:
 | `vipe/pipeline/default.py` | Calls `io.save_artifacts` and `save_projection_video` |
 | `vipe/utils/io.py` | Saves RGB, pose, depth, intrinsics, camera type, PCD |
 | `vipe/utils/visualization.py` | Projection/depth/SLAM-map visualization video |
+
+Stage context: this is the persistence part of Stage 5. It consumes the final stream once as frames are yielded from DAV3 depth pass 1. It writes frame-wise artifacts, updates exactly one configured PCD fusion mode online during the loop, and then performs the final PCD extraction/write step. If `save_viz=true`, it writes the saved projection video from artifacts and the internal SLAM map.
 
 ### Diagram
 
@@ -2213,136 +2219,7 @@ Important: the `pcd` visualization panel does not project `color_tsdf.ply` or `c
 
 ### Toy Trace
 
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-10-toy) for the matching numeric example for this chunk.
-
-## Chunk 11: Optional Trajectory Comparison And Pose Export
-
-Source file:
-
-| File | Role |
-| --- | --- |
-| `scripts/make_traj_compare_video.py` | Passive trajectory plot and aligned pose export |
-
-### Diagram
-
-```mermaid
-flowchart TD
-    A[ViPE output directory] --> B[Find pose/*.npz]
-    B --> C[Load predicted frame ids and c2w poses]
-    D[GT pose dir] --> E[Load numeric txt poses]
-    C --> F[Find overlapping frame ids]
-    E --> F
-    F --> G{alignment}
-    G -->|first| H[first_to_gt = gt_first @ inv(pred_first)]
-    G -->|se3| I[Umeyama rigid alignment]
-    G -->|sim3| J[Umeyama similarity alignment]
-    H --> K[Aligned predicted poses]
-    I --> K
-    J --> K
-    K --> L{--export?}
-    L -->|yes| M[Write pose_aligned/*.txt]
-    L -->|no| N[No pose txt export]
-    K --> O[Draw 2D trajectory mp4]
-```
-
-### Loading Predicted Poses
-
-The script discovers the ViPE pose file:
-
-```python
-pose_files = sorted((vipe_output_dir / "pose").glob("*.npz"))
-```
-
-For your standalone path, this is normally:
-
-```text
-outputs/scene00_dav3tsdf/pose/color.npz
-```
-
-The npz stores:
-
-```python
-data["inds"]  # frame ids
-data["data"]  # camera-to-world 4x4 matrices
-```
-
-`load_pred_pose_npz` returns:
-
-```python
-frame_ids = data["inds"].astype(np.int64)
-pose_mats = data["data"].astype(np.float64)
-xyz = pose_mats[:, :3, 3]
-```
-
-### Loading GT Poses
-
-GT pose files are loaded with numeric sorting:
-
-```python
-pose_files = sorted(gt_pose_dir.glob("*.txt"), key=lambda p: int(p.stem))
-```
-
-Each pose must be a finite `4 x 4` matrix. Non-finite or wrong-shaped poses are skipped.
-
-### Overlap And Alignment
-
-The script builds maps by frame id:
-
-```python
-pred_map = {frame_id: predicted_xyz}
-gt_map = {frame_id: gt_xyz}
-overlap_ids = sorted(set(pred_map) & set(gt_map))
-```
-
-With `--alignment first`:
-
-```python
-first_id = overlap_ids[0]
-first_to_gt = gt_pose_map[first_id] @ inv(pred_pose_map[first_id])
-aligned_pose_mats = first_to_gt[None] @ pred_pose_mats
-```
-
-This assumes the first overlapping predicted camera pose should exactly coincide with the first overlapping GT camera pose. It does not estimate scale, rotation, or translation from the whole trajectory.
-
-With `--alignment se3`, it uses Umeyama alignment with scale fixed to `1.0`.
-
-With `--alignment sim3`, it uses Umeyama alignment with scale estimated.
-
-### Export And Video
-
-If `--export` is present:
-
-```python
-export_dir = vipe_output_dir / "pose_aligned"
-np.savetxt(export_dir / f"{frame_id}.txt", aligned_pose_mat)
-```
-
-The trajectory video path defaults to:
-
-```text
-<vipe_output_dir>/vipe_aux_vis/<sequence>_traj.mp4
-```
-
-For sequence `color`:
-
-```text
-outputs/scene00_dav3tsdf/vipe_aux_vis/color_traj.mp4
-```
-
-The plot:
-
-1. Chooses a 2D plane, default `xy`.
-2. Computes bounds from all GT and aligned predicted points.
-3. Draws a grid.
-4. Draws GT trajectory in green.
-5. Draws predicted trajectory in blue/orange.
-6. Writes one video frame for each integer frame id from `0` to max GT/pred id.
-
-This script does not change ViPE SLAM, depth, or PCD artifacts. It only reads saved poses and writes a trajectory visualization plus optional aligned pose txt files.
-
-### Toy Trace
-
-See [fullexplain-toy.md](./fullexplain-toy.md#chunk-11-toy) for the matching numeric example for this chunk.
+See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-3-toy) for the matching numeric example for this chunk.
 
 ## End-To-End Toy Trace
 
@@ -2371,7 +2248,6 @@ The end-to-end toy sequence diagram and final toy output table are in [fullexpla
 | `pcd/color_tsdf.ply` | Surface point cloud sampled from TSDF fusion of final DAV3 depth plus ViPE poses/intrinsics. |
 | `pcd/color_backproject.ply` | Only produced if `pcd_fusion_mode=backproject`; direct sampled pixel backprojection of final DAV3 depth plus ViPE poses/intrinsics. |
 | `vipe/color_vis.mp4` | Diagnostic visualization using final saved artifacts plus the internal low-res SLAM map. |
-| `pose_aligned/*.txt` | Optional post-script output; ViPE poses left-multiplied so the first predicted pose equals the first GT pose. |
 
 The key computational distinction is:
 
