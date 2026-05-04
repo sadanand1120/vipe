@@ -16,10 +16,10 @@
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from typing import Iterator
 
-from vipe.priors.depth import make_depth_model
-from vipe.priors.depth.base import DepthType
-from vipe.streams.base import FrameAttribute, ProcessedFrameStream, FrameProcessor, FrameData, FrameStream
+from vipe.priors.depth.dav3 import DepthAnything3Model
+from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
@@ -33,7 +33,7 @@ from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
 
 
-class StandardResizeFrameProcessor(FrameProcessor):
+class StandardResizeFrameProcessor:
     def __init__(self) -> None:
         super().__init__()
         self.fac_x, self.fac_y = 1.0, 1.0
@@ -71,6 +71,28 @@ class StandardResizeFrameProcessor(FrameProcessor):
         return new_intrinsics
 
 
+class ResizedFrameStream(FrameStream):
+    def __init__(self, stream: FrameStream, resizer: StandardResizeFrameProcessor) -> None:
+        self.stream = stream
+        self.resizer = resizer
+
+    def frame_size(self) -> tuple[int, int]:
+        return self.resizer.update_frame_size(self.stream.frame_size())
+
+    def fps(self) -> float:
+        return self.stream.fps()
+
+    def name(self) -> str:
+        return self.stream.name()
+
+    def __len__(self) -> int:
+        return len(self.stream)
+
+    def __iter__(self) -> Iterator[FrameData]:
+        for frame_idx, frame in enumerate(self.stream):
+            yield self.resizer(frame_idx, frame)
+
+
 class SLAMSystem:
     """Solver-defined SLAM"""
 
@@ -98,22 +120,14 @@ class SLAMSystem:
         self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device)
         self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device)
         self.inner_filler = InnerFiller(self.droid_net, self.buffer, self.config, device=self.device)
+        self.metric_depth = DepthAnything3Model()
 
-        if self.config.keyframe_depth is not None:
-            self.metric_depth = make_depth_model(self.config.keyframe_depth)
-            assert self.metric_depth.depth_type == DepthType.METRIC_DEPTH
-
-        else:
-            self.metric_depth = None
-
-    def _add_keyframe(
+    def _store_buffer_frame(
         self,
         frame_idx: int,
         images: torch.Tensor,
         frame_data: FrameData,
-        phase: int,
-    ):
-        assert phase in [1, 2]
+    ) -> int:
         kf_idx = self.buffer.n_frames
         self.buffer.tstamp[kf_idx] = frame_idx
         self.buffer.images[kf_idx] = images[0]
@@ -124,19 +138,20 @@ class SLAMSystem:
         if kf_idx == 0:
             self.buffer.intrinsics = unpack_optional(frame_data.intrinsics).to(self.device)
 
-        if frame_data.metric_depth is not None:
-            disp_sens = frame_data.metric_depth[3::8, 3::8]
-            disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
-            self.buffer.disps_sens[kf_idx] = disp_sens
-
-        if frame_data.pose is not None and phase == 1:
+        if frame_data.pose is not None:
             self.buffer.poses[kf_idx] = frame_data.pose.inv().data
 
-        if phase == 1:
-            self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx)
         self.buffer.n_frames += 1
+        return kf_idx
 
-    def _precompute_features(self, frame_data: FrameData):
+    def _add_frontend_keyframe(self, frame_idx: int, images: torch.Tensor, frame_data: FrameData):
+        kf_idx = self._store_buffer_frame(frame_idx, images, frame_data)
+        self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx)
+
+    def _add_infill_frame(self, frame_idx: int, images: torch.Tensor, frame_data: FrameData):
+        self._store_buffer_frame(frame_idx, images, frame_data)
+
+    def _rgb_bchw(self, frame_data: FrameData):
         images = frame_data.rgb.permute(2, 0, 1)[None]
         return images
 
@@ -147,7 +162,7 @@ class SLAMSystem:
         camera_type: CameraType = CameraType.PINHOLE,
     ) -> SLAMOutput:
         resizer = StandardResizeFrameProcessor()
-        frame_stream = ProcessedFrameStream(frame_stream, [resizer])
+        frame_stream = ResizedFrameStream(frame_stream, resizer)
         frame_size = frame_stream.frame_size()
         total_n_frames = len(frame_stream)
 
@@ -155,7 +170,7 @@ class SLAMSystem:
             {
                 "height": frame_size[0],
                 "width": frame_size[1],
-                "has_init_pose": FrameAttribute.POSE in frame_stream.attributes(),
+                "has_init_pose": False,
                 "camera_type": camera_type,
             }
         )
@@ -167,10 +182,10 @@ class SLAMSystem:
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (1/2)", total=total_n_frames
         ):
-            images = self._precompute_features(frame_data)
+            images = self._rgb_bchw(frame_data)
 
             if self.motion_filter.check(images) or frame_idx == total_n_frames - 1:
-                self._add_keyframe(frame_idx, images, frame_data, phase=1)
+                self._add_frontend_keyframe(frame_idx, images, frame_data)
 
             self.frontend.run()
 
@@ -185,8 +200,8 @@ class SLAMSystem:
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (2/2)", total=total_n_frames
         ):
-            images = self._precompute_features(frame_data)
-            self._add_keyframe(frame_idx, images, frame_data, phase=2)
+            images = self._rgb_bchw(frame_data)
+            self._add_infill_frame(frame_idx, images, frame_data)
             if self.inner_filler.check() or frame_idx == total_n_frames - 1:
                 self.inner_filler.compute()
 
@@ -197,7 +212,6 @@ class SLAMSystem:
             raise ValueError("Your video might be malformed or unreadable.")
 
         slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
-        slam_map.backend_graph = self.backend.last_graph
 
         # Scale back the intrinsics to the original size.
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics)

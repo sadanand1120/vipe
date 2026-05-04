@@ -61,9 +61,7 @@ def infer(frame_dir: Path, fps: float, output: Path, save_viz: bool):
 
     logger.info(f"Processing frame directory {frame_dir}...")
     vipe_pipeline = DefaultAnnotationPipeline(
-        init=args.pipeline.init,
         slam=args.pipeline.slam,
-        post=args.pipeline.post,
         output=args.pipeline.output,
     )
     frame_stream = FrameDir(

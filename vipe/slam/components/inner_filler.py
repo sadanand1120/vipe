@@ -35,12 +35,9 @@ from .factor_graph import FactorGraph
 @dataclass
 class FilledReturn:
     poses: SE3  # Inverse of c2w
-    dense_disps: torch.Tensor | None = None
 
     def scale(self, factor: float):
         self.poses.data[..., :3] *= factor
-        if self.dense_disps is not None:
-            self.dense_disps /= factor
 
 
 class InnerFiller:
@@ -54,7 +51,6 @@ class InnerFiller:
         self.args = args
 
         self.filled_poses = []
-        self.filled_dense_disps = []
 
     def set_start_idx(self, start_idx: int):
         self.start_idx = start_idx
@@ -83,14 +79,6 @@ class InnerFiller:
 
         self.video.poses[self.start_idx : total_frames] = m_pose.data
 
-        if self.args.infill_dense_disp:
-            self.video.disps[self.start_idx : total_frames] = self.video.disps[t0].mean(dim=[2, 3], keepdim=True)
-            self.video.disps[self.start_idx : total_frames] = torch.where(
-                self.video.disps_sens[self.start_idx : total_frames] > 0,
-                self.video.disps_sens[self.start_idx : total_frames],
-                self.video.disps[self.start_idx : total_frames],
-            )
-
         # Build factor graph and optimize for the interpolated information.
         graph = FactorGraph(
             self.net,
@@ -102,29 +90,21 @@ class InnerFiller:
         infill_inds = torch.arange(self.start_idx, total_frames).to(self.device)
         graph.add_factors(t0, infill_inds)
         graph.add_factors(t1, infill_inds)
-        if self.args.infill_dense_disp:
-            graph.add_factors(infill_inds, t0)
-            graph.add_factors(infill_inds, t1)
 
         for _ in range(10):
             graph.update(
                 self.start_idx,
                 total_frames,
-                motion_only=not self.args.infill_dense_disp,
+                motion_only=True,
                 limited_disp=True,
             )
 
         current_poses = SE3(self.video.poses[self.start_idx : total_frames].clone())
         self.filled_poses.append(current_poses)
 
-        if self.args.infill_dense_disp:
-            current_dense_disps = self.video.disps[self.start_idx : total_frames].clone()
-            self.filled_dense_disps.append(current_dense_disps)
-
         self.video.n_frames = self.start_idx
 
     def get_result(self) -> FilledReturn:
         return FilledReturn(
             poses=lt.cat(self.filled_poses, dim=0),
-            dense_disps=(torch.cat(self.filled_dense_disps, dim=0) if self.filled_dense_disps else None),
         )

@@ -28,7 +28,6 @@ from omegaconf.dictconfig import DictConfig
 from vipe.ext import slam_ext
 from vipe.ext.lietorch import SE3
 from vipe.priors.depth import DepthEstimationInput, DepthEstimationModel
-from vipe.priors.depth.base import DepthType
 from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector
@@ -97,10 +96,7 @@ class GraphBuffer:
         self.fmaps[ix] = self.fmaps[ix + 1]
         self.n_frames -= 1
 
-    def update_disps_sens(self, depth_model: DepthEstimationModel | None, frame_idx: int):
-        if depth_model is None:
-            return
-
+    def update_disps_sens(self, depth_model: DepthEstimationModel, frame_idx: int):
         depth_input = DepthEstimationInput(
             rgb=self.images[frame_idx].moveaxis(0, -1).float(),
             intrinsics=self.intrinsics,

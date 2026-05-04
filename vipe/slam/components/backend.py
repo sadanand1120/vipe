@@ -37,7 +37,6 @@ class SLAMBackend:
         self.video = video
         self.args = args
         self.device = device
-        self.last_graph: torch.Tensor | None = None
 
     def _iterate(self, graph: FactorGraph, steps: int):
         graph.update_batch(
@@ -76,5 +75,3 @@ class SLAMBackend:
                 self.video.disps_sens[0],
                 self.video.disps[0],
             )
-
-        self.last_graph = torch.stack([graph.ii, graph.jj], dim=-1)

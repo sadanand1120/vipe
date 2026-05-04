@@ -163,9 +163,7 @@ def run_vipe(overrides: list[str]) -> None:
         frame_skip=cfg.streams.frame_skip,
     )
     pipeline = DefaultAnnotationPipeline(
-        init=cfg.pipeline.init,
         slam=cfg.pipeline.slam,
-        post=cfg.pipeline.post,
         output=cfg.pipeline.output,
     )
     logger.info(f"Running ViPE on {stream.name()}")

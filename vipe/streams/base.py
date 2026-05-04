@@ -14,9 +14,8 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Iterator
 
 import cv2
 import numpy as np
@@ -24,16 +23,7 @@ import torch
 
 from vipe.ext.lietorch import SE3
 from vipe.utils.cameras import CameraType
-from vipe.utils.logging import pbar
 from vipe.utils.misc import sort_image_sequence
-
-
-class FrameAttribute(Enum):
-    POSE = "pose"
-    INTRINSICS = "intrinsics"
-    CAMERA_TYPE = "camera_type"
-    METRIC_DEPTH = "metric_depth"
-    DEPTH_CONFIDENCE = "depth_confidence"
 
 
 @dataclass(kw_only=True, slots=True)
@@ -67,48 +57,6 @@ class FrameData:
     @property
     def device(self) -> torch.device:
         return self.rgb.device
-
-    def attributes(self) -> set[FrameAttribute]:
-        attributes = set()
-        if self.pose is not None:
-            attributes.add(FrameAttribute.POSE)
-        if self.intrinsics is not None:
-            attributes.add(FrameAttribute.INTRINSICS)
-        if self.camera_type is not None:
-            attributes.add(FrameAttribute.CAMERA_TYPE)
-        if self.metric_depth is not None:
-            attributes.add(FrameAttribute.METRIC_DEPTH)
-        if self.depth_confidence is not None:
-            attributes.add(FrameAttribute.DEPTH_CONFIDENCE)
-
-        return attributes
-
-    def get_attribute(self, attribute: FrameAttribute) -> Any:
-        if attribute == FrameAttribute.POSE:
-            return self.pose
-        if attribute == FrameAttribute.INTRINSICS:
-            return self.intrinsics
-        if attribute == FrameAttribute.CAMERA_TYPE:
-            return self.camera_type
-        if attribute == FrameAttribute.METRIC_DEPTH:
-            return self.metric_depth
-        if attribute == FrameAttribute.DEPTH_CONFIDENCE:
-            return self.depth_confidence
-        raise ValueError(f"Attribute {attribute} is not available in the frame.")
-
-    def set_attribute(self, attribute: FrameAttribute, value: Any) -> None:
-        if attribute == FrameAttribute.POSE:
-            self.pose = value
-        elif attribute == FrameAttribute.INTRINSICS:
-            self.intrinsics = value
-        elif attribute == FrameAttribute.CAMERA_TYPE:
-            self.camera_type = value
-        elif attribute == FrameAttribute.METRIC_DEPTH:
-            self.metric_depth = value
-        elif attribute == FrameAttribute.DEPTH_CONFIDENCE:
-            self.depth_confidence = value
-        else:
-            raise ValueError(f"Attribute {attribute} is not available in the frame.")
 
     def cpu(self) -> "FrameData":
         map_cpu = lambda x: x.cpu() if x is not None else None
@@ -254,9 +202,6 @@ class FrameStream:
     def __len__(self) -> int:
         raise NotImplementedError
 
-    def attributes(self) -> set[FrameAttribute]:
-        return set()
-
 
 class FrameDir(FrameStream):
     """
@@ -321,90 +266,3 @@ class FrameDir(FrameStream):
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
             yield FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb)
-
-
-class FrameProcessor(Protocol):
-    """
-    Interface for one lazy per-frame transform.
-    """
-
-    n_passes_required: int = 1
-
-    def update_fps(self, previous_fps: float) -> float:
-        return previous_fps
-
-    def update_frame_size(self, previous_frame_size: tuple[int, int]):
-        return previous_frame_size
-
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes
-
-    def update_iterator(self, previous_iterator: Iterator[FrameData], pass_idx: int) -> Iterator[FrameData]:
-        for frame_idx, frame in enumerate(previous_iterator):
-            yield self(frame_idx, frame)
-
-    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData: ...
-
-
-class AssignAttributesProcessor(FrameProcessor):
-    def __init__(self, stream_attributes: dict[FrameAttribute, list[Any]]):
-        self.stream_attributes = stream_attributes
-
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes.union(self.stream_attributes.keys())
-
-    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
-        for attribute, attribute_values in self.stream_attributes.items():
-            frame.set_attribute(attribute, attribute_values[frame_idx])
-        return frame
-
-
-class ProcessedFrameStream(FrameStream):
-    """
-    Lazy frame stream with processing applied.
-    """
-
-    def __init__(self, stream: FrameStream, processors: list[FrameProcessor]) -> None:
-        super().__init__()
-        self.stream = stream
-        self.processors = processors
-        self.n_passes_required = max(processor.n_passes_required for processor in processors) if processors else 1
-
-    def frame_size(self) -> tuple[int, int]:
-        frame_size = self.stream.frame_size()
-        for processor in self.processors:
-            frame_size = processor.update_frame_size(frame_size)
-        return frame_size
-
-    def fps(self) -> float:
-        fps = self.stream.fps()
-        for processor in self.processors:
-            fps = processor.update_fps(fps)
-        return fps
-
-    def attributes(self) -> set[FrameAttribute]:
-        attributes = self.stream.attributes()
-        for processor in self.processors:
-            attributes = processor.update_attributes(attributes)
-        return attributes
-
-    def name(self) -> str:
-        return self.stream.name()
-
-    def _build_iterator(self, pass_idx: int) -> Iterator[FrameData]:
-        iterator = iter(self.stream)
-        for processor in self.processors:
-            iterator = processor.update_iterator(iterator, pass_idx)
-        return iterator
-
-    def __len__(self) -> int:
-        return len(self.stream)
-
-    def __iter__(self):
-        for pass_idx in range(self.n_passes_required):
-            iterator = self._build_iterator(pass_idx)
-            # Iterate through the processors to update internal state.
-            if pass_idx != self.n_passes_required - 1:
-                for _ in pbar(iterator, desc=f"Pre-iterating for pass {pass_idx}"):
-                    pass
-        return iterator

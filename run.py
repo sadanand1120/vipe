@@ -17,9 +17,7 @@ def run(args: DictConfig) -> None:
         frame_skip=args.streams.frame_skip,
     )
     pipeline = DefaultAnnotationPipeline(
-        init=args.pipeline.init,
         slam=args.pipeline.slam,
-        post=args.pipeline.post,
         output=args.pipeline.output,
     )
     logger.info(f"Processing {frame_stream.name()}")

@@ -18,84 +18,31 @@ import logging
 import pickle
 
 from pathlib import Path
+from typing import Iterator
 
 import torch
 
 from omegaconf import DictConfig
 
 from vipe.slam.system import SLAMOutput, SLAMSystem
-from vipe.streams.base import (
-    AssignAttributesProcessor,
-    FrameAttribute,
-    ProcessedFrameStream,
-    FrameProcessor,
-    FrameStream,
-)
+from vipe.streams.base import FrameData, FrameStream
 from vipe.utils import io
 from vipe.utils.cameras import CameraType
 from vipe.utils.visualization import save_projection_video
 
 from .processors import (
-    DAV3DepthProcessor,
-    GeoCalibIntrinsicsProcessor,
+    DAV3DepthStream,
+    estimate_geocalib_intrinsics,
 )
 
 
 logger = logging.getLogger(__name__)
 
 
-def _cpu_value(value):
-    return value.cpu() if hasattr(value, "cpu") else value
-
-
-def _cuda_value(value):
-    return value.cuda() if hasattr(value, "cuda") else value
-
-
-class InitAttributeRecorder(FrameProcessor):
-    def __init__(self) -> None:
-        self.recorded_attributes = [
-            FrameAttribute.INTRINSICS,
-            FrameAttribute.CAMERA_TYPE,
-        ]
-        self.stream_attributes: dict[FrameAttribute, list] = {attribute: [] for attribute in self.recorded_attributes}
-
-    def __call__(self, frame_idx: int, frame):
-        for attribute in self.recorded_attributes:
-            self.stream_attributes[attribute].append(_cpu_value(frame.get_attribute(attribute)))
-        return frame
-
-    def replay_processors(self) -> list[FrameProcessor]:
-        stream_attributes = {
-            attribute: values
-            for attribute, values in self.stream_attributes.items()
-            if any(value is not None for value in values)
-        }
-        return [AssignRecordedInitProcessor(stream_attributes)]
-
-
-class AssignRecordedInitProcessor(FrameProcessor):
-    def __init__(
-        self,
-        stream_attributes: dict[FrameAttribute, list],
-    ) -> None:
-        self.stream_attributes = stream_attributes
-
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes.union(self.stream_attributes.keys())
-
-    def __call__(self, frame_idx: int, frame):
-        for attribute, attribute_values in self.stream_attributes.items():
-            frame.set_attribute(attribute, _cuda_value(attribute_values[frame_idx]))
-        return frame
-
-
-class InitializedFrameStream(FrameStream):
-    def __init__(self, stream: FrameStream, init_processors: list[FrameProcessor], recorder: InitAttributeRecorder):
+class SharedIntrinsicsFrameStream(FrameStream):
+    def __init__(self, stream: FrameStream, intrinsics: torch.Tensor):
         self.stream = stream
-        self.init_processors = init_processors
-        self.recorder = recorder
-        self.initialized = False
+        self.intrinsics = intrinsics
 
     def frame_size(self) -> tuple[int, int]:
         return self.stream.frame_size()
@@ -109,75 +56,54 @@ class InitializedFrameStream(FrameStream):
     def __len__(self) -> int:
         return len(self.stream)
 
-    def attributes(self) -> set[FrameAttribute]:
-        attributes = self.stream.attributes()
-        for processor in self.init_processors:
-            attributes = processor.update_attributes(attributes)
-        return attributes
+    def __iter__(self) -> Iterator[FrameData]:
+        for frame in self.stream:
+            frame.intrinsics = self.intrinsics
+            frame.camera_type = CameraType.PINHOLE
+            yield frame
 
-    def replay(self) -> ProcessedFrameStream:
-        if not self.initialized:
-            raise RuntimeError("Initialization attributes are not available until the first full stream pass completes")
-        return ProcessedFrameStream(self.stream, self.recorder.replay_processors())
 
-    def __iter__(self):
-        if self.initialized:
-            return iter(self.replay())
+class SLAMOutputFrameStream(FrameStream):
+    def __init__(self, stream: FrameStream, slam_output: SLAMOutput):
+        self.stream = stream
+        self.slam_output = slam_output
 
-        def _recording_iterator():
-            processed = ProcessedFrameStream(self.stream, self.init_processors + [self.recorder])
-            for frame in processed:
-                yield frame
-            self.initialized = True
-            torch.cuda.empty_cache()
+    def frame_size(self) -> tuple[int, int]:
+        return self.stream.frame_size()
 
-        return _recording_iterator()
+    def fps(self) -> float:
+        return self.stream.fps()
+
+    def name(self) -> str:
+        return self.stream.name()
+
+    def __len__(self) -> int:
+        return len(self.stream)
+
+    def __iter__(self) -> Iterator[FrameData]:
+        for frame_idx, frame in enumerate(self.stream):
+            frame.pose = self.slam_output.trajectory[frame_idx]
+            frame.intrinsics = self.slam_output.intrinsics
+            frame.camera_type = CameraType.PINHOLE
+            yield frame
 
 
 class DefaultAnnotationPipeline:
-    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig) -> None:
-        self.init_cfg = init
+    def __init__(self, slam: DictConfig, output: DictConfig) -> None:
         self.slam_cfg = slam
-        self.post_cfg = post
         self.out_cfg = output
         self.out_path = Path(self.out_cfg.path)
         self.out_path.mkdir(exist_ok=True, parents=True)
-        self.camera_type = CameraType(self.init_cfg.camera_type)
-
-    def _add_init_processors(self, frame_stream: FrameStream) -> InitializedFrameStream:
-        init_processors: list[FrameProcessor] = []
-
-        # The assertions make sure that the attributes are not estimated previously.
-        # Otherwise it will be overwritten by the processors.
-        assert FrameAttribute.INTRINSICS not in frame_stream.attributes()
-        assert FrameAttribute.CAMERA_TYPE not in frame_stream.attributes()
-        assert FrameAttribute.METRIC_DEPTH not in frame_stream.attributes()
-
-        init_processors.append(GeoCalibIntrinsicsProcessor(frame_stream, camera_type=self.camera_type))
-        recorder = InitAttributeRecorder()
-        return InitializedFrameStream(frame_stream, init_processors, recorder)
-
-    def _add_post_processors(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> ProcessedFrameStream:
-        post_processors: list[FrameProcessor] = [
-            AssignAttributesProcessor(
-                {
-                    FrameAttribute.POSE: slam_output.trajectory,
-                    FrameAttribute.INTRINSICS: [slam_output.intrinsics] * len(frame_stream),
-                }
-            )
-        ]
-        if (depth_align_model := self.post_cfg.depth_align_model) is not None:
-            post_processors.append(DAV3DepthProcessor(slam_output, model=depth_align_model))
-        return ProcessedFrameStream(frame_stream, post_processors)
 
     def run(self, frame_stream: FrameStream) -> SLAMOutput:
         artifact_path = io.ArtifactPath(self.out_path, frame_stream.name())
-        init_stream = self._add_init_processors(frame_stream)
+        intrinsics = estimate_geocalib_intrinsics(frame_stream)
+        init_stream = SharedIntrinsicsFrameStream(frame_stream, intrinsics)
 
         slam_pipeline = SLAMSystem(device=torch.device("cuda"), config=self.slam_cfg)
-        slam_output = slam_pipeline.run(init_stream, camera_type=self.camera_type)
+        slam_output = slam_pipeline.run(init_stream, camera_type=CameraType.PINHOLE)
 
-        output_stream = self._add_post_processors(init_stream.replay(), slam_output)
+        output_stream = DAV3DepthStream(SLAMOutputFrameStream(frame_stream, slam_output), slam_output)
 
         artifact_path.meta_info_path.parent.mkdir(exist_ok=True, parents=True)
         if self.out_cfg.save_artifacts:
@@ -205,9 +131,5 @@ class DefaultAnnotationPipeline:
                 self.out_cfg.viz_downsample,
                 self.out_cfg.viz_attributes,
             )
-
-        if self.out_cfg.save_slam_map and slam_output.slam_map is not None:
-            logger.info(f"Saving SLAM map to {artifact_path.slam_map_path}")
-            slam_output.slam_map.save(artifact_path.slam_map_path)
 
         return slam_output

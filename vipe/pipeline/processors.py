@@ -22,7 +22,7 @@ import torch
 
 from vipe.priors.geocalib import GeoCalib
 from vipe.slam.interface import SLAMOutput
-from vipe.streams.base import FrameAttribute, FrameProcessor, FrameData, FrameStream
+from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
@@ -30,93 +30,52 @@ from vipe.utils.misc import unpack_optional
 logger = logging.getLogger(__name__)
 
 
-class IntrinsicEstimationProcessor(FrameProcessor):
-    """Override existing intrinsics with estimated intrinsics."""
+def estimate_geocalib_intrinsics(frame_stream: FrameStream, gap_sec: float = 1.0) -> torch.Tensor:
+    gap_frame = int(gap_sec * frame_stream.fps())
+    gap_frame = min(gap_frame, (len(frame_stream) - 1) // 2)
+    sample_frame_inds = [0, gap_frame, gap_frame * 2]
+    sample_frame_set = set(sample_frame_inds)
 
-    def __init__(self, frame_stream: FrameStream, gap_sec: float = 1.0) -> None:
-        super().__init__()
-        gap_frame = int(gap_sec * frame_stream.fps())
-        gap_frame = min(gap_frame, (len(frame_stream) - 1) // 2)
-        self.sample_frame_inds = [0, gap_frame, gap_frame * 2]
-        self.fov_y = -1.0
-        self.camera_type = CameraType.PINHOLE
+    model = GeoCalib(weights="pinhole").cuda()
+    sample_by_idx = {}
+    for frame_idx, frame in enumerate(frame_stream):
+        if frame_idx in sample_frame_set:
+            sample_by_idx[frame_idx] = frame.rgb.moveaxis(-1, 0)
+        if frame_idx >= sample_frame_inds[-1]:
+            break
 
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes | {FrameAttribute.INTRINSICS}
+    sample_frames = torch.stack([sample_by_idx[i] for i in sample_frame_inds])
+    res = model.calibrate(sample_frames, shared_intrinsics=True)
+    fov_y = res["camera"].vfov[0].item()
 
-    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
-        assert self.fov_y > 0, "FOV not set"
-        frame_height, frame_width = frame.size()
-        fx = fy = frame_height / (2 * np.tan(self.fov_y / 2))
-        frame.intrinsics = torch.as_tensor(
-            [fx, fy, frame_width / 2, frame_height / 2],
-        ).float()
-        frame.camera_type = self.camera_type
-        return frame
+    frame_height, frame_width = frame_stream.frame_size()
+    fx = fy = frame_height / (2 * np.tan(fov_y / 2))
+    return torch.as_tensor([fx, fy, frame_width / 2, frame_height / 2]).float().cuda()
 
 
-class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
-    def __init__(
-        self,
-        frame_stream: FrameStream,
-        gap_sec: float = 1.0,
-        camera_type: CameraType = CameraType.PINHOLE,
-    ) -> None:
-        super().__init__(frame_stream, gap_sec)
-        assert camera_type == CameraType.PINHOLE, "Only pinhole camera intrinsics are supported"
-
-        model = GeoCalib(weights="pinhole").cuda()
-        sample_frame_set = set(self.sample_frame_inds)
-        sample_by_idx = {}
-        for frame_idx, frame in enumerate(frame_stream):
-            if frame_idx in sample_frame_set:
-                sample_by_idx[frame_idx] = frame.rgb.moveaxis(-1, 0)
-            if frame_idx >= self.sample_frame_inds[-1]:
-                break
-        sample_frames = torch.stack([sample_by_idx[i] for i in self.sample_frame_inds])
-        res = model.calibrate(
-            sample_frames,
-            shared_intrinsics=True,
-        )
-
-        self.fov_y = res["camera"].vfov[0].item()
-        self.camera_type = camera_type
-
-
-class DAV3DepthProcessor(FrameProcessor):
+class DAV3DepthStream(FrameStream):
     """
     Use DAV3 to estimate depth for each frame.
     Depth is conditioned on camera poses and intrinsics from SLAM.
 
     Depth is estimated in a sliding-window manner, and overlapped frames are linearly averaged to sharp transitions.
-    To create enough parallex to improve estimation confidence, for each window we optionally also include
-    neighboring keyframes, and their secondary neighboring keyframes.
+    To create enough parallax to improve estimation confidence, each window also includes neighboring keyframes.
     """
 
     def __init__(
         self,
+        frame_stream: FrameStream,
         slam_output: SLAMOutput,
-        model: str = "mvd_dav3",
         window_size: int = 10,                  # Practically this should be as large as possible if memory permits.
         overlap_size: int = 3,
-        secondary_keyframe: bool = False,       # This is found to cause jittering for some scenes due to abrupt context changes.
     ):
         super().__init__()
+        self.frame_stream = frame_stream
         self.slam_output = slam_output
-        self.model = model
         self.window_size = window_size
         self.overlap_size = overlap_size
-        self.secondary_keyframe = secondary_keyframe
 
         self.keyframes_inds = unpack_optional(self.slam_output.slam_map).dense_disp_frame_inds
-        self.keyframes_data: list[FrameData] = []
-        self.n_frames = 0
-
-        # Need two passes for this iterator to work.
-        self.n_passes_required = 2
-
-        if self.model != "mvd_dav3":
-            raise ValueError(f"Only mvd_dav3 is supported, got {self.model}")
 
         try:
             from depth_anything_3.api import DepthAnything3
@@ -130,11 +89,17 @@ class DAV3DepthProcessor(FrameProcessor):
         self.dav3_api = DepthAnything3.from_pretrained("depth-anything/DA3-GIANT")
         self.dav3_api = self.dav3_api.cuda().eval()
 
-    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
-        return previous_attributes | {FrameAttribute.METRIC_DEPTH, FrameAttribute.DEPTH_CONFIDENCE}
+    def frame_size(self) -> tuple[int, int]:
+        return self.frame_stream.frame_size()
 
-    def __call__(self, frame_idx: int, frame: FrameData) -> FrameData:
-        raise NotImplementedError("DAV3DepthProcessor should not be called directly.")
+    def fps(self) -> float:
+        return self.frame_stream.fps()
+
+    def name(self) -> str:
+        return self.frame_stream.name()
+
+    def __len__(self) -> int:
+        return len(self.frame_stream)
 
     def _probe_keyframe_indices(self, frame_idx: int) -> list[int]:
         inds: list[int] = []
@@ -142,13 +107,6 @@ class DAV3DepthProcessor(FrameProcessor):
         inds.append(left_idx)
         if frame_idx < self.keyframes_inds[-1]:
             inds.append(left_idx + 1)
-        # Pick the farthest secondary keyframe from the left keyframe.
-        if self.secondary_keyframe:
-            slam_graph = unpack_optional(self.slam_output.slam_map).backend_graph
-            if slam_graph is not None:
-                matching_secondary_j = slam_graph[slam_graph[:, 0] == left_idx, 1].tolist()
-                picked_sj_idx = np.argmax([abs(self.keyframes_inds[j] - frame_idx) for j in matching_secondary_j])
-                inds.append(matching_secondary_j[picked_sj_idx])
         return inds
 
     def record_keyframes(self, previous_iterator: Iterator[FrameData]) -> Iterator[FrameData]:
@@ -227,10 +185,9 @@ class DAV3DepthProcessor(FrameProcessor):
 
         assert len(current_sliding_window) == 0, "Current sliding window should be empty"
 
-    def update_iterator(self, previous_iterator: Iterator[FrameData], pass_idx: int) -> Iterator[FrameData]:
-        if pass_idx == 0:
-            yield from self.record_keyframes(previous_iterator)
-        elif pass_idx == 1:
-            yield from self.estimate_depth_sliding_window(previous_iterator)
-        else:
-            raise ValueError(f"Invalid pass index: {pass_idx}")
+    def __iter__(self) -> Iterator[FrameData]:
+        self.keyframes_data: list[FrameData] = []
+        self.n_frames = 0
+        for _ in pbar(self.record_keyframes(iter(self.frame_stream)), total=len(self), desc="Collecting DAV3 keyframes"):
+            pass
+        yield from self.estimate_depth_sliding_window(iter(self.frame_stream))

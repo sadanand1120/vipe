@@ -30,7 +30,7 @@ import OpenEXR
 import torch
 
 from vipe.ext.lietorch import SE3
-from vipe.streams.base import FrameAttribute, FrameData, FrameStream
+from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.geometry import se3_matrix_to_se3
 from vipe.utils.logging import pbar
@@ -186,7 +186,6 @@ class ArtifactFrameStream(FrameStream):
         finally:
             rgb_reader.close()
 
-        self._attributes: set[FrameAttribute] = set()
         self.pose_by_idx: dict[int, SE3] = {}
         self.intrinsics_by_idx: dict[int, torch.Tensor] = {}
         self.camera_type_by_idx: dict[int, CameraType] = {}
@@ -194,7 +193,6 @@ class ArtifactFrameStream(FrameStream):
         if artifact_path.pose_path.exists():
             pose_inds, pose_data = read_pose_artifacts(artifact_path.pose_path)
             self.pose_by_idx = {int(frame_idx): pose_data[list_idx] for list_idx, frame_idx in enumerate(pose_inds.tolist())}
-            self._attributes.add(FrameAttribute.POSE)
 
         if artifact_path.intrinsics_path.exists():
             intr_inds, intrinsics_data, camera_types = read_intrinsics_artifacts(
@@ -209,10 +207,6 @@ class ArtifactFrameStream(FrameStream):
                 int(frame_idx): camera_types[list_idx]
                 for list_idx, frame_idx in enumerate(intr_inds.tolist())
             }
-            self._attributes.update({FrameAttribute.INTRINSICS, FrameAttribute.CAMERA_TYPE})
-
-        if artifact_path.depth_path.exists():
-            self._attributes.add(FrameAttribute.METRIC_DEPTH)
 
     def frame_size(self) -> tuple[int, int]:
         return self._frame_size
@@ -225,9 +219,6 @@ class ArtifactFrameStream(FrameStream):
 
     def __len__(self) -> int:
         return self._len
-
-    def attributes(self) -> set[FrameAttribute]:
-        return self._attributes
 
     def __iter__(self):
         depth_iterator = read_depth_artifacts(self.artifact_path.depth_path) if self.artifact_path.depth_path.exists() else None

@@ -34,8 +34,6 @@ class SLAMMap:
     dense_disp_packinfo: torch.Tensor
     # Actual frame indices of the dense_disp_xyz (assert sorted)
     dense_disp_frame_inds: list[int]
-    # (Q, 2) keyframe graphs (index into dense_disp_frame_inds)
-    backend_graph: torch.Tensor | None = None
 
     def scale(self, factor: float):
         self.dense_disp_xyz *= factor
@@ -77,14 +75,12 @@ class SLAMMap:
         rgb: torch.Tensor,
         mask: torch.Tensor,
         tstamps: torch.Tensor,
-        backend_graph: torch.Tensor | None = None,
     ):
         """
         xyz: (N, H, W, 3)
         rgb: (N, H, W, 3)
         mask: (N, H, W)
         tstamps: (N,)
-        backend_graph: (Q, 2)
         """
         assert torch.all(tstamps[1:] > tstamps[:-1]), "Timestamps should be sorted."
         N, H, W, C = xyz.shape
@@ -98,7 +94,6 @@ class SLAMMap:
             dense_disp_rgb=rgb,
             dense_disp_packinfo=packinfo,
             dense_disp_frame_inds=tstamps.tolist(),
-            backend_graph=backend_graph,
         )
 
     def get_dense_disp_pcd(self, keyframe_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
