@@ -71,7 +71,7 @@ This corresponds to [fullexplain.md Chunk 1.1](./fullexplain.md#chunk-1-1). This
 Toy CLI:
 
 ```bash
-python run.py streams.base_path=/toy/scene0000_00/color streams.fps=2 pipeline.output.path=/toy/out pipeline.output.save_artifacts=true pipeline.output.save_viz=true pipeline.output.pcd_fusion_mode=tsdf
+python run.py streams.base_path=/toy/scene0000_00/color streams.fps=2 pipeline.output.path=/toy/out pipeline.output.save_artifacts=true pipeline.output.pcd_fusion_mode=tsdf
 ```
 
 Hydra produces:
@@ -464,10 +464,10 @@ keyframe_tstamps = [0,1,2,3,4,5,6,8,9]
 K = 9
 ```
 
-The first backend call:
+The backend call:
 
 ```python
-backend.run(7)
+backend.run(backend_iters)  # backend_iters = 31
 ```
 
 builds a fresh non-incremental graph. A toy subset of accepted bidirectional edges could be:
@@ -481,23 +481,11 @@ graph_edges = [
 ]
 ```
 
-`update_batch(..., steps=7)` updates all keyframe poses/disparities. Toy value for raw frame 8:
+`update_batch(..., steps=31)` updates all keyframe poses/disparities. Toy value for raw frame 8:
 
 ```text
 before backend: world-to-camera translation = [-0.82, 0.01, 0.00]
-after backend pass 1: world-to-camera translation = [-0.805, 0.003, 0.00]
-```
-
-The second backend call:
-
-```python
-backend.run(backend_iters)  # backend_iters = 24
-```
-
-builds another fresh non-incremental graph and runs a longer solve. Toy value:
-
-```text
-after backend pass 2: world-to-camera translation = [-0.800, 0.000, 0.00]
+after backend: world-to-camera translation = [-0.800, 0.000, 0.00]
 ```
 
 At the end of chunk 3.1:
@@ -716,9 +704,9 @@ Because this toy has one last window, all 10 frames are yielded and `trailing_de
 After chunk 5.2, each frame has all data needed for persistence: RGB, pose, intrinsics, camera type, final metric depth, and confidence. Chunk 5.3 consumes this final stream once to write artifacts and build the selected point cloud.
 
 <a id="chunk-5-3-toy"></a>
-## Chunk 5.3 Toy: Artifact Saving, PCD Fusion, And Visualization
+## Chunk 5.3 Toy: Artifact Saving And PCD Fusion
 
-This corresponds to [fullexplain.md Chunk 5.3](./fullexplain.md#chunk-5-3). This is the persistence part of Stage 5. The input is the final stream from chunk 5.2. The output is saved files under the output directory: RGB video, pose npz, intrinsics npz, depth zip, one PCD file, and visualization video.
+This corresponds to [fullexplain.md Chunk 5.3](./fullexplain.md#chunk-5-3). This is the persistence part of Stage 5. The input is the final stream from chunk 5.2. The output is saved files under the output directory: RGB video, pose npz, intrinsics npz, depth zip, and one PCD file.
 
 ### Backprojection Formula
 
@@ -844,4 +832,3 @@ Final toy outputs:
 | `intrinsics/color.npz` | `inds=[0..9]`, `data.shape=(10,4)` |
 | `depth/color.zip` | 10 EXR depth maps, each 24x32 |
 | `pcd/color_tsdf.ply` | sampled point cloud from TSDF mesh |
-| `vipe/color_vis.mp4` | RGB/depth/internal-SLAM-map projection video |

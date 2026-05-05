@@ -188,10 +188,7 @@ class SLAMSystem:
 
             self.frontend.run()
 
-        # Run the backend to perform a global BA over the keyframes.
-        self.backend.run(7)
-
-        # Run backend again with a new graph and cleared GRU states.
+        # Run a global BA over the keyframes.
         self.backend.run(self.config.backend_iters)
 
         # Infill poses and attributes for non-keyframe frames.

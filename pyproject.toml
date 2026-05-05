@@ -31,7 +31,6 @@ dependencies = [
     "OpenEXR",
     "kornia",
     "scipy",
-    "Pillow",
     "open3d",
 ]
 

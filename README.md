@@ -28,7 +28,6 @@ python run.py \
   streams.fps=30 \
   pipeline.output.path=/path/to/output \
   pipeline.output.save_artifacts=true \
-  pipeline.output.save_viz=false \
   pipeline.output.pcd_fusion_mode=tsdf
 ```
 
@@ -37,7 +36,6 @@ Useful output knobs:
 - `pipeline.output.pcd_fusion_mode=backproject`: save `pcd/color_backproject.ply`.
 - `pipeline.output.pcd_fusion_mode=tsdf`: save `pcd/color_tsdf.ply`.
 - `pipeline.output.pcd_max_points=8000000`: cap saved point cloud points.
-- `pipeline.output.save_viz=true`: save the projection/depth visualization video.
 
 ## ScanNet Benchmark
 
@@ -49,8 +47,7 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   --raw-root /robodata/smodak/datasets/scannet_v2/scans \
   --max-frames -1 \
   --num-fusion-workers 16 \
-  streams.fps=30 \
-  pipeline.output.save_viz=false
+  streams.fps=30
 ```
 
 ## Notes

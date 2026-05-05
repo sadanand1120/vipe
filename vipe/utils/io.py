@@ -21,23 +21,44 @@ import zipfile
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Any
 
 import imageio
 import Imath
 import numpy as np
 import OpenEXR
-import torch
 
-from vipe.ext.lietorch.groups import SE3
 from vipe.streams.base import FrameData, FrameStream
-from vipe.utils.cameras import CameraType
 from vipe.utils.geometry import se3_matrix_to_se3
 from vipe.utils.logging import pbar
-from vipe.utils.visualization import VideoWriter
 
 
 logger = logging.getLogger(__name__)
+
+
+class VideoWriter:
+    def __init__(self, path: Path, fps: float):
+        self.path = path
+        self.fps = fps
+        self.vw: Any = None
+
+    def __enter__(self):
+        return self
+
+    def write(self, frame: np.ndarray):
+        if self.vw is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.vw = imageio.get_writer(str(self.path), fps=self.fps, codec="libx264", macro_block_size=None)
+
+        if frame.dtype in [np.float32, np.float64]:
+            frame = (frame * 255).astype(np.uint8)
+
+        assert self.vw is not None
+        self.vw.append_data(frame)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.vw is not None:
+            self.vw.close()
 
 
 @dataclass
@@ -69,19 +90,6 @@ class ArtifactPath:
     def intrinsics_path(self) -> Path:
         return self.base_path / "intrinsics" / f"{self.artifact_name}.npz"
 
-    @property
-    def meta_vis_path(self) -> Path:
-        return self.base_path / "vipe" / f"{self.artifact_name}_vis.mp4"
-
-    @property
-    def slam_map_path(self) -> Path:
-        return self.base_path / "vipe" / f"{self.artifact_name}_slam_map.pt"
-
-
-def read_pose_artifacts(npz_file_path: Path) -> tuple[np.ndarray, SE3]:
-    data = np.load(npz_file_path)
-    return data["inds"], se3_matrix_to_se3(data["data"])
-
 
 def read_pose_artifacts_benchmark(npz_file_path: Path) -> dict:
     data = np.load(npz_file_path)
@@ -92,117 +100,6 @@ def read_pose_artifacts_benchmark(npz_file_path: Path) -> dict:
         keyframe_ids=data.get("keyframe_ids", None),
         frame_num=len(data["inds"]),
     )
-
-
-def read_intrinsics_artifacts(intr_file_path: Path) -> tuple[np.ndarray, torch.Tensor]:
-    data = np.load(intr_file_path)
-    inds, intrinsics = data["inds"], torch.from_numpy(data["data"])
-    return inds, intrinsics
-
-
-def read_rgb_artifacts(rgb_file_path: Path) -> Iterator[tuple[int, torch.Tensor]]:
-    """
-    Read RGB from H264-encoded video.
-    """
-    reader = imageio.get_reader(rgb_file_path, "ffmpeg")
-    for frame_idx, rgb in enumerate(reader):
-        rgb = torch.from_numpy(rgb) / 255.0
-        yield frame_idx, rgb
-
-
-def read_depth_artifacts(zip_file_path: Path) -> Iterator[tuple[int, torch.Tensor]]:
-    """
-    Read metric depth from zipped exr files.
-    """
-    valid_width, valid_height = 0, 0
-    with zipfile.ZipFile(zip_file_path, "r") as z:
-        for file_name in sorted(z.namelist()):
-            frame_idx = int(file_name.split(".")[0])
-            with z.open(file_name) as f:
-                try:
-                    exr = OpenEXR.InputFile(f)
-                except OSError:
-                    # Sometimes EXR loader might fail, we return all nan maps.
-                    logger.warning(f"Failed to load EXR file {zip_file_path}-{file_name}. Returning all nan maps.")
-                    assert valid_width > 0 and valid_height > 0
-                    yield (
-                        frame_idx,
-                        torch.full(
-                            (valid_height, valid_width),
-                            float("nan"),
-                            dtype=torch.float32,
-                        ),
-                    )
-                    continue
-                header = exr.header()
-                dw = header["dataWindow"]
-                valid_width = width = dw.max.x - dw.min.x + 1
-                valid_height = height = dw.max.y - dw.min.y + 1
-                channels = exr.channels(["Z"])
-                depth_data = np.frombuffer(channels[0], dtype=np.float16).reshape((height, width))
-                yield frame_idx, torch.from_numpy(depth_data.copy()).float()
-
-
-class ArtifactFrameStream(FrameStream):
-    def __init__(self, artifact_path: ArtifactPath) -> None:
-        self.artifact_path = artifact_path
-        self._name = artifact_path.artifact_name
-
-        rgb_reader = imageio.get_reader(artifact_path.rgb_path, "ffmpeg")
-        try:
-            first_rgb = rgb_reader.get_data(0)
-            self._frame_size = (first_rgb.shape[0], first_rgb.shape[1])
-            self._fps = float(rgb_reader.get_meta_data()["fps"])
-            self._len = rgb_reader.count_frames()
-        finally:
-            rgb_reader.close()
-
-        self.pose_by_idx: dict[int, SE3] = {}
-        self.intrinsics_by_idx: dict[int, torch.Tensor] = {}
-
-        if artifact_path.pose_path.exists():
-            pose_inds, pose_data = read_pose_artifacts(artifact_path.pose_path)
-            self.pose_by_idx = {int(frame_idx): pose_data[list_idx] for list_idx, frame_idx in enumerate(pose_inds.tolist())}
-
-        if artifact_path.intrinsics_path.exists():
-            intr_inds, intrinsics_data = read_intrinsics_artifacts(artifact_path.intrinsics_path)
-            self.intrinsics_by_idx = {
-                int(frame_idx): intrinsics_data[list_idx]
-                for list_idx, frame_idx in enumerate(intr_inds.tolist())
-            }
-
-    def frame_size(self) -> tuple[int, int]:
-        return self._frame_size
-
-    def name(self) -> str:
-        return self._name
-
-    def fps(self) -> float:
-        return self._fps
-
-    def __len__(self) -> int:
-        return self._len
-
-    def __iter__(self):
-        depth_iterator = read_depth_artifacts(self.artifact_path.depth_path) if self.artifact_path.depth_path.exists() else None
-        next_depth = next(depth_iterator, None) if depth_iterator is not None else None
-
-        for frame_idx, rgb in read_rgb_artifacts(self.artifact_path.rgb_path):
-            metric_depth = None
-            while next_depth is not None and next_depth[0] < frame_idx:
-                next_depth = next(depth_iterator, None)
-            if next_depth is not None and next_depth[0] == frame_idx:
-                metric_depth = next_depth[1]
-                next_depth = next(depth_iterator, None)
-
-            yield FrameData(
-                raw_frame_idx=frame_idx,
-                rgb=rgb,
-                pose=self.pose_by_idx.get(frame_idx),
-                camera_type=CameraType.PINHOLE if frame_idx in self.intrinsics_by_idx else None,
-                intrinsics=self.intrinsics_by_idx.get(frame_idx),
-                metric_depth=metric_depth,
-            )
 
 
 def _backproject_vertices(

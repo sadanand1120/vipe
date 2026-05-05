@@ -31,7 +31,6 @@ from vipe.utils import io
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
 from vipe.utils.misc import unpack_optional
-from vipe.utils.visualization import save_projection_video
 
 
 logger = logging.getLogger(__name__)
@@ -277,16 +276,6 @@ class VipePipeline:
                 pcd_tsdf_voxel_length=self.out_cfg.pcd_tsdf_voxel_length,
                 pcd_tsdf_sdf_trunc=self.out_cfg.pcd_tsdf_sdf_trunc,
                 pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
-            )
-
-        if self.out_cfg.save_viz:
-            viz_stream = io.ArtifactFrameStream(artifact_path) if self.out_cfg.save_artifacts else output_stream
-            save_projection_video(
-                artifact_path.meta_vis_path,
-                viz_stream,
-                slam_output,
-                self.out_cfg.viz_downsample,
-                self.out_cfg.viz_attributes,
             )
 
         return slam_output

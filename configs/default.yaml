@@ -25,7 +25,7 @@ pipeline:
     backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
     backend_radius: 2                    # Local radius for forced backend graph edges.
     backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
-    backend_iters: 24                    # Final global backend BA iteration steps.
+    backend_iters: 31                    # Global backend BA iteration steps.
     init_disp: 1.0                       # Initial disparity value before metric depth is injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     map_filter_thresh: 0.05              # Relative depth-consistency threshold for extracting the SLAM map.
@@ -42,9 +42,6 @@ pipeline:
     pcd_tsdf_voxel_length: 0.02          # TSDF voxel size in meters.
     pcd_tsdf_sdf_trunc: 0.15             # TSDF signed-distance truncation distance in meters.
     pcd_tsdf_depth_trunc: 5.0            # Ignore TSDF depth samples beyond this distance in meters.
-    save_viz: false                      # Save projection/depth visualization video.
-    viz_downsample: 2                    # Downsample factor for visualization rendering.
-    viz_attributes: [["rgb", "depth"], ["pcd", "empty"]] # Visualization panels to render.
 
 hydra:
   output_subdir: null  # Do not create .hydra metadata directories.

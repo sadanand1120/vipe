@@ -15,7 +15,6 @@ python run.py \
   streams.fps=30 \
   pipeline.output.path=/robodata/smodak/repos/vipe/outputs/scene00_dav3tsdf \
   pipeline.output.save_artifacts=true \
-  pipeline.output.save_viz=true \
   pipeline.output.pcd_fusion_mode=tsdf
 ```
 
@@ -34,7 +33,7 @@ flowchart LR
     S1[Stage 1: initialization and stream setup] -->|SharedIntrinsicsFrameStream with one GeoCalib intrinsics tensor| S2[Stage 2: SLAM pass 1 frontend loop]
     S2 -->|keyframe buffer: poses, DROID features, disparities, DAV3 keyframe depth anchors| S3[Stage 3: backend global BA over keyframes]
     S3 -->|refined keyframe poses/disparities in GraphBuffer| S4[Stage 4: SLAM pass 2 pose infill loop]
-    S4 -->|SLAMOutput: pose for every frame, recovered intrinsics, SLAM keyframe map| S5[Stage 5: replay, final DAV3 depth, artifact/PCD/viz writing]
+    S4 -->|SLAMOutput: pose for every frame, recovered intrinsics, SLAM keyframe map| S5[Stage 5: replay, final DAV3 depth, artifact/PCD writing]
 ```
 
 The execution grain is:
@@ -43,9 +42,9 @@ The execution grain is:
 | --- | --- |
 | Stage 1: initialization and stream setup | Creates one `FrameDir`, estimates one shared pinhole intrinsics vector from three sampled frames with GeoCalib, and wraps the original stream with `SharedIntrinsicsFrameStream`. No full-sequence cache or attribute recorder exists. |
 | Stage 2: SLAM pass 1 frontend loop | Loops over frames once, resizes each frame for SLAM, runs DROID motion-filter features on every frame, stores accepted keyframes with DROID feature/context tensors and DAV3 metric depth anchors, and runs incremental frontend BA as keyframes arrive. |
-| Stage 3: backend global BA | Runs twice over the complete pass-1 keyframe set: first with `steps=7`, then with `steps=backend_iters`. Each call builds a fresh non-incremental factor graph and optimizes all keyframes as a sequence-level solve. |
+| Stage 3: backend global BA | Runs once over the complete pass-1 keyframe set with `steps=backend_iters`. It builds one fresh non-incremental factor graph and optimizes all keyframes as a sequence-level solve. |
 | Stage 4: SLAM pass 2 pose infill loop | Loops over every frame again, appends frames in chunks, initializes non-keyframe poses from neighboring keyframes, optimizes those appended poses motion-only, returns one pose per original frame, and extracts the internal low-resolution keyframe map. |
-| Stage 5: final DAV3 depth and outputs | Re-reads original-resolution frames, assigns final SLAM pose/intrinsics, runs final DAV3 depth in a two-pass stream, writes artifacts, writes exactly one configured PCD, and optionally writes `color_vis.mp4`. |
+| Stage 5: final DAV3 depth and outputs | Re-reads original-resolution frames, assigns final SLAM pose/intrinsics, runs final DAV3 depth in a two-pass stream, writes artifacts, and writes exactly one configured PCD. |
 
 The detailed chunks map to the five stages like this:
 
@@ -55,7 +54,7 @@ The detailed chunks map to the five stages like this:
 | Chunks 2.1-2.2 | Stage 2 | Per-frame SLAM pass-1 loop with incremental updates as keyframes arrive. | Optimized frontend keyframe buffer. |
 | Chunk 3.1 | Stage 3 | Sequence-level backend BA over all keyframes, not a per-frame loop. | Refined keyframe poses/disparities in `GraphBuffer`. |
 | Chunk 4.1 | Stage 4 | Per-frame pass-2 loop plus chunked infill solves. | `SLAMOutput` containing full-frame trajectory, recovered intrinsics, and `SLAMMap`. |
-| Chunks 5.1-5.3 | Stage 5 | Re-reads original frames; DAV3 uses two stream passes; artifact writing loops once over final yielded frames. | Saved artifacts, one PCD, optional `color_vis.mp4`. |
+| Chunks 5.1-5.3 | Stage 5 | Re-reads original frames; DAV3 uses two stream passes; artifact writing loops once over final yielded frames. | Saved artifacts and one PCD. |
 
 <a id="chunk-1-1"></a>
 ## Chunk 1.1: Shell, Hydra Config, And Runtime Construction
@@ -102,7 +101,6 @@ streams.base_path=/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/col
 streams.fps=30
 pipeline.output.path=/robodata/smodak/repos/vipe/outputs/scene00_dav3tsdf
 pipeline.output.save_artifacts=true
-pipeline.output.save_viz=true
 pipeline.output.pcd_fusion_mode=tsdf
 ```
 
@@ -165,7 +163,6 @@ logger.info(f"Finished processing {frame_stream.name()}")
 | Branch | Current command outcome |
 | --- | --- |
 | `save_artifacts` | `true`, so artifacts are written. |
-| `save_viz` | `true`, so the visualization video is written. |
 | `pcd_fusion_mode` | `tsdf` for the command shown. Default is `backproject` if not overridden. |
 
 ### Toy Trace
@@ -1156,16 +1153,14 @@ Stage context: this is Stage 3. It is a sequence-level solve over the pass-1 key
 
 ```mermaid
 flowchart TD
-    A[Pass 1 complete with keyframes] --> B[backend.run steps=7]
+    A[Pass 1 complete with keyframes] --> B[backend.run steps=backend_iters]
     B --> C[Build non-incremental FactorGraph]
     C --> D[Add backend proximity factors]
     D --> E{Any graph edges?}
     E -->|yes| F[update_batch with AltCorrBlock]
     E -->|no| G[Use sensor depth for single keyframe]
     F --> H[Dense BA over all keyframes]
-    H --> I[backend.run steps=backend_iters]
-    I --> J[Another global BA pass]
-    J --> K[Refined keyframe poses and disparities in GraphBuffer]
+    H --> K[Refined keyframe poses and disparities in GraphBuffer]
 ```
 
 ### Backend Graph Creation
@@ -1173,14 +1168,13 @@ flowchart TD
 After pass 1:
 
 ```python
-self.backend.run(7)
 self.backend.run(self.config.backend_iters)
 ```
 
 Default:
 
 ```text
-backend_iters = 24
+backend_iters = 31
 ```
 
 `SLAMBackend.run` creates a fresh non-incremental `FactorGraph`:
@@ -1766,17 +1760,16 @@ Default normal window yields `10 - 3 = 7` frames and keeps 3 trailing frames for
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-2-toy) for the matching numeric example for this chunk.
 
 <a id="chunk-5-3"></a>
-## Chunk 5.3: Artifact Saving, PCD Fusion, And Visualization
+## Chunk 5.3: Artifact Saving And PCD Fusion
 
 Source files:
 
 | File | Role |
 | --- | --- |
-| `vipe/pipeline.py` | Calls `io.save_artifacts` and `save_projection_video` |
+| `vipe/pipeline.py` | Calls `io.save_artifacts` |
 | `vipe/utils/io.py` | Saves RGB, pose, depth, intrinsics, and one selected PCD |
-| `vipe/utils/visualization.py` | Projection/depth/SLAM-map visualization video |
 
-Stage context: this is the persistence part of Stage 5. It consumes the final stream once as frames are yielded from DAV3 depth pass 1. It writes frame-wise artifacts, updates exactly one configured PCD fusion mode online during the loop, and then performs the final PCD extraction/write step. If `save_viz=true`, it writes the saved projection video from artifacts and the internal SLAM map.
+Stage context: this is the persistence part of Stage 5. It consumes the final stream once as frames are yielded from DAV3 depth pass 1. It writes frame-wise artifacts, updates exactly one configured PCD fusion mode online during the loop, and then performs the final PCD extraction/write step.
 
 ### Diagram
 
@@ -1797,10 +1790,8 @@ flowchart TD
     M --> O[Extract TSDF mesh and sample max_points]
     O --> P[Write color_tsdf.ply]
     C --> Q[Write pose npz and intrinsics npz]
-    D --> R{save_viz?}
-    Q --> R
-    R -->|yes| S[save_projection_video]
-    R -->|no| T[Done]
+    D --> T[Done]
+    Q --> T
 ```
 
 ### Artifact Paths
@@ -1833,7 +1824,6 @@ Artifacts are:
 | Intrinsics npz | `outputs/scene00_dav3tsdf/intrinsics/color.npz` |
 | Backproject PCD | `outputs/scene00_dav3tsdf/pcd/color_backproject.ply` |
 | TSDF PCD | `outputs/scene00_dav3tsdf/pcd/color_tsdf.ply` |
-| ViPE viz video | `outputs/scene00_dav3tsdf/vipe/color_vis.mp4` |
 
 Only one PCD is written per run, based on `pcd_fusion_mode`.
 
@@ -2051,35 +2041,6 @@ o3d.io.write_point_cloud(str(out_path.tsdf_pcd_path), pcd, write_ascii=False)
 
 So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled points on the extracted TSDF mesh. The requested sample count is `max_points`, default `8,000,000`.
 
-### Visualization Video
-
-After artifact saving, because `save_viz=true`, pipeline calls:
-
-```python
-viz_stream = io.ArtifactFrameStream(artifact_path) if save_artifacts else output_stream
-save_projection_video(artifact_path.meta_vis_path, viz_stream, slam_output, ...)
-```
-
-Because artifacts were saved, visualization re-reads saved artifacts from disk through `ArtifactFrameStream`.
-
-The default visualization panels are:
-
-```yaml
-viz_attributes: [["rgb", "depth"], ["pcd", "empty"]]
-```
-
-`save_projection_video` writes a grid where:
-
-| Panel | Data source |
-| --- | --- |
-| `rgb` | saved RGB mp4 |
-| `depth` | saved final DAV3 depth zip, displayed as reciprocal depth color map |
-| `pcd` | internal low-res `slam_output.slam_map` projected into each frame |
-| `empty` | black placeholder panel labeled `N/A` |
-| `rectified` | optional RGB rectification panel if configured |
-
-Important: the `pcd` visualization panel does not project `color_tsdf.ply` or `color_backproject.ply`. It projects the internal SLAM keyframe map.
-
 ### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-3-toy) for the matching numeric example for this chunk.
@@ -2098,7 +2059,6 @@ The end-to-end toy sequence diagram and final toy output table are in [fullexpla
 | SLAM keyframe depth anchor | DAV3 `DA3METRIC-LARGE` | DAV3 metric depth regularizes keyframe disparities. |
 | Final dense depth | DAV3 `DA3-GIANT` | Final dense depth comes from DAV3 posed multi-frame inference. |
 | `save_artifacts` | `true` in your command | RGB/pose/depth/intrinsics/PCD artifacts are written. |
-| `save_viz` | `true` in your command | `vipe/color_vis.mp4` is written. |
 | `pcd_fusion_mode` | `tsdf` in your command | `pcd/color_tsdf.ply` is written, not `color_backproject.ply`. |
 
 ## Practical Interpretation Of The Final Results
@@ -2110,7 +2070,6 @@ The end-to-end toy sequence diagram and final toy output table are in [fullexpla
 | `depth/color.zip` | Final DAV3 multiview metric depth conditioned on ViPE poses and intrinsics. |
 | `pcd/color_tsdf.ply` | Surface point cloud sampled from TSDF fusion of final DAV3 depth plus ViPE poses/intrinsics. |
 | `pcd/color_backproject.ply` | Only produced if `pcd_fusion_mode=backproject`; direct sampled pixel backprojection of final DAV3 depth plus ViPE poses/intrinsics. |
-| `vipe/color_vis.mp4` | Diagnostic visualization using final saved artifacts plus the internal low-res SLAM map. |
 
 The key computational distinction is:
 
