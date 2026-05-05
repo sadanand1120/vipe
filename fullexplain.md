@@ -56,8 +56,10 @@ The detailed chunks map to the five stages like this:
 | Chunk 4.1 | Stage 4 | Per-frame pass-2 loop plus chunked infill solves. | `SLAMOutput` containing full-frame trajectory, recovered intrinsics, and `SLAMMap`. |
 | Chunks 5.1-5.3 | Stage 5 | Re-reads original frames; DAV3 uses two stream passes; artifact writing loops once over final yielded frames. | Saved artifacts and one PCD. |
 
+## Stage 1: Initialization And Stream Setup
+
 <a id="chunk-1-1"></a>
-## Chunk 1.1: Shell, Hydra Config, And Runtime Construction
+### Chunk 1.1: Shell, Hydra Config, And Runtime Construction
 
 Source files:
 
@@ -70,7 +72,7 @@ Source files:
 
 Stage context: this is the sequence-once setup part of Stage 1. It constructs config-backed Python objects only. It does not read the whole image sequence, does not run GeoCalib yet, and does not run SLAM. The handoff is one `FrameDir` source plus one `VipePipeline`.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -86,7 +88,7 @@ flowchart TD
     I --> J
 ```
 
-### Computation
+#### Computation
 
 `run.py` is decorated with:
 
@@ -158,19 +160,19 @@ pipeline.run(frame_stream)
 logger.info(f"Finished processing {frame_stream.name()}")
 ```
 
-### Branches
+#### Branches
 
 | Branch | Current command outcome |
 | --- | --- |
 | `save_artifacts` | `true`, so artifacts are written. |
 | `pcd_fusion_mode` | `tsdf` for the command shown. Default is `backproject` if not overridden. |
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-1-toy) for the matching numeric example for this chunk.
 
 <a id="chunk-1-2"></a>
-## Chunk 1.2: Frame Directory Source And Frame Ordering
+### Chunk 1.2: Frame Directory Source And Frame Ordering
 
 Source files:
 
@@ -181,7 +183,7 @@ Source files:
 
 Stage context: this is the frame-source part of Stage 1. The file list and image size are computed once in `FrameDir.__init__`. Actual pixel tensors are produced lazily each time the stream is iterated, so later stages can re-read the same directory without caching a full frame list in memory.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -200,7 +202,7 @@ flowchart TD
     L --> M[FrameData(raw_frame_idx, rgb)]
 ```
 
-### Computation
+#### Computation
 
 `run.py` calls:
 
@@ -282,7 +284,7 @@ FrameData(
 )
 ```
 
-### Branches
+#### Branches
 
 | Branch | Behavior |
 | --- | --- |
@@ -290,12 +292,12 @@ FrameData(
 | `frame_skip > 1` | Reads every `frame_skip`-th image and divides FPS by `frame_skip`. |
 | Image read fails | Raises `ValueError`. |
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-2-toy) for the matching numeric example for this chunk.
 
 <a id="chunk-1-3"></a>
-## Chunk 1.3: GeoCalib Intrinsics And Shared Intrinsics Stream
+### Chunk 1.3: GeoCalib Intrinsics And Shared Intrinsics Stream
 
 Source files:
 
@@ -306,7 +308,7 @@ Source files:
 
 Stage context: this completes Stage 1. GeoCalib samples three frames once, estimates one shared vertical FOV, converts that FOV into one raw-resolution pinhole intrinsics tensor, and wraps the original `FrameDir` with `SharedIntrinsicsFrameStream`. The one-time handoff to Stage 2 is a lazy stream whose every yielded frame receives the same intrinsics tensor and `CameraType.PINHOLE`.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -319,7 +321,7 @@ flowchart TD
     G --> H[SLAM receives frames with intrinsics and PINHOLE camera type]
 ```
 
-### Pipeline Construction
+#### Pipeline Construction
 
 `VipePipeline.run(frame_stream)` starts by creating the artifact path and computing intrinsics:
 
@@ -342,7 +344,7 @@ for frame in self.stream:
 
 So if later code iterates `init_stream` twice, the original directory is read twice and the same shared intrinsics tensor is attached twice. In the current standalone path, SLAM consumes `init_stream`, and Stage 5 later re-reads the original `FrameDir` through `SLAMOutputFrameStream`.
 
-### GeoCalib Intrinsics Computation
+#### GeoCalib Intrinsics Computation
 
 `estimate_geocalib_intrinsics(frame_stream, gap_sec=1.0)` computes sample indices:
 
@@ -431,7 +433,7 @@ intrinsics = torch.as_tensor([fx, fy, frame_width / 2, frame_height / 2]).float(
 
 Important: this code uses image height to compute both `fx` and `fy` from vertical FOV. `cx` and `cy` are image center coordinates.
 
-### Stream Handoff To SLAM
+#### Stream Handoff To SLAM
 
 `SharedIntrinsicsFrameStream` preserves the original stream metadata:
 
@@ -451,12 +453,85 @@ frame.camera_type = CameraType.PINHOLE
 
 SLAM then performs its own resizing in Stage 2. That separation matters: GeoCalib intrinsics are computed at the raw frame size; SLAM scales and crops both RGB and intrinsics afterward.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-1-3-toy) for the matching numeric example for this chunk.
 
+## Stage 2: SLAM Pass 1 Frontend Loop
+
+### High-Level Pseudocode
+
+```python
+def stage_2_slam_pass_1_frontend(shared_intrinsics_stream):
+    resizer = StandardResizeFrameProcessor()
+    slam_stream = ResizedFrameStream(shared_intrinsics_stream, resizer)
+    total_n_frames = len(slam_stream)
+
+    frame_size = slam_stream.frame_size()
+    config.height = frame_size[0]
+    config.width = frame_size[1]
+    config.camera_type = PINHOLE
+
+    droid_net = DroidNet().cuda().eval()
+    buffer = GraphBuffer(height=config.height, width=config.width, ...)
+    motion_filter = MotionFilter(droid_net, thresh=config.filter_thresh)
+    frontend = SLAMFrontend(droid_net, buffer, config)
+    metric_depth_model = DepthAnything3Model()  # DA3METRIC-LARGE keyframe depth anchor
+
+    for frame_idx, frame_data in enumerate(slam_stream):
+        images = frame_data.rgb.permute(2, 0, 1)[None]  # BCHW
+
+        should_add_keyframe = motion_filter.check(images)
+        is_last_frame = frame_idx == total_n_frames - 1
+
+        if should_add_keyframe or is_last_frame:
+            kf_idx = buffer.n_frames
+            buffer.tstamp[kf_idx] = frame_idx
+            buffer.images[kf_idx] = images[0]
+            buffer.fmaps[kf_idx] = droid_net.encode_features(images)[0]
+            net, inp = droid_net.encode_context(images)
+            buffer.nets[kf_idx], buffer.inps[kf_idx] = net[0], inp[0]
+
+            if kf_idx == 0:
+                buffer.intrinsics = frame_data.intrinsics
+
+            buffer.n_frames += 1
+            buffer.update_disps_sens(metric_depth_model, frame_idx=kf_idx)
+
+        if not frontend.is_initialized and buffer.n_frames == config.warmup:
+            frontend.t1 = buffer.n_frames
+            frontend.graph.add_neighborhood_factors(0, frontend.t1, r=1 if config.seq_init else 3)
+            for _ in range(8):
+                frontend.graph.update(t0=1, use_inactive=True)
+
+            if not config.seq_init:
+                frontend.graph.add_proximity_factors(...)
+                for _ in range(8):
+                    frontend.graph.update(t0=1, use_inactive=True)
+
+            frontend.initialize_next_pose_and_disparity()
+            frontend.is_initialized = True
+
+        elif frontend.is_initialized and frontend.t1 < buffer.n_frames:
+            frontend.graph.rm_factors(frontend.graph.age > frontend.max_age, store=True)
+            frontend.graph.add_proximity_factors(...)
+
+            for _ in range(frontend.iters1):
+                frontend.graph.update(use_inactive=True)
+
+            if second_newest_keyframe_is_too_close():
+                frontend.graph.rm_second_newest_keyframe(...)
+            else:
+                for _ in range(frontend.iters2):
+                    frontend.graph.update(use_inactive=True)
+
+            frontend.initialize_next_pose_and_disparity()
+
+    return buffer  # keyframe poses/disparities/features/DAV3 depth anchors for Stage 3
+```
+
 <a id="chunk-2-1"></a>
-## Chunk 2.1: SLAM Standard Resize, Graph Buffer, And Model Setup
+### Chunk 2.1: SLAM Standard Resize, Graph Buffer, And Model Setup
 
 Source files:
 
@@ -469,7 +544,7 @@ Source files:
 
 Stage context: this is the sequence-once setup for Stage 2. It wraps `SharedIntrinsicsFrameStream` in the SLAM resize stream, computes the resized SLAM frame size, builds the DROID network, allocates the keyframe `GraphBuffer`, and loads the DAV3 metric-depth model used only for keyframe scale anchors. The handoff is an empty but fully allocated SLAM state ready for the pass-1 frame loop.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -487,7 +562,7 @@ flowchart TD
     F --> F7[DAV3 metric depth model for keyframes]
 ```
 
-### Standard Resize And Crop
+#### Standard Resize And Crop
 
 SLAM never works at the original frame size directly. It wraps the shared-intrinsics stream with:
 
@@ -542,7 +617,7 @@ frame_data = frame_data.crop(top=crop_top, bottom=crop_bottom, left=crop_left, r
 
 The resized dimensions must be divisible by 8 because DROID features and disparities live at `1/8` resolution.
 
-### GraphBuffer State
+#### GraphBuffer State
 
 After resize, `SLAMSystem.run` sets config values:
 
@@ -582,7 +657,7 @@ camera_type = PINHOLE
 
 `disps` is initialized to `init_disp`, default `1.0`. That corresponds to initial depth `1 / 1.0 = 1.0 m`.
 
-### DROID Network Setup
+#### DROID Network Setup
 
 `DroidNet()` contains:
 
@@ -600,7 +675,7 @@ ckpt_path = Path(torch.hub.get_dir()) / "droid_slam" / "droid.pth"
 
 If missing, it downloads the DROID checkpoint, strips `module.` prefixes, adapts the 4-channel original output heads down to 2 channels, loads weights, and sets eval mode.
 
-### Keyframe DAV3 Metric Depth Model
+#### Keyframe DAV3 Metric Depth Model
 
 `SLAMSystem._build_components` always creates:
 
@@ -616,12 +691,12 @@ DepthAnything3.from_pretrained("depth-anything/DA3METRIC-LARGE")
 
 This keyframe model is separate from the final post-processing multiview DAV3 model. It is used to anchor SLAM keyframe inverse depths during bundle adjustment.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-2-1-toy) for the matching numeric example for this chunk.
 
 <a id="chunk-2-2"></a>
-## Chunk 2.2: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
+### Chunk 2.2: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
 
 Source files:
 
@@ -637,7 +712,7 @@ Source files:
 
 Stage context: this is the per-frame loop of Stage 2. It consumes the shared-intrinsics stream once at SLAM resolution. Every frame is converted to BCHW and runs the motion filter. The motion filter computes DROID features for every frame for keyframe selection, while accepted keyframes are stored in `GraphBuffer` with their own DROID feature/context tensors plus DAV3 keyframe depth anchors. Frontend BA runs incrementally as keyframes arrive. The handoff to Stage 3 is the keyframe buffer with frontend-optimized poses and disparities.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -661,7 +736,7 @@ flowchart TD
     O -->|distance >= keyframe_thresh| Q[Keep keyframe]
 ```
 
-### Per-Frame BCHW Conversion
+#### Per-Frame BCHW Conversion
 
 Each pass-1 iteration receives one `FrameData` from:
 
@@ -686,7 +761,7 @@ The batch dimension is `1` because this runtime path has one camera and one fram
 
 This helper only changes tensor layout and adds a batch dimension. DROID feature computation happens inside `MotionFilter.check(images)` for every frame and inside `_store_buffer_frame(...)` for each accepted keyframe.
 
-### MotionFilter Keyframe Decision
+#### MotionFilter Keyframe Decision
 
 `MotionFilter.check(images)` runs on every frame.
 
@@ -747,7 +822,7 @@ if self.motion_filter.check(images) or frame_idx == total_n_frames - 1:
     is_keyframe = True
 ```
 
-### Keyframe Addition
+#### Keyframe Addition
 
 When a frame is accepted as a keyframe, `_add_frontend_keyframe(...)` runs.
 
@@ -828,7 +903,7 @@ Finally:
 self.buffer.n_frames += 1
 ```
 
-### Frontend Initialization
+#### Frontend Initialization
 
 `self.frontend.run()` is called every frame, but it only acts when enough keyframes are present or a new keyframe arrives after initialization.
 
@@ -872,7 +947,7 @@ Default `warmup=8`.
    self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
    ```
 
-### Frontend Incremental Update
+#### Frontend Incremental Update
 
 After initialization, when a new keyframe exists:
 
@@ -924,7 +999,7 @@ elif self.is_initialized and self.t1 < self.video.n_frames:
    ```
 8. Predict initial pose and disparity for the next possible keyframe.
 
-### Factor Graph Update
+#### Factor Graph Update
 
 `FactorGraph.update` is the central DROID-style learned optimization step.
 
@@ -968,7 +1043,7 @@ For all active graph edges `(i,j)`:
    self.buffer.bundle_adjustment(...)
    ```
 
-### Dense Bundle Adjustment Terms
+#### Dense Bundle Adjustment Terms
 
 `GraphBuffer.bundle_adjustment` builds a `Solver` with two term families in the current reduced path:
 
@@ -1132,12 +1207,80 @@ The solver:
 
 Intrinsics remain the GeoCalib estimate at resized scale during SLAM.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-2-2-toy) for the matching numeric example for this chunk.
 
+## Stage 3: Backend Global BA Over Keyframes
+
+### High-Level Pseudocode
+
+```python
+def stage_3_backend_global_ba(buffer):
+    t = buffer.n_frames  # number of pass-1 keyframes
+
+    graph = FactorGraph(
+        net=droid_net,
+        buffer=buffer,
+        max_factors=16 * t,
+        incremental=False,
+    )
+
+    graph.add_proximity_factors(
+        rad=config.backend_radius,
+        nms=config.backend_nms,
+        thresh=config.backend_thresh,
+        beta=config.beta,
+    )
+
+    if len(graph.ii) == 0:
+        buffer.disps[0] = where(buffer.disps_sens[0] > 0, buffer.disps_sens[0], buffer.disps[0])
+        return buffer
+
+    corr_op = AltCorrBlock(buffer.fmaps[None])
+
+    for step in range(config.backend_iters):
+        coords1, _ = buffer.reproject_dense_disp(graph.ii, graph.jj)
+        motn = build_motion_features(coords1, graph.coords0, graph.target)
+
+        for source_chunk in chunks_by_source_keyframe(graph.ii, chunk_size=8):
+            iis = graph.ii[source_chunk]
+            jjs = graph.jj[source_chunk]
+
+            corr = corr_op(coords1[:, source_chunk], iis, jjs)
+            net, delta, weight, damping, _ = droid_net.update(
+                graph.f_net[:, source_chunk],
+                buffer.inps[iis][None],
+                corr,
+                motn[:, source_chunk],
+                ix=unique_source_inverse_indices(iis),
+            )
+
+            graph.f_net[:, source_chunk] = net
+            graph.target[:, source_chunk] = coords1[:, source_chunk] + delta.float()
+            graph.weight[:, source_chunk] = weight.float()
+            graph.damping[unique(iis)] = damping
+
+        buffer.bundle_adjustment(
+            target=flatten_hw(graph.target),
+            weight=flatten_hw(graph.weight),
+            disp_damping=graph.damping,
+            ii=graph.ii,
+            jj=graph.jj,
+            t0=1,
+            t1=t,
+            n_iters=8,
+            pose_damping=1e-5,
+            pose_ep=1e-2,
+            motion_only=False,
+            verbose=True,
+        )
+
+    return buffer  # same GraphBuffer, globally refined in-place
+```
+
 <a id="chunk-3-1"></a>
-## Chunk 3.1: Backend Global BA Over Keyframes
+### Chunk 3.1: Backend Global BA Over Keyframes
 
 Source files:
 
@@ -1149,7 +1292,7 @@ Source files:
 
 Stage context: this is Stage 3. It is a sequence-level solve over the pass-1 keyframes. It does not loop over raw frames. The handoff into this chunk is the complete keyframe buffer from Stage 2. The handoff out is the same keyframe buffer with globally refined keyframe poses/disparities.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -1163,7 +1306,7 @@ flowchart TD
     H --> K[Refined keyframe poses and disparities in GraphBuffer]
 ```
 
-### Backend Graph Creation
+#### Backend Graph Creation
 
 After pass 1:
 
@@ -1215,7 +1358,7 @@ beta = 0.3
 2. Additional edges whose frame-distance score is below threshold.
 3. Bidirectional pairs for accepted edges.
 
-### Backend Batch Update
+#### Backend Batch Update
 
 If the graph has edges, the backend calls `_iterate`.
 
@@ -1247,12 +1390,76 @@ For each batch step:
 6. Update target coordinates, weights, and damping.
 7. Run dense BA over all keyframes.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-3-1-toy) for the matching numeric example for this chunk.
 
+## Stage 4: SLAM Pass 2 Pose Infill
+
+### High-Level Pseudocode
+
+```python
+def stage_4_slam_pass_2_pose_infill(refined_keyframe_buffer, slam_stream, resizer):
+    inner_filler.start_after_keyframes(refined_keyframe_buffer.n_frames)
+    keyframe_count = refined_keyframe_buffer.n_frames
+    total_n_frames = len(slam_stream)
+
+    for frame_idx, frame_data in enumerate(slam_stream):
+        images = frame_data.rgb.permute(2, 0, 1)[None]  # BCHW
+
+        append_idx = refined_keyframe_buffer.n_frames
+        refined_keyframe_buffer.tstamp[append_idx] = frame_idx
+        refined_keyframe_buffer.images[append_idx] = images[0]
+        refined_keyframe_buffer.fmaps[append_idx] = droid_net.encode_features(images)[0]
+        net, inp = droid_net.encode_context(images)
+        refined_keyframe_buffer.nets[append_idx], refined_keyframe_buffer.inps[append_idx] = net[0], inp[0]
+        refined_keyframe_buffer.n_frames += 1
+
+        is_chunk_ready = refined_keyframe_buffer.n_frames - keyframe_count >= config.infill_chunk_size
+        is_last_frame = frame_idx == total_n_frames - 1
+
+        if is_chunk_ready or is_last_frame:
+            fill_start = keyframe_count
+            fill_end = refined_keyframe_buffer.n_frames
+            fill_inds = arange(fill_start, fill_end)
+
+            for fill_idx in fill_inds:
+                left_kf, right_kf = nearest_keyframes_by_timestamp(fill_idx)
+                refined_keyframe_buffer.poses[fill_idx] = se3_constant_velocity_interpolate(
+                    refined_keyframe_buffer.poses[left_kf],
+                    refined_keyframe_buffer.poses[right_kf],
+                    refined_keyframe_buffer.tstamp[left_kf],
+                    refined_keyframe_buffer.tstamp[right_kf],
+                    refined_keyframe_buffer.tstamp[fill_idx],
+                )
+
+            graph = FactorGraph(droid_net, refined_keyframe_buffer, max_factors=-1, incremental=True)
+            graph.add_factors(left_keyframe_indices(fill_inds), fill_inds)
+            graph.add_factors(right_keyframe_indices(fill_inds), fill_inds)
+
+            for _ in range(10):
+                graph.update(
+                    t0=fill_start,
+                    t1=fill_end,
+                    motion_only=True,  # optimize appended poses, keep dense disparities fixed
+                )
+
+            inner_filler.filled_poses.append(SE3(refined_keyframe_buffer.poses[fill_start:fill_end].clone()))
+            refined_keyframe_buffer.n_frames = keyframe_count  # discard appended frames from keyframe graph
+
+    filled_w2c_poses = inner_filler.get_result().poses
+    slam_map = refined_keyframe_buffer.extract_slam_map(filter_thresh=config.map_filter_thresh)
+    original_intrinsics = resizer.recover_intrinsics(refined_keyframe_buffer.intrinsics)
+
+    return SLAMOutput(
+        trajectory=filled_w2c_poses.inv(),  # camera-to-world pose for every raw frame
+        intrinsics=original_intrinsics,
+        slam_map=slam_map,
+    )
+```
+
 <a id="chunk-4-1"></a>
-## Chunk 4.1: SLAM Pass 2 And Non-Keyframe Pose Infill
+### Chunk 4.1: SLAM Pass 2 And Non-Keyframe Pose Infill
 
 Source files:
 
@@ -1266,7 +1473,7 @@ Source files:
 
 Stage context: this is Stage 4. It loops over the original sequence again; its primary purpose is to produce poses for frames that were not retained as pass-1 keyframes. After that loop, it extracts the internal keyframe map and returns `SLAMOutput`. The handoff into this chunk is the globally refined keyframe buffer from Stage 3. The handoff out is `SLAMOutput`: camera-to-world pose for every original frame, recovered original-resolution intrinsics, and the internal low-resolution `SLAMMap`.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -1288,7 +1495,7 @@ flowchart TD
     O --> P[Return SLAMOutput]
 ```
 
-### Computation
+#### Computation
 
 After backend, SLAM has optimized only keyframes. Non-keyframe poses are filled in pass 2.
 
@@ -1326,7 +1533,7 @@ infill_chunk_size = 16
 
 So for long scenes, it fills in chunks of 16 appended frames. For the toy 10-frame sequence, it fills once at the last frame.
 
-### Pose Initialization Inside `fill_pending_chunk`
+#### Pose Initialization Inside `fill_pending_chunk`
 
 Let:
 
@@ -1363,11 +1570,11 @@ self.video.poses[self.start_idx:total_frames] = m_pose.data
 
 These poses are world-to-camera because `GraphBuffer.poses` stores inverse/camera poses.
 
-### Motion-Only Infill
+#### Motion-Only Infill
 
 Current `InnerFiller.fill_pending_chunk` only optimizes poses for appended non-keyframe frames. It does not update their dense disparities.
 
-### Infill Graph Optimization
+#### Infill Graph Optimization
 
 `InnerFiller.fill_pending_chunk` builds a temporary incremental `FactorGraph`:
 
@@ -1407,7 +1614,7 @@ self.video.n_frames = self.start_idx
 
 Resetting `video.n_frames` discards appended infill frames from the keyframe graph buffer, while preserving the filled poses in `self.filled_poses`.
 
-### Return From SLAM
+#### Return From SLAM
 
 After pass 2:
 
@@ -1495,12 +1702,14 @@ fac_y = 24 / 384 = 0.0625
 original_intrinsics = [20.7846, 20.7846, 16.0, 12.0]
 ```
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-4-1-toy) for the matching numeric example for this chunk.
 
+## Stage 5: Final DAV3 Depth And Outputs
+
 <a id="chunk-5-1"></a>
-## Chunk 5.1: Re-Reading Original Frames And Assigning SLAM Results
+### Chunk 5.1: Re-Reading Original Frames And Assigning SLAM Results
 
 Source files:
 
@@ -1511,7 +1720,7 @@ Source files:
 
 Stage context: this starts Stage 5. `run.py` has already received `SLAMOutput` from Stage 4. The pipeline now re-reads the original frame directory, assigns final camera-to-world poses, assigns recovered raw-resolution SLAM intrinsics, sets the camera type to pinhole, and wraps that posed stream with DAV3 final-depth processing.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -1527,7 +1736,7 @@ flowchart TD
     G --> H[Final output_stream yields pose, intrinsics, metric depth, confidence]
 ```
 
-### Re-Reading Original Frames
+#### Re-Reading Original Frames
 
 After SLAM returns, `VipePipeline.run` builds the final output stream directly:
 
@@ -1561,7 +1770,7 @@ FrameData(
 
 `slam_output.trajectory` is a length-`N` batch of camera-to-world poses. `slam_output.intrinsics` is one recovered original-resolution pinhole intrinsic vector with shape `(4,)`, so the same tensor is assigned to every frame.
 
-### DAV3DepthStream Two-Pass Behavior
+#### DAV3DepthStream Two-Pass Behavior
 
 `DAV3DepthStream` wraps `SLAMOutputFrameStream` and makes two explicit passes over it:
 
@@ -1580,12 +1789,12 @@ This means:
 
 The important consequence is that artifact writing receives original-resolution frames, not the resized SLAM frames. SLAM’s resized/cropped intrinsics are recovered back to original size before assignment, so final DAV3 and final PCD construction operate in the original input image coordinate system.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-1-toy) for the matching numeric example for this chunk.
 
 <a id="chunk-5-2"></a>
-## Chunk 5.2: Final DAV3 Depth For Every Frame
+### Chunk 5.2: Final DAV3 Depth For Every Frame
 
 Source files:
 
@@ -1596,7 +1805,7 @@ Source files:
 
 Stage context: this is the depth-estimation part of Stage 5. It is not a single global DAV3 call over the entire scene. `DAV3DepthStream` makes a first pass to collect keyframe frames needed as context, then makes a second pass that runs posed DAV3-GIANT over sliding windows and yields final original-resolution frames with metric depth and confidence.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -1618,7 +1827,7 @@ flowchart TD
     N --> O[Save trailing frames for next overlap]
 ```
 
-### Processor State
+#### Processor State
 
 Constructor state:
 
@@ -1648,7 +1857,7 @@ This is the final post-SLAM DAV3 depth model. It is different from the SLAM keyf
 | SLAM keyframe inverse-depth anchor | `depth-anything/DA3METRIC-LARGE` |
 | Final depth for every frame | `depth-anything/DA3-GIANT` |
 
-### Pass 0: Record Keyframes
+#### Pass 0: Record Keyframes
 
 `record_keyframes`:
 
@@ -1662,7 +1871,7 @@ for frame_idx, frame in enumerate(previous_iterator):
 
 The first loop inside `DAV3DepthStream.__iter__` consumes these yielded frames only to populate processor state. Artifact writing does not see them yet.
 
-### Pass 1: Sliding Window Depth
+#### Pass 1: Sliding Window Depth
 
 `estimate_depth_sliding_window` maintains:
 
@@ -1723,7 +1932,7 @@ dav3_int = [[fx,0,cx],[0,fy,cy],[0,0,1]]
 
 Important: ViPE frame pose is camera-to-world. DAV3 receives extrinsics as world-to-camera.
 
-### Overlap Blending
+#### Overlap Blending
 
 If the current window has trailing depth from the previous window:
 
@@ -1755,12 +1964,12 @@ n_frames_to_yield = window_size - overlap_size if not is_last_frame else len(cur
 
 Default normal window yields `10 - 3 = 7` frames and keeps 3 trailing frames for the next window. Last window yields everything.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-2-toy) for the matching numeric example for this chunk.
 
 <a id="chunk-5-3"></a>
-## Chunk 5.3: Artifact Saving And PCD Fusion
+### Chunk 5.3: Artifact Saving And PCD Fusion
 
 Source files:
 
@@ -1771,7 +1980,7 @@ Source files:
 
 Stage context: this is the persistence part of Stage 5. It consumes the final stream once as frames are yielded from DAV3 depth pass 1. It writes frame-wise artifacts, updates exactly one configured PCD fusion mode online during the loop, and then performs the final PCD extraction/write step.
 
-### Diagram
+#### Diagram
 
 ```mermaid
 flowchart TD
@@ -1794,7 +2003,7 @@ flowchart TD
     Q --> T
 ```
 
-### Artifact Paths
+#### Artifact Paths
 
 For input base path:
 
@@ -1827,7 +2036,7 @@ Artifacts are:
 
 Only one PCD is written per run, based on `pcd_fusion_mode`.
 
-### `save_artifacts` Streaming Pass
+#### `save_artifacts` Streaming Pass
 
 `save_artifacts` is designed to avoid keeping the whole final sequence in RAM.
 
@@ -1884,7 +2093,7 @@ At the end:
    ```
 4. Write selected PCD.
 
-### Backproject PCD Mode
+#### Backproject PCD Mode
 
 This branch runs when:
 
@@ -1971,7 +2180,7 @@ x float32, y float32, z float32, red uint8, green uint8, blue uint8
 
 At the end, `_write_backproject_pcd` writes the PLY header and copies the temporary body to `pcd/color_backproject.ply`.
 
-### TSDF PCD Mode
+#### TSDF PCD Mode
 
 This branch runs for your shown command:
 
@@ -2041,7 +2250,7 @@ o3d.io.write_point_cloud(str(out_path.tsdf_pcd_path), pcd, write_ascii=False)
 
 So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled points on the extracted TSDF mesh. The requested sample count is `max_points`, default `8,000,000`.
 
-### Toy Trace
+#### Toy Trace
 
 See [fullexplain-toy.md](./fullexplain-toy.md#chunk-5-3-toy) for the matching numeric example for this chunk.
 

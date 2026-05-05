@@ -14,6 +14,7 @@ import numpy as np
 import OpenEXR
 from tqdm import tqdm
 
+from vipe.utils.determinism import seed_everything
 from vipe.utils.misc import sort_image_sequence
 
 
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-frames", type=int, default=-1, help="Maximum frames to evaluate (-1 for all)")
     parser.add_argument("--num-fusion-workers", type=int, default=4, help="TSDF fusion workers")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for Python/NumPy/Torch/Open3D RNGs")
     parser.add_argument("--fps", type=float, default=30.0, help="Default streams.fps if not provided as an override")
     parser.add_argument("--artifact-name", default=None, help="ViPE artifact basename. Defaults to frame dir name")
     parser.add_argument("--vipe-output-dir", type=Path, default=None, help="ViPE output dir override")
@@ -341,6 +343,7 @@ def _append_common_cli_args(cmd: list[str], args: argparse.Namespace, vipe_overr
     cmd += ["--modes", *args.modes]
     cmd += ["--max-frames", str(args.max_frames)]
     cmd += ["--num-fusion-workers", str(args.num_fusion_workers)]
+    cmd += ["--seed", str(args.seed)]
     cmd += ["--fps", str(args.fps)]
     if args.artifact_name is not None:
         cmd += ["--artifact-name", args.artifact_name]
@@ -460,6 +463,7 @@ def print_scannet_summary(metrics) -> None:
 def main() -> None:
     parser = build_parser()
     args, vipe_overrides = parser.parse_known_args()
+    seed_everything(args.seed)
     is_worker = os.environ.get(WORKER_ENV) == "1"
 
     evaluator = _load_evaluator(args)
