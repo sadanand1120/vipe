@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
-import shutil
 import subprocess
 import sys
+import time
 import zipfile
 
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import OpenEXR
 from tqdm import tqdm
 
 from vipe.utils.determinism import seed_everything
@@ -51,12 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-fusion-workers", type=int, default=4, help="TSDF fusion workers")
     parser.add_argument("--seed", type=int, default=42, help="Seed for Python/NumPy/Torch/Open3D RNGs")
     parser.add_argument("--fps", type=float, default=30.0, help="Default streams.fps if not provided as an override")
-    parser.add_argument("--artifact-name", default=None, help="ViPE artifact basename. Defaults to frame dir name")
     parser.add_argument("--vipe-output-dir", type=Path, default=None, help="ViPE output dir override")
-    parser.add_argument("--skip-vipe-run", action="store_true", help="Use existing ViPE artifacts")
-    parser.add_argument("--eval-only", action="store_true", help="Only evaluate existing DA3 benchmark exports")
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip ViPE inference, rebuild DA3 benchmark exports from existing ViPE artifacts, then evaluate",
+    )
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
-    parser.add_argument("--debug", action="store_true", help="Enable DA3 evaluator debug mode")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--total-gpus", type=int, default=1, help=argparse.SUPPRESS)
     return parser
@@ -122,16 +124,6 @@ def _resolve_vipe_output_dir(args: argparse.Namespace, vipe_overrides: list[str]
     return args.work_dir / "vipe_outputs" / scene
 
 
-def _resolve_artifact_name(args: argparse.Namespace, frame_dir: Path, scene: str) -> str:
-    if args.artifact_name is None:
-        return frame_dir.name
-    if "{scene}" in args.artifact_name:
-        return args.artifact_name.format(scene=scene)
-    if _single_scene(args):
-        return args.artifact_name
-    raise ValueError("--artifact-name must include '{scene}' when evaluating multiple scenes")
-
-
 def _prepare_vipe_overrides(args: argparse.Namespace, vipe_overrides: list[str], scene: str) -> tuple[list[str], Path, Path]:
     frame_dir = _resolve_frame_dir(args, vipe_overrides, scene)
     vipe_output_dir = _resolve_vipe_output_dir(args, vipe_overrides, scene)
@@ -166,44 +158,11 @@ def run_vipe(overrides: list[str]) -> None:
     )
     pipeline = VipePipeline(
         slam=cfg.pipeline.slam,
+        depth=cfg.pipeline.depth,
         output=cfg.pipeline.output,
     )
     logger.info(f"Running ViPE on {stream.name()}")
     pipeline.run(stream)
-
-
-def _read_depth_zip(depth_path: Path) -> dict[int, np.ndarray]:
-    depths = {}
-    with zipfile.ZipFile(depth_path, "r") as zf:
-        names = sorted(zf.namelist())
-        for name in tqdm(names, desc=f"[ViPE export] read depths {depth_path.name}", unit="frame"):
-            frame_idx = int(Path(name).stem)
-            with zf.open(name) as fh:
-                exr = OpenEXR.InputFile(fh)
-                header = exr.header()
-                dw = header["dataWindow"]
-                width = dw.max.x - dw.min.x + 1
-                height = dw.max.y - dw.min.y + 1
-                channel = exr.channels(["Z"])[0]
-                depths[frame_idx] = np.frombuffer(channel, dtype=np.float16).reshape(height, width).astype(np.float32)
-    return depths
-
-
-def _load_vipe_artifacts(vipe_output_dir: Path, artifact_name: str):
-    pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
-    intr_path = vipe_output_dir / "intrinsics" / f"{artifact_name}.npz"
-    depth_path = vipe_output_dir / "depth" / f"{artifact_name}.zip"
-
-    missing = [path for path in [pose_path, intr_path, depth_path] if not path.exists()]
-    if missing:
-        raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing))
-
-    pose_npz = np.load(pose_path)
-    intr_npz = np.load(intr_path)
-    poses_c2w = {int(idx): pose.astype(np.float32) for idx, pose in zip(pose_npz["inds"], pose_npz["data"])}
-    intrinsics = {int(idx): intr.astype(np.float32) for idx, intr in zip(intr_npz["inds"], intr_npz["data"])}
-    depths = _read_depth_zip(depth_path)
-    return poses_c2w, intrinsics, depths
 
 
 def _intrinsics_3x3(intr: np.ndarray) -> np.ndarray:
@@ -233,67 +192,148 @@ def _subset_scene_data(scene_data, keep_indices: list[int]):
     return subset
 
 
-def _export_vipe_scene(
+def _benchmark_frame_request(
     args: argparse.Namespace,
     evaluator,
     scene: str,
     frame_dir: Path,
-    vipe_output_dir: Path,
-    artifact_name: str,
-) -> None:
+    scene_overrides: list[str],
+) -> tuple[Any, list[int], list[int]]:
     dataset = evaluator.datasets["scannet"]
     full_scene_data = dataset.get_data(scene)
     scene_data = evaluator._sample_frames(full_scene_data, scene)
 
     frame_files = _image_files(frame_dir)
     frame_index_by_path = {str(path.resolve()): idx for idx, path in enumerate(frame_files)}
-    print(f"[INFO] Loading ViPE artifacts | {scene} | {vipe_output_dir}", flush=True)
-    poses_c2w, intrinsics, depths = _load_vipe_artifacts(vipe_output_dir, artifact_name)
-    print(f"[INFO] Packing ViPE benchmark export | {scene} | frames={len(scene_data.image_files)}", flush=True)
-
-    depths_out = []
-    conf_out = []
-    extrinsics_out = []
-    intrinsics_out = []
+    full_index_by_image = {str(Path(path).resolve()): idx for idx, path in enumerate(full_scene_data.image_files)}
+    frame_start = int(_override_value(scene_overrides, "streams.frame_start") or 0)
+    frame_end_override = int(_override_value(scene_overrides, "streams.frame_end") or -1)
+    frame_end = len(frame_files) if frame_end_override == -1 else min(frame_end_override, len(frame_files))
+    frame_skip = int(_override_value(scene_overrides, "streams.frame_skip") or 1)
+    frame_indices = []
     kept_scene_indices = []
     missing = []
 
-    full_index_by_image = {str(Path(path).resolve()): idx for idx, path in enumerate(full_scene_data.image_files)}
-    for image_file in tqdm(scene_data.image_files, desc=f"[ViPE export] pack {scene}", unit="frame"):
+    for image_file in scene_data.image_files:
         image_key = str(Path(image_file).resolve())
         if image_key not in frame_index_by_path:
             missing.append(f"{image_file}: not found in ViPE frame dir")
             continue
-        frame_idx = frame_index_by_path[image_key]
-        if frame_idx not in poses_c2w or frame_idx not in intrinsics or frame_idx not in depths:
-            missing.append(f"{image_file}: missing ViPE artifact frame {frame_idx}")
+        raw_frame_idx = frame_index_by_path[image_key]
+        if raw_frame_idx < frame_start or raw_frame_idx >= frame_end or (raw_frame_idx - frame_start) % frame_skip != 0:
+            missing.append(f"{image_file}: not included by ViPE frame_start/frame_end/frame_skip")
+            continue
+        frame_idx = (raw_frame_idx - frame_start) // frame_skip
+        if image_key not in full_index_by_image:
+            missing.append(f"{image_file}: not found in full ScanNet scene data")
             continue
 
-        depths_out.append(depths[frame_idx])
-        conf_out.append(np.ones_like(depths[frame_idx], dtype=np.float32))
-        extrinsics_out.append(np.linalg.inv(poses_c2w[frame_idx]).astype(np.float32))
-        intrinsics_out.append(_intrinsics_3x3(intrinsics[frame_idx]))
+        frame_indices.append(frame_idx)
         kept_scene_indices.append(full_index_by_image[image_key])
 
     if missing:
+        raise ValueError("ViPE input frames do not cover the benchmark frame set:\n" + "\n".join(missing[:20]))
+    return full_scene_data, frame_indices, kept_scene_indices
+
+
+def _artifact_name(frame_dir: Path) -> str:
+    return frame_dir.name
+
+
+def _load_pose_artifact(vipe_output_dir: Path, artifact_name: str) -> dict[int, np.ndarray]:
+    pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
+    if not pose_path.exists():
+        raise FileNotFoundError(f"Missing ViPE pose artifact: {pose_path}")
+
+    pose_npz = np.load(pose_path)
+    return {int(idx): pose.astype(np.float32) for idx, pose in zip(pose_npz["inds"], pose_npz["data"])}
+
+
+def _load_intrinsics_artifact(vipe_output_dir: Path, artifact_name: str) -> np.ndarray:
+    intr_path = vipe_output_dir / "intrinsics" / f"{artifact_name}.json"
+    if not intr_path.exists():
+        raise FileNotFoundError(f"Missing ViPE intrinsics artifact: {intr_path}")
+
+    data = json.loads(intr_path.read_text(encoding="utf-8"))
+    return np.array(data["params"], dtype=np.float32)
+
+
+def _read_depth_artifact(depth_zip: zipfile.ZipFile, frame_idx: int) -> np.ndarray:
+    name = f"{frame_idx:06d}.npy"
+    try:
+        raw = depth_zip.read(name)
+    except KeyError as exc:
+        raise KeyError(f"Missing ViPE depth frame {name}") from exc
+    return np.load(BytesIO(raw), allow_pickle=False).astype(np.float16, copy=False)
+
+
+def _file_size_summary(path: Path) -> str:
+    stat = path.stat()
+    disk_mb = stat.st_blocks * 512 / 1024 / 1024
+    return f"{disk_mb:.1f} MB"
+
+
+def _export_vipe_scene(
+    args: argparse.Namespace,
+    evaluator,
+    scene: str,
+    full_scene_data,
+    frame_indices: list[int],
+    kept_scene_indices: list[int],
+    vipe_output_dir: Path,
+    artifact_name: str,
+) -> None:
+    print(f"[INFO] Packing ViPE benchmark export | {scene} | frames={len(frame_indices)}", flush=True)
+
+    poses_c2w = _load_pose_artifact(vipe_output_dir, artifact_name)
+    intrinsics = _load_intrinsics_artifact(vipe_output_dir, artifact_name)
+    depth_path = vipe_output_dir / "depth" / f"{artifact_name}.zip"
+    if not depth_path.exists():
+        raise FileNotFoundError(f"Missing ViPE depth artifact: {depth_path}")
+
+    depths_out = []
+    extrinsics_out = []
+    intrinsics_out = []
+    missing = []
+    with zipfile.ZipFile(depth_path, "r") as depth_zip:
+        for frame_idx in tqdm(
+            frame_indices,
+            total=len(frame_indices),
+            desc=f"[ViPE export] pack {scene}",
+            unit="frame",
+            dynamic_ncols=True,
+        ):
+            if frame_idx not in poses_c2w:
+                missing.append(f"missing pose frame {frame_idx}")
+                continue
+            try:
+                depth = _read_depth_artifact(depth_zip, frame_idx)
+            except KeyError as exc:
+                missing.append(str(exc))
+                continue
+
+            depths_out.append(depth)
+            extrinsics_out.append(np.linalg.inv(poses_c2w[frame_idx]).astype(np.float32))
+            intrinsics_out.append(_intrinsics_3x3(intrinsics))
+
+    if missing:
         raise ValueError("ViPE artifacts do not cover the benchmark frame set:\n" + "\n".join(missing[:20]))
+
     if not depths_out:
         raise ValueError("No frames exported for benchmark")
 
-    result_tmp = args.work_dir / "model_results" / "scannet" / scene / "_vipe_results.npz"
-    result_tmp.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Writing compressed ViPE NPZ | {scene} | {result_tmp}", flush=True)
-    np.savez_compressed(
-        result_tmp,
-        depth=np.round(np.stack(depths_out), 8),
-        conf=np.round(np.stack(conf_out), 2),
-        extrinsics=np.stack(extrinsics_out),
-        intrinsics=np.stack(intrinsics_out),
-    )
+    depth_arr = np.stack(depths_out).astype(np.float16, copy=False)
+    result_payload = {
+        "depth": depth_arr,
+        "conf": np.ones(depth_arr.shape, dtype=np.float16),
+        "extrinsics": np.stack(extrinsics_out).astype(np.float32, copy=False),
+        "intrinsics": np.stack(intrinsics_out).astype(np.float32, copy=False),
+    }
 
     exported_scene_data = _subset_scene_data(full_scene_data, kept_scene_indices)
     need_unposed = {"pose", "recon_unposed"} & set(args.modes)
     need_posed = {"recon_posed"} & set(args.modes)
+    first_result_path = None
     for posed in [False, True]:
         if posed and not need_posed:
             continue
@@ -302,12 +342,22 @@ def _export_vipe_scene(
         export_dir = Path(evaluator._export_dir("scannet", scene, posed=posed))
         result_path = export_dir / "exports" / "mini_npz" / "results.npz"
         result_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Copying export NPZ | {scene} | posed={posed} | {result_path}", flush=True)
-        shutil.copy2(result_tmp, result_path)
+        if first_result_path is None:
+            print(f"[INFO] Writing ViPE NPZ | {scene} | {result_path}", flush=True)
+            start_time = time.perf_counter()
+            np.savez(result_path, **result_payload)
+            elapsed = time.perf_counter() - start_time
+            print(f"[INFO] Saved ViPE NPZ | {scene} | {elapsed:.2f}s | {_file_size_summary(result_path)}", flush=True)
+            first_result_path = result_path
+        else:
+            if result_path.exists():
+                result_path.unlink()
+            print(f"[INFO] Linking ViPE NPZ | {scene} | posed={posed} | {result_path}", flush=True)
+            os.link(first_result_path, result_path)
         print(f"[INFO] Writing GT metadata | {scene} | posed={posed}", flush=True)
         evaluator._save_gt_meta(str(export_dir), exported_scene_data)
 
-    print(f"[INFO] Exported ViPE artifacts for {scene} to DA3 benchmark layout under {args.work_dir}")
+    print(f"[INFO] Exported ViPE benchmark data for {scene} to DA3 layout under {args.work_dir}")
 
 
 def _load_evaluator(args: argparse.Namespace):
@@ -325,7 +375,6 @@ def _load_evaluator(args: argparse.Namespace):
         datas=["scannet"],
         modes=args.modes,
         scenes=args.scenes,
-        debug=args.debug,
         num_fusion_workers=args.num_fusion_workers,
         max_frames=args.max_frames,
         ref_view_strategy="unused_by_vipe",
@@ -345,20 +394,14 @@ def _append_common_cli_args(cmd: list[str], args: argparse.Namespace, vipe_overr
     cmd += ["--num-fusion-workers", str(args.num_fusion_workers)]
     cmd += ["--seed", str(args.seed)]
     cmd += ["--fps", str(args.fps)]
-    if args.artifact_name is not None:
-        cmd += ["--artifact-name", args.artifact_name]
     if args.vipe_output_dir is not None:
         cmd += ["--vipe-output-dir", str(args.vipe_output_dir)]
-    if args.skip_vipe_run:
-        cmd += ["--skip-vipe-run"]
-    if args.debug:
-        cmd += ["--debug"]
     cmd += vipe_overrides
     return cmd
 
 
 def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> bool:
-    if args.skip_vipe_run or args.eval_only or args.print_only or os.environ.get(WORKER_ENV) == "1":
+    if args.eval_only or args.print_only or os.environ.get(WORKER_ENV) == "1":
         return False
 
     cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -395,11 +438,12 @@ def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> 
 
 def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
     dataset = evaluator.datasets["scannet"]
-    all_scenes = evaluator._get_scenes(dataset)
-    missing = sorted(set(args.scenes) - set(all_scenes))
+    known_scenes = set(evaluator._get_scenes(dataset))
+    missing = sorted(set(args.scenes) - known_scenes)
     if missing:
         raise ValueError(f"Unknown ScanNet scenes: {missing}")
 
+    all_scenes = list(args.scenes)
     if args.total_gpus <= 1:
         print(f"[INFO] Total ViPE benchmark scenes: {len(all_scenes)}")
         return all_scenes
@@ -409,13 +453,29 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
     return scenes
 
 
-def infer_vipe(args: argparse.Namespace, evaluator, vipe_overrides: list[str]) -> None:
+def prepare_vipe_benchmark_exports(
+    args: argparse.Namespace,
+    evaluator,
+    vipe_overrides: list[str],
+    run_vipe_first: bool,
+) -> None:
     for scene in _scenes_for_worker(args, evaluator):
         scene_overrides, frame_dir, vipe_output_dir = _prepare_vipe_overrides(args, vipe_overrides, scene)
-        artifact_name = _resolve_artifact_name(args, frame_dir, scene)
-        if not args.skip_vipe_run:
+        full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(
+            args, evaluator, scene, frame_dir, scene_overrides
+        )
+        if run_vipe_first:
             run_vipe(scene_overrides)
-        _export_vipe_scene(args, evaluator, scene, frame_dir, vipe_output_dir, artifact_name)
+        _export_vipe_scene(
+            args,
+            evaluator,
+            scene,
+            full_scene_data,
+            frame_indices,
+            kept_scene_indices,
+            vipe_output_dir,
+            _artifact_name(frame_dir),
+        )
 
 
 def _fmt(value):
@@ -433,14 +493,17 @@ def _get_nested(d, *keys):
 
 def print_scannet_summary(metrics) -> None:
     pose_mean = _get_nested(metrics, "scannet_pose", "mean") or {}
-    recon_u_mean = _get_nested(metrics, "scannet_recon_unposed", "mean") or {}
-    recon_p_mean = _get_nested(metrics, "scannet_recon_posed", "mean") or {}
+    recon_u_tsdf = _get_nested(metrics, "scannet_recon_unposed_tsdf", "mean") or {}
+    recon_u_backproject = _get_nested(metrics, "scannet_recon_unposed_backproject", "mean") or {}
+    recon_p_tsdf = _get_nested(metrics, "scannet_recon_posed_tsdf", "mean") or {}
+    recon_p_backproject = _get_nested(metrics, "scannet_recon_posed_backproject", "mean") or {}
 
     auc3 = next((pose_mean[key] for key in ["Auc_3", "auc03", "auc_3", "auc3", "Auc3"] if key in pose_mean), None)
     auc30 = next((pose_mean[key] for key in ["Auc_30", "auc30", "auc_30", "Auc30"] if key in pose_mean), None)
 
     col1 = 15
     col2 = 14
+    col3 = 14
     print("\n" + "=" * 44)
     print("SCANNET VIPE BENCHMARK SUMMARY")
     print("=" * 44)
@@ -451,13 +514,17 @@ def print_scannet_summary(metrics) -> None:
     print(f"{'Auc3':<{col1}}{_fmt(auc3):<{col2}}")
     print(f"{'Auc30':<{col1}}{_fmt(auc30):<{col2}}")
     print("\nRECON_UNPOSED (ViPE Pose)")
-    print("-" * (col1 + col2))
-    print(f"{'F-score':<{col1}}{_fmt(recon_u_mean.get('fscore')):<{col2}}")
-    print(f"{'Overall':<{col1}}{_fmt(recon_u_mean.get('overall')):<{col2}}")
+    print("-" * (col1 + col2 + col3))
+    print(f"{'Metric':<{col1}}{'TSDF':<{col2}}{'Backproject':<{col3}}")
+    print("-" * (col1 + col2 + col3))
+    print(f"{'F-score':<{col1}}{_fmt(recon_u_tsdf.get('fscore')):<{col2}}{_fmt(recon_u_backproject.get('fscore')):<{col3}}")
+    print(f"{'Overall':<{col1}}{_fmt(recon_u_tsdf.get('overall')):<{col2}}{_fmt(recon_u_backproject.get('overall')):<{col3}}")
     print("\nRECON_POSED (GT Pose)")
-    print("-" * (col1 + col2))
-    print(f"{'F-score':<{col1}}{_fmt(recon_p_mean.get('fscore')):<{col2}}")
-    print(f"{'Overall':<{col1}}{_fmt(recon_p_mean.get('overall')):<{col2}}")
+    print("-" * (col1 + col2 + col3))
+    print(f"{'Metric':<{col1}}{'TSDF':<{col2}}{'Backproject':<{col3}}")
+    print("-" * (col1 + col2 + col3))
+    print(f"{'F-score':<{col1}}{_fmt(recon_p_tsdf.get('fscore')):<{col2}}{_fmt(recon_p_backproject.get('fscore')):<{col3}}")
+    print(f"{'Overall':<{col1}}{_fmt(recon_p_tsdf.get('overall')):<{col2}}{_fmt(recon_p_backproject.get('overall')):<{col3}}")
 
 
 def main() -> None:
@@ -474,6 +541,7 @@ def main() -> None:
         return
 
     if args.eval_only:
+        prepare_vipe_benchmark_exports(args, evaluator, vipe_overrides, run_vipe_first=False)
         metrics = evaluator.eval()
         print_scannet_summary(metrics)
         return
@@ -483,7 +551,7 @@ def main() -> None:
         print_scannet_summary(metrics)
         return
 
-    infer_vipe(args, evaluator, vipe_overrides)
+    prepare_vipe_benchmark_exports(args, evaluator, vipe_overrides, run_vipe_first=True)
     if is_worker:
         return
     metrics = evaluator.eval()

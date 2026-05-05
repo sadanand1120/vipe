@@ -27,15 +27,27 @@ python run.py \
   streams.base_path=/path/to/scene/color \
   streams.fps=30 \
   pipeline.output.path=/path/to/output \
-  pipeline.output.save_artifacts=true \
-  pipeline.output.pcd_fusion_mode=tsdf
+  pipeline.output.save_artifacts=true
 ```
 
 Useful output knobs:
 
+- `pipeline.output.pcd_fusion_mode=both`: save both point-cloud exports. This is the default.
 - `pipeline.output.pcd_fusion_mode=backproject`: save `pcd/color_backproject.ply`.
 - `pipeline.output.pcd_fusion_mode=tsdf`: save `pcd/color_tsdf.ply`.
 - `pipeline.output.pcd_max_points=8000000`: cap saved point cloud points.
+- `pipeline.depth.keyframe_model=depth-anything/DA3METRIC-LARGE`: DAV3 metric model used to anchor SLAM keyframe depth.
+- `pipeline.depth.final_model=depth-anything/DA3-GIANT`: DAV3 posed model used for final per-frame dense depth.
+- `pipeline.depth.window_size=10`: final DAV3 sliding-window size.
+- `pipeline.depth.overlap_size=3`: final DAV3 overlap blended between windows.
+
+Saved artifacts:
+
+- `pose/color.npz`: camera-to-world pose per selected frame.
+- `depth/color.zip`: per-frame final dense depth as NumPy `.npy` entries.
+- `intrinsics/color.json`: one shared original-resolution pinhole intrinsics record.
+- `pcd/color_backproject.ply`: direct backprojected point cloud, if enabled.
+- `pcd/color_tsdf.ply`: TSDF-fused sampled point cloud, if enabled.
 
 ## ScanNet Benchmark
 
@@ -53,3 +65,5 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
 ## Notes
 
 The repo is intentionally configured through `configs/default.yaml`; `run.py` and the ScanNet benchmark both compose that config and instantiate `VipePipeline` directly.
+
+The standalone artifact path is intentionally lean but complete for benchmarking: RGB videos are not written, while pose, depth, intrinsics, and configured point clouds are written. The ScanNet benchmark reads those artifacts from disk, rebuilds the DA3 `results.npz`, and reports reconstruction metrics for both TSDF and direct backprojection.

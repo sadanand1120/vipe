@@ -34,11 +34,17 @@ pipeline:
     ba:
       dense_disp_alpha: 0.001            # Weight for sensor/DAV3 depth regularization in BA.
 
+  depth:
+    keyframe_model: depth-anything/DA3METRIC-LARGE # DAV3 metric model anchoring SLAM keyframe depth.
+    final_model: depth-anything/DA3-GIANT          # DAV3 posed model used for final per-frame dense depth.
+    window_size: 10                                # Number of frames per final DAV3 sliding window.
+    overlap_size: 3                                # Number of overlapped frames blended between windows.
+
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.
-    save_artifacts: false                # Save pose/depth/intrinsics/rgb/pcd artifacts.
-    pcd_fusion_mode: backproject         # Point cloud mode: backproject or tsdf.
-    pcd_max_points: 8000000              # Max saved points for either backproject or sampled TSDF point cloud.
+    save_artifacts: false                # Save pose, intrinsics, and point-cloud artifacts.
+    pcd_fusion_mode: both                # Point cloud mode: backproject, tsdf, or both.
+    pcd_max_points: 8000000              # Max saved points per point-cloud output.
     pcd_conf_threshold_coef: 0.75        # DAV3 confidence threshold = mean confidence times this factor.
     pcd_sample_ratio: 0.015              # Per-frame sampling ratio before max-point downsampling.
     pcd_tsdf_voxel_length: 0.02          # TSDF voxel size in meters.

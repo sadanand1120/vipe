@@ -59,56 +59,7 @@ def estimate_geocalib_intrinsics(frame_stream: FrameStream, gap_sec: float = 1.0
     return torch.as_tensor([fx, fy, frame_width / 2, frame_height / 2]).float().cuda()
 
 
-class SharedIntrinsicsFrameStream(FrameStream):
-    def __init__(self, stream: FrameStream, intrinsics: torch.Tensor):
-        self.stream = stream
-        self.intrinsics = intrinsics
-
-    def frame_size(self) -> tuple[int, int]:
-        return self.stream.frame_size()
-
-    def fps(self) -> float:
-        return self.stream.fps()
-
-    def name(self) -> str:
-        return self.stream.name()
-
-    def __len__(self) -> int:
-        return len(self.stream)
-
-    def __iter__(self) -> Iterator[FrameData]:
-        for frame in self.stream:
-            frame.intrinsics = self.intrinsics
-            frame.camera_type = CameraType.PINHOLE
-            yield frame
-
-
-class SLAMOutputFrameStream(FrameStream):
-    def __init__(self, stream: FrameStream, slam_output: SLAMOutput):
-        self.stream = stream
-        self.slam_output = slam_output
-
-    def frame_size(self) -> tuple[int, int]:
-        return self.stream.frame_size()
-
-    def fps(self) -> float:
-        return self.stream.fps()
-
-    def name(self) -> str:
-        return self.stream.name()
-
-    def __len__(self) -> int:
-        return len(self.stream)
-
-    def __iter__(self) -> Iterator[FrameData]:
-        for frame_idx, frame in enumerate(self.stream):
-            frame.pose = self.slam_output.trajectory[frame_idx]
-            frame.intrinsics = self.slam_output.intrinsics
-            frame.camera_type = CameraType.PINHOLE
-            yield frame
-
-
-class DAV3DepthStream(FrameStream):
+class DAV3DepthEstimator:
     """
     Use DAV3 to estimate depth for each frame.
     Depth is conditioned on camera poses and intrinsics from SLAM.
@@ -119,18 +70,13 @@ class DAV3DepthStream(FrameStream):
 
     def __init__(
         self,
-        frame_stream: FrameStream,
-        slam_output: SLAMOutput,
+        model_name: str,
         window_size: int = 10,
         overlap_size: int = 3,
     ):
         super().__init__()
-        self.frame_stream = frame_stream
-        self.slam_output = slam_output
         self.window_size = window_size
         self.overlap_size = overlap_size
-
-        self.keyframes_inds = unpack_optional(self.slam_output.slam_map).dense_disp_frame_inds
 
         try:
             from depth_anything_3.api import DepthAnything3
@@ -141,60 +87,60 @@ class DAV3DepthStream(FrameStream):
             )
 
         dav3_logger.level = 0
-        self.dav3_api = DepthAnything3.from_pretrained("depth-anything/DA3-GIANT")
+        self.dav3_api = DepthAnything3.from_pretrained(model_name)
         self.dav3_api = self.dav3_api.cuda().eval()
 
-    def frame_size(self) -> tuple[int, int]:
-        return self.frame_stream.frame_size()
-
-    def fps(self) -> float:
-        return self.frame_stream.fps()
-
-    def name(self) -> str:
-        return self.frame_stream.name()
-
-    def __len__(self) -> int:
-        return len(self.frame_stream)
-
-    def _probe_keyframe_indices(self, frame_idx: int) -> list[int]:
+    def _probe_keyframe_indices(self, keyframes_inds: list[int], frame_idx: int) -> list[int]:
         inds: list[int] = []
-        left_idx = np.searchsorted(self.keyframes_inds, frame_idx, side="right").item() - 1
+        left_idx = np.searchsorted(keyframes_inds, frame_idx, side="right").item() - 1
         inds.append(left_idx)
-        if frame_idx < self.keyframes_inds[-1]:
+        if frame_idx < keyframes_inds[-1]:
             inds.append(left_idx + 1)
         return inds
 
-    def record_keyframes(self, previous_iterator: Iterator[FrameData]) -> Iterator[FrameData]:
-        for frame_idx, frame in enumerate(previous_iterator):
-            self.n_frames += 1
-            if frame_idx in self.keyframes_inds:
-                self.keyframes_data.append(frame)
-            yield frame
+    def _attach_slam_output(self, frame_stream: FrameStream, frame_idx: int, slam_output: SLAMOutput) -> FrameData:
+        frame = frame_stream[frame_idx]
+        frame.pose = slam_output.trajectory[frame_idx]
+        frame.intrinsics = slam_output.intrinsics
+        frame.camera_type = CameraType.PINHOLE
+        return frame
 
-    def estimate_depth_sliding_window(self, previous_iterator: Iterator[FrameData]) -> Iterator[FrameData]:
+    def estimate(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> Iterator[FrameData]:
+        keyframes_inds = unpack_optional(slam_output.slam_map).dense_disp_frame_inds
+        keyframes_data = [
+            self._attach_slam_output(frame_stream, frame_idx, slam_output)
+            for frame_idx in keyframes_inds
+        ]
+        n_frames = len(frame_stream)
+
         current_sliding_window: list[FrameData] = []
         current_sliding_window_idx: list[int] = []
         trailing_depth: torch.Tensor | None = None
         trailing_confidence: torch.Tensor | None = None
-        for frame_idx, frame in pbar(enumerate(previous_iterator), desc="Estimating DAV3 depth"):
+        for frame_idx in pbar(range(n_frames), desc="Estimating DAV3 depth"):
+            frame = self._attach_slam_output(frame_stream, frame_idx, slam_output)
             current_sliding_window.append(frame)
             current_sliding_window_idx.append(frame_idx)
-            is_last_frame = frame_idx == self.n_frames - 1
+            is_last_frame = frame_idx == n_frames - 1
 
             if len(current_sliding_window) == self.window_size or is_last_frame:
                 # Neighboring keyframes anchor each current sliding window.
-                sw_keyframe_inds = list(
-                    set(sum([self._probe_keyframe_indices(i) for i in current_sliding_window_idx], []))
+                sw_keyframe_inds = sorted(
+                    {
+                        keyframe_idx
+                        for i in current_sliding_window_idx
+                        for keyframe_idx in self._probe_keyframe_indices(keyframes_inds, i)
+                    }
                 )
                 sw_keyframe_inds = [
-                    t for t in sw_keyframe_inds if self.keyframes_inds[t] not in current_sliding_window_idx
+                    t for t in sw_keyframe_inds if keyframes_inds[t] not in current_sliding_window_idx
                 ]
 
                 sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
 
                 if len(sw_keyframe_inds) > 0:
                     kf_images, kf_exts, kf_ints = zip(
-                        *[self.keyframes_data[t].dav3_conditions() for t in sw_keyframe_inds]
+                        *[keyframes_data[t].dav3_conditions() for t in sw_keyframe_inds]
                     )
                 else:
                     kf_images, kf_exts, kf_ints = tuple(), tuple(), tuple()
@@ -239,43 +185,61 @@ class DAV3DepthStream(FrameStream):
 
         assert len(current_sliding_window) == 0, "Current sliding window should be empty"
 
-    def __iter__(self) -> Iterator[FrameData]:
-        self.keyframes_data: list[FrameData] = []
-        self.n_frames = 0
-        for _ in pbar(self.record_keyframes(iter(self.frame_stream)), total=len(self), desc="Collecting DAV3 keyframes"):
-            pass
-        yield from self.estimate_depth_sliding_window(iter(self.frame_stream))
-
 
 class VipePipeline:
-    def __init__(self, slam: DictConfig, output: DictConfig) -> None:
+    def __init__(self, slam: DictConfig, depth: DictConfig, output: DictConfig) -> None:
         self.slam_cfg = slam
+        self.depth_cfg = depth
         self.out_cfg = output
         self.out_path = Path(self.out_cfg.path)
         self.out_path.mkdir(exist_ok=True, parents=True)
 
+    def _initialize(self, frame_stream: FrameStream) -> torch.Tensor:
+        return estimate_geocalib_intrinsics(frame_stream)
+
+    def _run_slam(self, frame_stream: FrameStream, intrinsics: torch.Tensor) -> SLAMOutput:
+        slam_pipeline = SLAMSystem(
+            device=torch.device("cuda"),
+            config=self.slam_cfg,
+            keyframe_depth_model=self.depth_cfg.keyframe_model,
+        )
+        return slam_pipeline.run(frame_stream, intrinsics, camera_type=CameraType.PINHOLE)
+
+    def _run_final_depth(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> Iterator[FrameData]:
+        depth_estimator = DAV3DepthEstimator(
+            model_name=self.depth_cfg.final_model,
+            window_size=self.depth_cfg.window_size,
+            overlap_size=self.depth_cfg.overlap_size,
+        )
+        return depth_estimator.estimate(frame_stream, slam_output)
+
+    def _save_outputs(
+        self,
+        artifact_path: io.ArtifactPath,
+        frame_stream: FrameStream,
+        slam_output: SLAMOutput,
+    ) -> None:
+        if not self.out_cfg.save_artifacts:
+            return
+
+        logger.info(f"Saving artifacts to {artifact_path}")
+        io.save_artifacts(
+            artifact_path,
+            self._run_final_depth(frame_stream, slam_output),
+            n_frames=len(frame_stream),
+            pcd_fusion_mode=self.out_cfg.pcd_fusion_mode,
+            max_pcd_points=self.out_cfg.pcd_max_points,
+            pcd_conf_threshold_coef=self.out_cfg.pcd_conf_threshold_coef,
+            pcd_sample_ratio=self.out_cfg.pcd_sample_ratio,
+            pcd_tsdf_voxel_length=self.out_cfg.pcd_tsdf_voxel_length,
+            pcd_tsdf_sdf_trunc=self.out_cfg.pcd_tsdf_sdf_trunc,
+            pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
+        )
+
     def run(self, frame_stream: FrameStream) -> SLAMOutput:
         artifact_path = io.ArtifactPath(self.out_path, frame_stream.name())
-        intrinsics = estimate_geocalib_intrinsics(frame_stream)
-        init_stream = SharedIntrinsicsFrameStream(frame_stream, intrinsics)
-
-        slam_pipeline = SLAMSystem(device=torch.device("cuda"), config=self.slam_cfg)
-        slam_output = slam_pipeline.run(init_stream, camera_type=CameraType.PINHOLE)
-
-        output_stream = DAV3DepthStream(SLAMOutputFrameStream(frame_stream, slam_output), slam_output)
-
-        if self.out_cfg.save_artifacts:
-            logger.info(f"Saving artifacts to {artifact_path}")
-            io.save_artifacts(
-                artifact_path,
-                output_stream,
-                pcd_fusion_mode=self.out_cfg.pcd_fusion_mode,
-                max_pcd_points=self.out_cfg.pcd_max_points,
-                pcd_conf_threshold_coef=self.out_cfg.pcd_conf_threshold_coef,
-                pcd_sample_ratio=self.out_cfg.pcd_sample_ratio,
-                pcd_tsdf_voxel_length=self.out_cfg.pcd_tsdf_voxel_length,
-                pcd_tsdf_sdf_trunc=self.out_cfg.pcd_tsdf_sdf_trunc,
-                pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
-            )
+        intrinsics = self._initialize(frame_stream)
+        slam_output = self._run_slam(frame_stream, intrinsics)
+        self._save_outputs(artifact_path, frame_stream, slam_output)
 
         return slam_output

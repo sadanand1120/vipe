@@ -20,6 +20,7 @@ def run(args: DictConfig) -> None:
     )
     pipeline = VipePipeline(
         slam=args.pipeline.slam,
+        depth=args.pipeline.depth,
         output=args.pipeline.output,
     )
     logger.info(f"Processing {frame_stream.name()}")

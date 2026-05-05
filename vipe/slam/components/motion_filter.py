@@ -18,9 +18,19 @@
 # Licensed under the MIT License. See THIRD_PARTY_LICENSES.md for details.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
+
 import torch
 
 from ..networks.droid_net import CorrBlock, DroidNet
+
+
+@dataclass(slots=True)
+class MotionFilterResult:
+    is_keyframe: bool
+    fmap: torch.Tensor
+    net: torch.Tensor | None = None
+    inp: torch.Tensor | None = None
 
 
 class MotionFilter:
@@ -51,7 +61,7 @@ class MotionFilter:
 
     @torch.amp.autocast("cuda", enabled=True)
     @torch.no_grad()
-    def check(self, images: torch.Tensor) -> bool:
+    def check(self, images: torch.Tensor) -> MotionFilterResult:
         """
         main update operation - run on every frame in video
 
@@ -73,7 +83,7 @@ class MotionFilter:
             self.current_frame_idx = 0
             self.last_kf_frame_idx = 0
             self.initialized = True
-            return True
+            return MotionFilterResult(True, gmap, net, inp)
 
         ### only add new frame if there is enough motion ###
         else:
@@ -94,7 +104,7 @@ class MotionFilter:
                 net, inp = self.net.encode_context(images)
                 self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
                 self.last_kf_frame_idx = self.current_frame_idx
-                return True
+                return MotionFilterResult(True, gmap, net, inp)
 
             else:
-                return False
+                return MotionFilterResult(False, gmap)

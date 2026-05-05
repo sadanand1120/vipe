@@ -33,7 +33,7 @@ class DepthAnything3Model(DepthEstimationModel):
     https://github.com/ByteDance-Seed/Depth-Anything-3
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_name: str) -> None:
         super().__init__()
         if DepthAnything3 is None or dav3_logger is None:
             raise RuntimeError(
@@ -41,7 +41,7 @@ class DepthAnything3Model(DepthEstimationModel):
             )
 
         dav3_logger.level = 0  # Disable logging timing information
-        self.model = DepthAnything3.from_pretrained("depth-anything/DA3METRIC-LARGE")
+        self.model = DepthAnything3.from_pretrained(model_name)
         self.model = self.model.cuda().eval()
 
     @property
@@ -57,7 +57,8 @@ class DepthAnything3Model(DepthEstimationModel):
         assert rgb.dtype == torch.float32, "Input image should be float32"
 
         assert src.camera_type == CameraType.PINHOLE, "DAv3 only supports pinhole cameras"
-        focal_length: float = unpack_optional(src.intrinsics)[0].item()
+        intrinsics = unpack_optional(src.intrinsics)
+        focal_length: float = ((intrinsics[0] + intrinsics[1]) / 2).item()
 
         if rgb.dim() == 3:
             rgb, batch_dim = rgb[None], False

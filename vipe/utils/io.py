@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import math
 import shutil
@@ -20,55 +21,22 @@ import tempfile
 import zipfile
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
-from typing import Any
 
-import imageio
-import Imath
 import numpy as np
-import OpenEXR
 
-from vipe.streams.base import FrameData, FrameStream
-from vipe.utils.geometry import se3_matrix_to_se3
+from vipe.streams.base import FrameData
 from vipe.utils.logging import pbar
 
 
 logger = logging.getLogger(__name__)
 
 
-class VideoWriter:
-    def __init__(self, path: Path, fps: float):
-        self.path = path
-        self.fps = fps
-        self.vw: Any = None
-
-    def __enter__(self):
-        return self
-
-    def write(self, frame: np.ndarray):
-        if self.vw is None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.vw = imageio.get_writer(str(self.path), fps=self.fps, codec="libx264", macro_block_size=None)
-
-        if frame.dtype in [np.float32, np.float64]:
-            frame = (frame * 255).astype(np.uint8)
-
-        assert self.vw is not None
-        self.vw.append_data(frame)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.vw is not None:
-            self.vw.close()
-
-
 @dataclass
 class ArtifactPath:
     base_path: Path
     artifact_name: str
-
-    @property
-    def rgb_path(self) -> Path:
-        return self.base_path / "rgb" / f"{self.artifact_name}.mp4"
 
     @property
     def pose_path(self) -> Path:
@@ -88,18 +56,7 @@ class ArtifactPath:
 
     @property
     def intrinsics_path(self) -> Path:
-        return self.base_path / "intrinsics" / f"{self.artifact_name}.npz"
-
-
-def read_pose_artifacts_benchmark(npz_file_path: Path) -> dict:
-    data = np.load(npz_file_path)
-    return dict(
-        ids=data["inds"],
-        trajectory=se3_matrix_to_se3(data["data"]),
-        runtime=data.get("runtime", None),
-        keyframe_ids=data.get("keyframe_ids", None),
-        frame_num=len(data["inds"]),
-    )
+        return self.base_path / "intrinsics" / f"{self.artifact_name}.json"
 
 
 def _backproject_vertices(
@@ -260,10 +217,44 @@ def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
     o3d.io.write_point_cloud(str(out_path.tsdf_pcd_path), pcd, write_ascii=False)
 
 
+def _write_intrinsics_json(out_path: ArtifactPath, intrinsics: np.ndarray, frame_size: tuple[int, int]) -> None:
+    height, width = frame_size
+    fx, fy, cx, cy = intrinsics[:4]
+    out_path.intrinsics_path.parent.mkdir(exist_ok=True, parents=True)
+    out_path.intrinsics_path.write_text(
+        json.dumps(
+            {
+                "camera_model": "pinhole",
+                "width": int(width),
+                "height": int(height),
+                "params": [float(fx), float(fy), float(cx), float(cy)],
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_depth_frame(depth_zip: zipfile.ZipFile, frame_idx: int, frame_data: FrameData) -> None:
+    if frame_data.metric_depth is None:
+        raise ValueError(f"Frame {frame_idx} is missing metric depth")
+
+    depth = frame_data.metric_depth.detach().cpu().numpy().astype(np.float16)
+    buffer = BytesIO()
+    np.save(buffer, depth, allow_pickle=False)
+    depth_zip.writestr(f"{frame_idx:06d}.npy", buffer.getvalue())
+
+
 def save_artifacts(
     out_path: ArtifactPath,
-    final_stream: FrameStream,
-    pcd_fusion_mode: str = "backproject",
+    final_frames,
+    n_frames: int,
+    pcd_fusion_mode: str = "both",
     max_pcd_points: int = 8_000_000,
     pcd_conf_threshold_coef: float = 0.75,
     pcd_sample_ratio: float = 0.015,
@@ -276,52 +267,38 @@ def save_artifacts(
     """
 
     pose_list = []
-    intrinsics_list = []
-    depth_zip: zipfile.ZipFile | None = None
-    if pcd_fusion_mode not in {"backproject", "tsdf"}:
+    intrinsics = None
+    intrinsics_frame_size = None
+    if pcd_fusion_mode not in {"backproject", "tsdf", "both"}:
         raise ValueError(f"Invalid pcd_fusion_mode: {pcd_fusion_mode}")
 
-    pcd_body_file = tempfile.TemporaryFile() if pcd_fusion_mode == "backproject" else None
+    write_backproject = pcd_fusion_mode in {"backproject", "both"}
+    write_tsdf = pcd_fusion_mode in {"tsdf", "both"}
+    pcd_body_file = tempfile.TemporaryFile() if write_backproject else None
     pcd_vertex_count = 0
-    max_points_per_frame = math.ceil(max_pcd_points / max(len(final_stream), 1))
-    tsdf_volume = (
-        _make_tsdf_volume(pcd_tsdf_voxel_length, pcd_tsdf_sdf_trunc) if pcd_fusion_mode == "tsdf" else None
-    )
+    max_points_per_frame = math.ceil(max_pcd_points / max(n_frames, 1))
+    tsdf_volume = _make_tsdf_volume(pcd_tsdf_voxel_length, pcd_tsdf_sdf_trunc) if write_tsdf else None
 
     try:
-        with VideoWriter(out_path.rgb_path, final_stream.fps()) as rgb_writer:
+        out_path.depth_path.parent.mkdir(exist_ok=True, parents=True)
+        with zipfile.ZipFile(out_path.depth_path, "w", compression=zipfile.ZIP_STORED) as depth_zip:
             for frame_idx, frame_data in pbar(
-                enumerate(final_stream),
-                total=len(final_stream),
+                enumerate(final_frames),
+                total=n_frames,
                 desc="Saving artifacts",
             ):
                 assert isinstance(frame_data, FrameData)
+                _write_depth_frame(depth_zip, frame_idx, frame_data)
 
                 if frame_data.pose is not None:
                     pose_list.append((frame_idx, frame_data.pose.matrix().cpu().numpy()))
 
-                if frame_data.intrinsics is not None:
-                    intrinsics_list.append((frame_idx, frame_data.intrinsics.cpu().numpy()))
-
-                rgb_writer.write((frame_data.rgb.cpu().numpy() * 255).astype(np.uint8))
-
-                if frame_data.metric_depth is not None:
-                    if depth_zip is None:
-                        out_path.depth_path.parent.mkdir(exist_ok=True, parents=True)
-                        depth_zip = zipfile.ZipFile(out_path.depth_path, "w", zipfile.ZIP_DEFLATED)
-
-                    metric_depth = frame_data.metric_depth.cpu().numpy()
-                    height, width = metric_depth.shape
-                    header = OpenEXR.Header(width, height)
-                    header["channels"] = {"Z": Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))}
-                    with tempfile.NamedTemporaryFile(suffix=".exr") as f:
-                        exr = OpenEXR.OutputFile(f.name, header)
-                        exr.writePixels({"Z": metric_depth.astype(np.float16).tobytes()})
-                        exr.close()
-                        depth_zip.write(f.name, f"{frame_idx:05d}.exr")
+                if intrinsics is None and frame_data.intrinsics is not None:
+                    intrinsics = frame_data.intrinsics.cpu().numpy()
+                    intrinsics_frame_size = frame_data.size()
 
                 remaining_points = max_pcd_points - pcd_vertex_count
-                if pcd_fusion_mode == "backproject" and remaining_points > 0:
+                if write_backproject and remaining_points > 0:
                     assert pcd_body_file is not None
                     vertices = _backproject_vertices(
                         frame_data,
@@ -332,15 +309,12 @@ def save_artifacts(
                     if vertices is not None:
                         vertices.tofile(pcd_body_file)
                         pcd_vertex_count += len(vertices)
-                elif pcd_fusion_mode == "tsdf":
+                if write_tsdf:
                     _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc)
     except Exception:
         if pcd_body_file is not None:
             pcd_body_file.close()
         raise
-    finally:
-        if depth_zip is not None:
-            depth_zip.close()
 
     if len(pose_list) > 0:
         pose_data = np.stack([pose for _, pose in pose_list], axis=0)
@@ -348,17 +322,15 @@ def save_artifacts(
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
         np.savez(out_path.pose_path, data=pose_data, inds=pose_inds)
 
-    if len(intrinsics_list) > 0:
-        intrinsics_data = np.stack([intrinsics for _, intrinsics in intrinsics_list], axis=0)
-        intrinsics_inds = np.array([frame_idx for frame_idx, _ in intrinsics_list])
-        out_path.intrinsics_path.parent.mkdir(exist_ok=True, parents=True)
-        np.savez(out_path.intrinsics_path, data=intrinsics_data, inds=intrinsics_inds)
+    if intrinsics is not None:
+        assert intrinsics_frame_size is not None
+        _write_intrinsics_json(out_path, intrinsics, intrinsics_frame_size)
 
     try:
-        if pcd_fusion_mode == "backproject":
+        if write_backproject:
             assert pcd_body_file is not None
             _write_backproject_pcd(out_path, pcd_body_file, pcd_vertex_count)
-        else:
+        if write_tsdf:
             _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)
     finally:
         if pcd_body_file is not None:

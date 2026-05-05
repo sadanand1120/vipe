@@ -16,7 +16,6 @@
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-from typing import Iterator
 
 from vipe.priors.depth.dav3 import DepthAnything3Model
 from vipe.streams.base import FrameData, FrameStream
@@ -28,7 +27,7 @@ from .components.backend import SLAMBackend
 from .components.buffer import GraphBuffer
 from .components.frontend import SLAMFrontend
 from .components.inner_filler import InnerFiller
-from .components.motion_filter import MotionFilter
+from .components.motion_filter import MotionFilter, MotionFilterResult
 from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
 
@@ -56,7 +55,7 @@ class StandardResizeFrameProcessor:
         (h1, w1), (crop_top, crop_bottom, crop_left, crop_right) = self._compute_frame_size_crop(previous_frame_size)
         return h1 - (crop_top + crop_bottom), w1 - (crop_left + crop_right)
 
-    def __call__(self, frame_idx: int, frame_data: FrameData) -> FrameData:
+    def __call__(self, frame_data: FrameData) -> FrameData:
         (h1, w1), (crop_top, crop_bottom, crop_left, crop_right) = self._compute_frame_size_crop(frame_data.size())
         frame_data = frame_data.resize((h1, w1))
         frame_data = frame_data.crop(top=crop_top, bottom=crop_bottom, left=crop_left, right=crop_right)
@@ -71,34 +70,13 @@ class StandardResizeFrameProcessor:
         return new_intrinsics
 
 
-class ResizedFrameStream(FrameStream):
-    def __init__(self, stream: FrameStream, resizer: StandardResizeFrameProcessor) -> None:
-        self.stream = stream
-        self.resizer = resizer
-
-    def frame_size(self) -> tuple[int, int]:
-        return self.resizer.update_frame_size(self.stream.frame_size())
-
-    def fps(self) -> float:
-        return self.stream.fps()
-
-    def name(self) -> str:
-        return self.stream.name()
-
-    def __len__(self) -> int:
-        return len(self.stream)
-
-    def __iter__(self) -> Iterator[FrameData]:
-        for frame_idx, frame in enumerate(self.stream):
-            yield self.resizer(frame_idx, frame)
-
-
 class SLAMSystem:
     """Solver-defined SLAM"""
 
-    def __init__(self, device: torch.device, config: DictConfig) -> None:
+    def __init__(self, device: torch.device, config: DictConfig, keyframe_depth_model: str) -> None:
         self.device = device
         self.config = config.copy()
+        self.keyframe_depth_model = keyframe_depth_model
         OmegaConf.set_struct(self.config, False)
 
     def _build_components(self):
@@ -120,19 +98,23 @@ class SLAMSystem:
         self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device)
         self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device)
         self.inner_filler = InnerFiller(self.droid_net, self.buffer, self.config, device=self.device)
-        self.metric_depth = DepthAnything3Model()
+        self.metric_depth = DepthAnything3Model(self.keyframe_depth_model)
 
     def _store_buffer_frame(
         self,
         frame_idx: int,
         images: torch.Tensor,
         frame_data: FrameData,
+        fmap: torch.Tensor | None = None,
+        net: torch.Tensor | None = None,
+        inp: torch.Tensor | None = None,
     ) -> int:
         kf_idx = self.buffer.n_frames
         self.buffer.tstamp[kf_idx] = frame_idx
         self.buffer.images[kf_idx] = images[0]
-        self.buffer.fmaps[kf_idx] = self.droid_net.encode_features(images)[0]
-        net, inp = self.droid_net.encode_context(images)
+        self.buffer.fmaps[kf_idx] = (self.droid_net.encode_features(images) if fmap is None else fmap)[0]
+        if net is None or inp is None:
+            net, inp = self.droid_net.encode_context(images)
         self.buffer.nets[kf_idx], self.buffer.inps[kf_idx] = net[0], inp[0]
 
         if kf_idx == 0:
@@ -144,8 +126,21 @@ class SLAMSystem:
         self.buffer.n_frames += 1
         return kf_idx
 
-    def _add_frontend_keyframe(self, frame_idx: int, images: torch.Tensor, frame_data: FrameData):
-        kf_idx = self._store_buffer_frame(frame_idx, images, frame_data)
+    def _add_frontend_keyframe(
+        self,
+        frame_idx: int,
+        images: torch.Tensor,
+        frame_data: FrameData,
+        motion_result: MotionFilterResult,
+    ):
+        kf_idx = self._store_buffer_frame(
+            frame_idx,
+            images,
+            frame_data,
+            fmap=motion_result.fmap,
+            net=motion_result.net,
+            inp=motion_result.inp,
+        )
         self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx)
 
     def _add_infill_frame(self, frame_idx: int, images: torch.Tensor, frame_data: FrameData):
@@ -155,15 +150,21 @@ class SLAMSystem:
         images = frame_data.rgb.permute(2, 0, 1)[None]
         return images
 
+    @staticmethod
+    def _attach_intrinsics(frame_data: FrameData, intrinsics: torch.Tensor, camera_type: CameraType) -> FrameData:
+        frame_data.intrinsics = intrinsics
+        frame_data.camera_type = camera_type
+        return frame_data
+
     @torch.no_grad()
     def run(
         self,
         frame_stream: FrameStream,
+        intrinsics: torch.Tensor,
         camera_type: CameraType = CameraType.PINHOLE,
     ) -> SLAMOutput:
         resizer = StandardResizeFrameProcessor()
-        frame_stream = ResizedFrameStream(frame_stream, resizer)
-        frame_size = frame_stream.frame_size()
+        frame_size = resizer.update_frame_size(frame_stream.frame_size())
         total_n_frames = len(frame_stream)
 
         self.config.update(
@@ -176,15 +177,16 @@ class SLAMSystem:
 
         self._build_components()
 
-        # Run frontend to get attributes initialization. This will also populate attribute buffers.
-        frame_idx: int = 0
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (1/2)", total=total_n_frames
         ):
+            frame_data = self._attach_intrinsics(frame_data, intrinsics, camera_type)
+            frame_data = resizer(frame_data)
             images = self._rgb_bchw(frame_data)
+            motion_result = self.motion_filter.check(images)
 
-            if self.motion_filter.check(images) or frame_idx == total_n_frames - 1:
-                self._add_frontend_keyframe(frame_idx, images, frame_data)
+            if motion_result.is_keyframe or frame_idx == total_n_frames - 1:
+                self._add_frontend_keyframe(frame_idx, images, frame_data, motion_result)
 
             self.frontend.run()
 
@@ -196,6 +198,8 @@ class SLAMSystem:
         for frame_idx, frame_data in pbar(
             enumerate(frame_stream), desc="SLAM Pass (2/2)", total=total_n_frames
         ):
+            frame_data = self._attach_intrinsics(frame_data, intrinsics, camera_type)
+            frame_data = resizer(frame_data)
             images = self._rgb_bchw(frame_data)
             self._add_infill_frame(frame_idx, images, frame_data)
             if self.inner_filler.chunk_ready() or frame_idx == total_n_frames - 1:

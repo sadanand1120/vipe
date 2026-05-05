@@ -28,7 +28,6 @@ dependencies = [
     "opencv-python",
     "python-pycg",
     "gdown",
-    "OpenEXR",
     "kornia",
     "scipy",
     "open3d",

@@ -202,6 +202,9 @@ class FrameStream:
     def __len__(self) -> int:
         raise NotImplementedError
 
+    def __getitem__(self, index: int) -> FrameData:
+        raise NotImplementedError
+
 
 class FrameDir(FrameStream):
     """
@@ -256,13 +259,23 @@ class FrameDir(FrameStream):
     def __len__(self) -> int:
         return len(range(self.start, self.end, self.step))
 
-    def __iter__(self) -> Iterator[FrameData]:
-        for frame_idx in range(self.start, self.end, self.step):
-            frame_path = self.frame_files[frame_idx]
-            frame = cv2.imread(str(frame_path))
-            if frame is None:
-                raise ValueError(f"Could not read frame: {frame_path}")
+    def __getitem__(self, index: int) -> FrameData:
+        n_frames = len(self)
+        if index < 0:
+            index += n_frames
+        if index < 0 or index >= n_frames:
+            raise IndexError(index)
 
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
-            yield FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb)
+        frame_idx = self.start + index * self.step
+        frame_path = self.frame_files[frame_idx]
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise ValueError(f"Could not read frame: {frame_path}")
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
+        return FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb)
+
+    def __iter__(self) -> Iterator[FrameData]:
+        for frame_idx in range(len(self)):
+            yield self[frame_idx]
