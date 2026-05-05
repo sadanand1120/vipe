@@ -21,7 +21,7 @@ import torch
 
 from einops import rearrange
 
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 from vipe.utils.cameras import CameraType
 
 from ..maths import geom

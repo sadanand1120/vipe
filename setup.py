@@ -4,7 +4,7 @@ import shutil
 import tarfile
 import tempfile
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, setup
 from urllib.request import urlretrieve
 
 try:
@@ -68,7 +68,7 @@ if os.environ.get("USE_SYSTEM_EIGEN", "0") == "0":
     cpp_flags += ["-isystem", additional_include_path]
     cuda_flags += ["-isystem", additional_include_path]
 
-packages = find_packages()
+packages = find_namespace_packages(include=["vipe", "vipe.*"])
 setup(
     packages=packages,
     version=__version__,

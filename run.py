@@ -1,7 +1,7 @@
 import hydra
 from omegaconf import DictConfig
 
-from vipe.pipeline.default import VipePipeline
+from vipe.pipeline import VipePipeline
 from vipe.streams.base import FrameDir
 from vipe.utils.logging import configure_logging
 

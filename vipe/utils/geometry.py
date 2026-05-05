@@ -23,7 +23,7 @@ import torch.optim as optim
 
 from pycg.isometry import Isometry, Quaternion
 
-from vipe.ext.lietorch import SE3, SO3, LieGroupParameter, Sim3
+from vipe.ext.lietorch.groups import SE3, SO3, LieGroupParameter, Sim3
 
 
 def uniformly_sample_aabb(mins: torch.Tensor, maxes: torch.Tensor, spacing: float) -> torch.Tensor:

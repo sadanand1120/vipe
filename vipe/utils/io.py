@@ -29,7 +29,7 @@ import numpy as np
 import OpenEXR
 import torch
 
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.geometry import se3_matrix_to_se3

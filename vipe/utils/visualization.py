@@ -24,7 +24,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from pycg import image
 
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 from vipe.slam.interface import SLAMOutput
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType

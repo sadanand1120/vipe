@@ -8,9 +8,9 @@ The five-stage toy handoff is:
 
 | Stage | Toy chunks | Toy handoff |
 | --- | --- | --- |
-| Stage 1: initialization and stream setup | chunks 1.1-1.3 | `FrameDir`, one shared GeoCalib intrinsics vector, and replayable recorded initialization attributes |
+| Stage 1: initialization and stream setup | chunks 1.1-1.3 | `FrameDir`, one shared GeoCalib intrinsics vector, and `SharedIntrinsicsFrameStream` |
 | Stage 2: SLAM pass 1 frontend loop | chunks 2.1-2.2 | keyframe buffer with toy keyframes `0,1,2,3,4,5,6,8,9` |
-| Stage 3: backend global BA | chunk 3.1 | globally refined keyframe poses/disparities and backend keyframe graph |
+| Stage 3: backend global BA | chunk 3.1 | globally refined keyframe poses/disparities in `GraphBuffer` |
 | Stage 4: SLAM pass 2 pose infill loop | chunk 4.1 | full 10-frame trajectory, recovered intrinsics, and internal `SLAMMap` |
 | Stage 5: final DAV3 depth and outputs | chunks 5.1-5.3 | final frames with depth plus saved artifacts and `pcd/color_tsdf.ply` |
 
@@ -146,9 +146,9 @@ FrameData(
 At the end of chunk 1.2, every yielded frame is just RGB plus its sorted-file index. There is still no camera model, pose, depth, or point cloud. Chunk 1.3 attaches the first required geometric attribute: shared pinhole intrinsics from GeoCalib.
 
 <a id="chunk-1-3-toy"></a>
-## Chunk 1.3 Toy: Initial Stream Processors: GeoCalib Intrinsics And Attribute Recording
+## Chunk 1.3 Toy: GeoCalib Intrinsics And Shared Intrinsics Stream
 
-This corresponds to [fullexplain.md Chunk 1.3](./fullexplain.md#chunk-1-3). This completes Stage 1. GeoCalib samples three frames once, then the first full stream pass attaches and records per-frame initialization attributes. The input is the RGB-only `FrameData` stream from chunk 1.2. The output is an initialized stream where each frame has `intrinsics` and `camera_type`, plus a recorder that can recreate those attributes when the raw directory is replayed later.
+This corresponds to [fullexplain.md Chunk 1.3](./fullexplain.md#chunk-1-3). This completes Stage 1. GeoCalib samples three frames once, converts the shared vertical FOV into one raw-resolution intrinsics tensor, and wraps the original `FrameDir` with `SharedIntrinsicsFrameStream`. The input is the RGB-only `FrameData` stream from chunk 1.2. The output is a lazy calibrated stream where each yielded frame has `intrinsics` and `camera_type`.
 
 GeoCalib samples toy frames:
 
@@ -173,45 +173,32 @@ fx = fy = 24 / (2 * tan(1.0472 / 2))
    = 20.7846
 cx = 32 / 2 = 16.0
 cy = 24 / 2 = 12.0
-frame.intrinsics = [20.7846, 20.7846, 16.0, 12.0]
-frame.camera_type = PINHOLE
+shared_intrinsics = tensor([20.7846, 20.7846, 16.0, 12.0], device="cuda")
 ```
 
-`InitAttributeRecorder` stores CPU copies while this first initialized pass is consumed by SLAM:
+`SharedIntrinsicsFrameStream` holds:
 
 ```python
-recorder.stream_attributes[FrameAttribute.INTRINSICS][0] = tensor([20.7846,20.7846,16.0,12.0], device="cpu")
-recorder.stream_attributes[FrameAttribute.CAMERA_TYPE][0] = CameraType.PINHOLE
-...
-recorder.stream_attributes[FrameAttribute.INTRINSICS][9] = tensor([20.7846,20.7846,16.0,12.0], device="cpu")
-recorder.stream_attributes[FrameAttribute.CAMERA_TYPE][9] = CameraType.PINHOLE
+init_stream.stream is frame_stream
+init_stream.intrinsics is shared_intrinsics
 ```
 
-After the tenth frame has passed through this iterator:
+When SLAM starts iterating `init_stream`, frame 0 is loaded from disk and augmented:
 
 ```python
-len(recorder.stream_attributes[FrameAttribute.INTRINSICS]) == 10
-len(recorder.stream_attributes[FrameAttribute.CAMERA_TYPE]) == 10
-init_stream.initialized == True
+raw_frame = FrameData(raw_frame_idx=0, rgb.shape=(24,32,3))
+raw_frame.intrinsics = shared_intrinsics
+raw_frame.camera_type = CameraType.PINHOLE
 ```
 
-The replay processor is built from only the attributes that have at least one non-null value:
+Frame 9 gets the same intrinsics object:
 
 ```python
-stream_attributes.keys() == {
-    FrameAttribute.INTRINSICS,
-    FrameAttribute.CAMERA_TYPE,
-}
+frame_9.intrinsics = shared_intrinsics
+frame_9.camera_type = CameraType.PINHOLE
 ```
 
-On replay, frame 0 is loaded again from disk and `AssignRecordedInitProcessor` assigns the recorded values back on CUDA:
-
-```python
-frame.intrinsics = tensor([20.7846,20.7846,16.0,12.0], device="cuda")
-frame.camera_type = CameraType.PINHOLE
-```
-
-Final initialized toy frame 0:
+Final calibrated toy frame 0 yielded to SLAM:
 
 ```python
 FrameData(
@@ -222,7 +209,7 @@ FrameData(
 )
 ```
 
-So chunk 1.3 turns image-only frames into camera-calibrated frames. SLAM consumes this initialized stream once, and the recorder preserves the same raw-resolution intrinsics for later replay. Chunk 2.1 now takes these calibrated frames into SLAM, where they are resized and placed into the graph buffer.
+So chunk 1.3 turns image-only frames into camera-calibrated frames for SLAM. The stream is still lazy and re-iterable through the original `FrameDir`; there is no full-frame cache. Chunk 2.1 now takes these calibrated frames into SLAM, where they are resized and placed into the graph buffer.
 
 <a id="chunk-2-1-toy"></a>
 ## Chunk 2.1 Toy: SLAM Standard Resize, Graph Buffer, And Model Setup
@@ -260,7 +247,7 @@ frame.rgb.shape == (384,512,3)
 frame.intrinsics == [332.5536, 332.5536, 256.0, 192.0]
 ```
 
-SLAM `_precompute_features` converts it to:
+SLAM `_rgb_bchw` converts it to:
 
 ```python
 images.shape == (1,3,384,512)  # batch,C,H,W
@@ -468,7 +455,7 @@ Frame 7 is still missing from the keyframe graph because it failed the motion th
 <a id="chunk-3-1-toy"></a>
 ## Chunk 3.1 Toy: Backend Global BA Over Keyframes
 
-This corresponds to [fullexplain.md Chunk 3.1](./fullexplain.md#chunk-3-1). This is Stage 3: a sequence-level solve over keyframes, not a raw-frame loop. The input is the pass-1 keyframe graph from chunk 2.2. The output is the same keyframe set with globally refined keyframe poses/disparities plus a final backend keyframe graph.
+This corresponds to [fullexplain.md Chunk 3.1](./fullexplain.md#chunk-3-1). This is Stage 3: a sequence-level solve over keyframes, not a raw-frame loop. The input is the pass-1 keyframe buffer from chunk 2.2. The output is the same keyframe set with globally refined keyframe poses/disparities stored back into `GraphBuffer`.
 
 Pass 1 toy keyframes:
 
@@ -518,7 +505,6 @@ At the end of chunk 3.1:
 ```python
 buffer.n_frames == 9
 buffer.tstamp[:9] == [0,1,2,3,4,5,6,8,9]
-backend.last_graph.shape == (Q,2)
 ```
 
 The keyframe trajectory is globally refined, but the sequence still needs poses for non-keyframe raw frames. Chunk 4.1 uses these refined keyframes to fill frame 7 and then extracts the internal low-resolution `SLAMMap`.
@@ -625,28 +611,29 @@ slam_output.slam_map.dense_disp_frame_inds == [0,1,2,3,4,5,6,8,9]
 At the end of chunk 4.1, SLAM has produced the geometric backbone needed by the rest of the pipeline: one pose per original frame, one recovered raw-resolution intrinsic vector, and the internal keyframe map. Chunk 5.1 now replays the original RGB frames and attaches those SLAM outputs to each original-resolution `FrameData`.
 
 <a id="chunk-5-1-toy"></a>
-## Chunk 5.1 Toy: Replaying The Initialized Stream And Assigning SLAM Results
+## Chunk 5.1 Toy: Re-Reading Original Frames And Assigning SLAM Results
 
-This corresponds to [fullexplain.md Chunk 5.1](./fullexplain.md#chunk-5-1). This starts Stage 5. The input is `SLAMOutput` from chunk 4.1 plus the recorded initialization attributes from chunk 1.3. The output is an original-resolution stream where every frame has RGB, camera type, recovered intrinsics, and its final SLAM pose.
+This corresponds to [fullexplain.md Chunk 5.1](./fullexplain.md#chunk-5-1). This starts Stage 5. The input is `SLAMOutput` from chunk 4.1 plus the original `FrameDir`. The output is an original-resolution stream where every frame has RGB, camera type, recovered intrinsics, and its final SLAM pose.
 
-During replay, toy raw frame 7 is loaded again from `/toy/scene0000_00/color/7.png`:
+The pipeline builds:
+
+```python
+output_base_stream = SLAMOutputFrameStream(frame_stream, slam_output)
+output_stream = DAV3DepthStream(output_base_stream, slam_output)
+```
+
+When `output_base_stream` is iterated, toy raw frame 7 is loaded again from `/toy/scene0000_00/color/7.png`:
 
 ```python
 frame.rgb.shape == (24,32,3)
 ```
 
-`AssignRecordedInitProcessor` restores:
-
-```python
-frame.intrinsics = [20.7846,20.7846,16.0,12.0]
-frame.camera_type = PINHOLE
-```
-
-`AssignAttributesProcessor` then overwrites intrinsics with the recovered SLAM intrinsics:
+`SLAMOutputFrameStream` assigns final SLAM geometry:
 
 ```python
 frame.pose = slam_output.trajectory[7]  # c2w
 frame.intrinsics = slam_output.intrinsics
+frame.camera_type = PINHOLE
 ```
 
 For the toy:
@@ -656,7 +643,7 @@ frame.pose.translation()[:3] approx [0.7,0,0]
 frame.intrinsics == [20.7846,20.7846,16.0,12.0]
 ```
 
-Then `DAV3DepthProcessor` attaches:
+Then `DAV3DepthStream` attaches:
 
 ```python
 frame.metric_depth.shape == (24,32)
@@ -668,7 +655,7 @@ Chunk 5.1 is the handoff from SLAM-space back to artifact-space. The RGB is orig
 <a id="chunk-5-2-toy"></a>
 ## Chunk 5.2 Toy: Final DAV3 Depth For Every Frame
 
-This corresponds to [fullexplain.md Chunk 5.2](./fullexplain.md#chunk-5-2). This is the final-depth part of Stage 5. The input is the replayed original-resolution stream from chunk 5.1. The output is the same stream with `metric_depth` and optional `depth_confidence` attached to every yielded frame.
+This corresponds to [fullexplain.md Chunk 5.2](./fullexplain.md#chunk-5-2). This is the final-depth part of Stage 5. The input is the re-read original-resolution stream from chunk 5.1. The output is the same stream with `metric_depth` and optional `depth_confidence` attached to every yielded frame.
 
 Toy has exactly 10 frames and `window_size=10`, so pass 1 creates one window:
 
@@ -822,17 +809,16 @@ So chunk 5.3 turns per-frame predictions into files you can inspect. In the comm
 ```mermaid
 sequenceDiagram
     participant R as Raw frame dir
-    participant I as Init processors
+    participant I as Shared intrinsics stream
     participant S as SLAM
     participant D as DAV3 depth
     participant O as Output artifacts
-    Note over R,I: Stage 1: setup, GeoCalib, recorded init attributes
+    Note over R,I: Stage 1: setup, GeoCalib, shared intrinsics stream
     R->>I: 10 RGB frames, each 24x32x3
     I->>I: GeoCalib samples frames 0,2,4
     I->>I: intrinsics [20.7846,20.7846,16,12]
-    I->>I: record intrinsics and camera type for replay
     Note over I,S: Stage 2: pass-1 frontend loop
-    I->>S: initialized stream
+    I->>S: SharedIntrinsicsFrameStream
     S->>S: resize each frame to 384x512
     S->>S: pass 1 keyframes 0,1,2,3,4,5,6,8,9
     S->>S: frontend initialize at 8 keyframes
@@ -845,7 +831,7 @@ sequenceDiagram
     S->>D: c2w poses, intrinsics, keyframe map
     D->>D: sliding window depth for frames 0..9
     D->>O: final frames with pose, intrinsics, depth
-    O->>O: save RGB, depth, pose, intrinsics, camera type
+    O->>O: save RGB, depth, pose, intrinsics
     O->>O: integrate TSDF and write pcd/color_tsdf.ply
 ```
 

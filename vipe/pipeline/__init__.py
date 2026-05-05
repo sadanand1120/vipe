@@ -1,1 +1,0 @@
-"""Frame-directory annotation pipeline."""

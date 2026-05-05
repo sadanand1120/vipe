@@ -15,7 +15,7 @@
 
 import torch
 
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 
 
 class BaseRetractor:

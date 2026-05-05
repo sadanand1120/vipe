@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from vipe.ext import utils_ext
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 from vipe.utils.cameras import CameraType
 
 

@@ -27,8 +27,6 @@ dependencies = [
     "imageio[ffmpeg]",
     "opencv-python",
     "python-pycg",
-    "timm",
-    "transformers",
     "gdown",
     "OpenEXR",
     "kornia",

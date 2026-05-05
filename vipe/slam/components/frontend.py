@@ -22,7 +22,7 @@ import torch
 
 from omegaconf import DictConfig
 
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 
 from ..networks.droid_net import DroidNet
 from .buffer import GraphBuffer

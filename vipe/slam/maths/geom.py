@@ -16,7 +16,7 @@
 import torch
 
 from vipe.ext import slam_ext
-from vipe.ext.lietorch import SE3, Sim3
+from vipe.ext.lietorch.groups import SE3, Sim3
 from vipe.utils.cameras import BaseCameraModel, CameraType
 
 

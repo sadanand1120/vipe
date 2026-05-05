@@ -26,8 +26,8 @@ from einops import rearrange
 from omegaconf.dictconfig import DictConfig
 
 from vipe.ext import slam_ext
-from vipe.ext.lietorch import SE3
-from vipe.priors.depth import DepthEstimationInput, DepthEstimationModel
+from vipe.ext.lietorch.groups import SE3
+from vipe.priors.depth.base import DepthEstimationInput, DepthEstimationModel
 from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector

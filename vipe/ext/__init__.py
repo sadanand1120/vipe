@@ -38,9 +38,7 @@ if vipe_ext_not_found or os.environ.get("VIPE_EXT_JIT", "0") == "1":
 
 # Reference to submodules
 droid_net_ext = _C.droid_net_ext
-grounding_dino_ext = _C.grounding_dino_ext
 utils_ext = _C.utils_ext
 slam_ext = _C.slam_ext
 scatter_ext = _C.scatter_ext
 lietorch_ext = _C.lietorch_ext
-corr_ext = _C.corr_ext

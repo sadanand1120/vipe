@@ -24,8 +24,7 @@ import torch
 
 from omegaconf import DictConfig
 
-from vipe.ext import lietorch as lt
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3, cat
 
 from ..networks.droid_net import DroidNet
 from .buffer import GraphBuffer
@@ -105,5 +104,5 @@ class InnerFiller:
 
     def get_result(self) -> PoseInfillResult:
         return PoseInfillResult(
-            poses=lt.cat(self.filled_poses, dim=0),
+            poses=cat(self.filled_poses, dim=0),
         )

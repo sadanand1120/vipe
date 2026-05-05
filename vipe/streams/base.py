@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 import torch
 
-from vipe.ext.lietorch import SE3
+from vipe.ext.lietorch.groups import SE3
 from vipe.utils.cameras import CameraType
 from vipe.utils.misc import sort_image_sequence
 

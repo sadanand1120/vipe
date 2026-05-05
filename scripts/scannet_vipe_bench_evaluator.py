@@ -147,7 +147,7 @@ def run_vipe(overrides: list[str]) -> None:
     import hydra
 
     from vipe import get_config_path
-    from vipe.pipeline.default import VipePipeline
+    from vipe.pipeline import VipePipeline
     from vipe.streams.base import FrameDir
     from vipe.utils.logging import configure_logging
 
