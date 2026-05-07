@@ -121,14 +121,9 @@ class SLAMFrontend:
 
         self.t1 = self.video.n_frames
 
-        self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
+        self.graph.add_neighborhood_factors(0, self.t1, r=1)
         for _ in range(8):
             self.graph.update(t0=1, use_inactive=True)
-
-        if not self.args.seq_init:
-            self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
-            for _ in range(8):
-                self.graph.update(t0=1, use_inactive=True)
 
         self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 4 : self.t1].mean()

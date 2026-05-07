@@ -120,9 +120,6 @@ class SLAMSystem:
         if kf_idx == 0:
             self.buffer.intrinsics = unpack_optional(frame_data.intrinsics).to(self.device)
 
-        if frame_data.pose is not None:
-            self.buffer.poses[kf_idx] = frame_data.pose.inv().data
-
         self.buffer.n_frames += 1
         return kf_idx
 

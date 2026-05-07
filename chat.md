@@ -1,0 +1,311 @@
+### Frontend: when it happens
+
+Triggered during **SLAM pass 1**, every time pass-1 loop processes a frame:
+
+```python
+if frame is keyframe or last frame:
+    add keyframe to GraphBuffer
+
+frontend.run()
+```
+
+`frontend.run()` does real work only:
+- once when `GraphBuffer.n_frames == warmup`
+- later whenever a new keyframe has been added
+
+Current values:
+- `warmup = 8` config
+- `iters1 = 4` hardcoded
+- `iters2 = 2` hardcoded
+- `BA n_iters = 3` default arg in `FactorGraph.update`, hardcoded default
+- `max_age = 25` hardcoded
+- `max_factors = 48` hardcoded for frontend graph
+
+### Frontend init pseudocode
+
+Runs **once** when 8 keyframes have accumulated.
+
+```python
+# event: first time buffer.n_frames == warmup=8
+frontend.t1 = buffer.n_frames  # 8
+
+frontend.graph.add_neighborhood_factors(0, 8, r=1)  # hardcoded adjacent sequential initialization
+
+repeat 8 times:  # hardcoded
+    frontend.graph.update(t0=1, use_inactive=True)
+```
+
+Inside each `graph.update(...)`:
+
+```python
+# edge list ii,jj stays fixed for this update call
+
+coords1 = reproject using current GraphBuffer.poses/disps
+corr = DROID correlation at coords1
+delta, weight, damping = DROID update network(...)
+
+FactorGraph.target = coords1 + delta      # updated once per graph.update call
+FactorGraph.weight = weight               # updated once per graph.update call
+FactorGraph.damping = damping             # updated once per graph.update call
+
+GraphBuffer.bundle_adjustment(..., n_iters=3)
+```
+
+Inside `bundle_adjustment(n_iters=3)`:
+
+```python
+# target/weight/damping are fixed during these 3 inner solver iterations
+
+repeat 3 times:
+    build/use same solver terms:
+        DenseDepthFlowTerm
+        DispSensRegularizationTerm
+    Solver.run_inplace(...)
+    update GraphBuffer.poses
+    update GraphBuffer.disps
+```
+
+So frontend init totals:
+
+```text
+8 outer graph.update calls
+each has 1 DROID target/weight refresh
+each has 3 inner BA solver iterations
+=> 24 solver iterations total
+```
+
+### Frontend incremental pseudocode
+
+Runs **multiple times** through pass 1: once per newly accepted keyframe after initialization.
+
+```python
+# event: frontend initialized and buffer.n_frames > frontend.t1
+
+frontend.t1 += 1
+
+if graph already has corr:
+    remove active factors with age > 25  # max_age hardcoded
+    store them as inactive
+
+frontend.graph.add_proximity_factors(...)
+```
+
+Then:
+
+```python
+repeat iters1=4 times:  # hardcoded
+    frontend.graph.update(use_inactive=True)
+```
+
+Each `graph.update`:
+- keeps current edge list fixed during that call
+- refreshes DROID `target/weight/damping` once
+- runs `bundle_adjustment(n_iters=3)`
+
+Then keyframe pruning check:
+
+```python
+d = buffer.frame_distance_dense_disp(t1-3, t1-2)
+
+if d < keyframe_thresh=4.0 config:
+    graph.rm_second_newest_keyframe(...)
+    buffer slot removed
+    graph edge indices adjusted
+else:
+    repeat iters2=2 times:  # hardcoded
+        frontend.graph.update(use_inactive=True)
+```
+
+So per kept keyframe:
+
+```text
+4 + 2 = 6 outer graph.update calls
+each has 1 DROID target/weight refresh
+each has 3 inner BA solver iterations
+=> 18 solver iterations per kept-keyframe frontend update
+```
+
+Per pruned keyframe:
+
+```text
+4 outer graph.update calls
+=> 12 solver iterations
+then keyframe removed
+```
+
+### What changes in frontend
+
+Fixed during whole frontend lifetime:
+```text
+GraphBuffer object identity
+frontend.graph object identity
+frontend.graph max_factors=48
+DROID network weights
+intrinsics
+```
+
+Changes when keyframe is added:
+```text
+GraphBuffer.n_frames
+GraphBuffer.tstamp/images/fmaps/nets/inps
+GraphBuffer.disps_sens
+```
+
+Changes when factors are added/removed:
+```text
+FactorGraph.ii/jj
+FactorGraph.age
+FactorGraph.corr/f_net/inp
+FactorGraph.target/weight
+FactorGraph inactive ii_inac/jj_inac/target_inac/weight_inac
+```
+
+Changes once per `graph.update` outer step:
+```text
+FactorGraph.target
+FactorGraph.weight
+FactorGraph.damping
+FactorGraph.f_net
+```
+
+Changes during inner BA solver iterations:
+```text
+GraphBuffer.poses
+GraphBuffer.disps
+```
+
+---
+
+### Backend: when it happens
+
+Triggered **once** after pass 1 completes.
+
+```python
+# event: after all pass-1 keyframes are in GraphBuffer
+backend.run(steps=backend_iters)
+```
+
+Current values:
+- `backend_iters = 31` config
+- `itrs = 8` hardcoded in `SLAMBackend._iterate`
+- `max_factors = 16 * t` hardcoded formula
+- `incremental = False` hardcoded for backend graph
+
+### Backend pseudocode
+
+```python
+# event: after SLAM pass 1
+t = buffer.n_frames  # number of keyframes
+
+graph = FactorGraph(
+    net=droid_net,
+    buffer=same GraphBuffer,
+    max_factors=16*t,
+    incremental=False,
+)
+
+graph.add_proximity_factors(
+    rad=backend_radius=2 config,
+    nms=backend_nms=3 config,
+    thresh=backend_thresh=22.0 config,
+    beta=beta=0.3 config,
+)
+```
+
+Important:
+
+```text
+backend graph object is new
+backend edge list is built once
+backend graph is discarded after backend.run finishes
+same GraphBuffer is mutated
+```
+
+Then:
+
+```python
+graph.update_batch(itrs=8, steps=31)
+```
+
+Inside `update_batch`:
+
+```python
+corr_op = AltCorrBlock(buffer.fmaps)
+
+repeat steps=31 times:  # config backend_iters
+    coords1 = reproject using current GraphBuffer.poses/disps
+
+    for edges in batches of s=8 source index range:  # hardcoded
+        corr = corr_op(...)
+        net, delta, weight, damping = DROID update network(...)
+
+        FactorGraph.target[edges] = coords1 + delta
+        FactorGraph.weight[edges] = weight
+        FactorGraph.damping[frames] = damping
+
+    GraphBuffer.bundle_adjustment(..., n_iters=8)
+```
+
+Inside each backend `bundle_adjustment(n_iters=8)`:
+
+```python
+# edge list fixed
+# target/weight/damping fixed for these 8 solver iterations
+
+repeat 8 times:
+    DenseDepthFlowTerm
+    DispSensRegularizationTerm
+    Solver.run_inplace(...)
+    update GraphBuffer.poses
+    update GraphBuffer.disps
+```
+
+So backend totals:
+
+```text
+31 outer update_batch steps
+each has 1 full DROID target/weight refresh over all backend edges
+each has 8 inner BA solver iterations
+=> 248 solver iterations total
+```
+
+### What changes in backend
+
+Fixed for whole backend run:
+```text
+backend FactorGraph edge list ii/jj
+GraphBuffer object identity
+DROID network weights
+intrinsics
+```
+
+Changes once per backend outer step:
+```text
+FactorGraph.target
+FactorGraph.weight
+FactorGraph.damping
+FactorGraph.f_net
+```
+
+Changes during inner BA solver iterations:
+```text
+GraphBuffer.poses
+GraphBuffer.disps
+```
+
+Does not change in backend:
+```text
+GraphBuffer.n_frames
+GraphBuffer.images
+GraphBuffer.fmaps
+GraphBuffer.nets/inps
+GraphBuffer.disps_sens
+FactorGraph.ii/jj edge set
+```
+
+### One-line mental model
+
+```text
+Outer graph update step = refresh learned targets/weights using DROID, then call BA.
+Inner BA solver iterations = optimize GraphBuffer.poses/disps against fixed targets/weights.
+```

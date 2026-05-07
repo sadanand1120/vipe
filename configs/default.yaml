@@ -23,7 +23,6 @@ pipeline:
     frontend_window: 25                  # Number of recent keyframes considered by frontend optimization.
     frontend_radius: 2                   # Local radius for forced frontend graph edges.
     frontend_nms: 1                      # Non-max suppression radius for frontend proximity edges.
-    seq_init: true                       # Initialize frontend with sequential neighbor edges.
     backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
     backend_radius: 2                    # Local radius for forced backend graph edges.
     backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
@@ -36,7 +35,7 @@ pipeline:
 
   depth:
     keyframe_model: depth-anything/DA3METRIC-LARGE # DAV3 metric model anchoring SLAM keyframe depth.
-    final_model: depth-anything/DA3-GIANT          # DAV3 posed model used for final per-frame dense depth.
+    final_model: depth-anything/DA3-GIANT-1.1      # DAV3 posed model used for final per-frame dense depth.
     window_size: 10                                # Number of frames per final DAV3 sliding window.
     overlap_size: 3                                # Number of overlapped frames blended between windows.
 

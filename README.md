@@ -66,4 +66,4 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
 
 The repo is intentionally configured through `configs/default.yaml`; `run.py` and the ScanNet benchmark both compose that config and instantiate `VipePipeline` directly.
 
-The standalone artifact path is intentionally lean but complete for benchmarking: RGB videos are not written, while pose, depth, intrinsics, and configured point clouds are written. The ScanNet benchmark reads those artifacts from disk, rebuilds the DA3 `results.npz`, and reports reconstruction metrics for both TSDF and direct backprojection.
+The standalone artifact path is intentionally lean but complete for benchmarking: RGB videos are not written, while pose, depth, intrinsics, and configured point clouds are written. The ScanNet benchmark reads those artifacts through a lightweight DA3-side ViPE manifest and reports reconstruction metrics for both TSDF and direct backprojection.

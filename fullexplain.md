@@ -491,14 +491,9 @@ def stage_2_slam_pass_1_frontend(frame_stream, intrinsics):
 
         if not frontend.is_initialized and buffer.n_frames == config.warmup:
             frontend.t1 = buffer.n_frames
-            frontend.graph.add_neighborhood_factors(0, frontend.t1, r=1 if config.seq_init else 3)
+            frontend.graph.add_neighborhood_factors(0, frontend.t1, r=1)
             for _ in range(8):
                 frontend.graph.update(t0=1, use_inactive=True)
-
-            if not config.seq_init:
-                frontend.graph.add_proximity_factors(...)
-                for _ in range(8):
-                    frontend.graph.update(t0=1, use_inactive=True)
 
             frontend.initialize_next_pose_and_disparity()
             frontend.is_initialized = True
@@ -849,13 +844,6 @@ if kf_idx == 0:
 
 If the frame already has metric depth, it samples it into `disps_sens`. In current initialized frames, metric depth is not present yet, so this part is normally skipped before DAV3 keyframe depth.
 
-If an input pose exists, it stores that pose as world-to-camera. In current standalone frame-dir runs, input poses are not present, so this is skipped:
-
-```python
-if frame_data.pose is not None:
-    self.buffer.poses[kf_idx] = frame_data.pose.inv().data
-```
-
 Then phase 1 runs keyframe DAV3:
 
 ```python
@@ -924,25 +912,24 @@ Default `warmup=8`.
    ```
 2. Adds neighborhood factors:
    ```python
-   self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
+   self.graph.add_neighborhood_factors(0, self.t1, r=1)
    ```
-   Current config has `seq_init=true`, so `r=1`.
+   The reduced path always uses adjacent sequential initialization, so `r=1`.
 3. Runs 8 graph updates:
    ```python
    for _ in range(8):
        self.graph.update(t0=1, use_inactive=True)
    ```
-4. If `seq_init=false`, it would also add proximity factors and run 8 more updates. Current config does not use that branch.
-5. If no initial poses exist, initialize the next pose by constant velocity:
+4. Initialize the next pose by constant velocity from the latest optimized keyframe poses:
    ```python
    self.__init_pose()
    ```
-6. Set next disparity initial value to mean of recent disparities:
+5. Set next disparity initial value to mean of recent disparities:
    ```python
    self.video.disps[self.t1] = self.video.disps[self.t1 - 4:self.t1].mean()
    ```
-7. Set `self.is_initialized=True`.
-8. Remove factors older than `warmup - 4`, storing them as inactive:
+6. Set `self.is_initialized=True`.
+7. Remove factors older than `warmup - 4`, storing them as inactive:
    ```python
    self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
    ```
@@ -997,7 +984,7 @@ elif self.is_initialized and self.t1 < self.video.n_frames:
    for _ in range(self.iters2):  # iters2 = 2
        self.graph.update(use_inactive=True)
    ```
-8. Predict initial pose and disparity for the next possible keyframe.
+8. Seed the next buffer slot pose and disparity for the next possible keyframe.
 
 #### Factor Graph Update
 
@@ -1966,7 +1953,7 @@ Source files:
 | `vipe/pipeline.py` | Calls `io.save_artifacts` |
 | `vipe/utils/io.py` | Saves pose, per-frame final depth, one shared intrinsics JSON, and configured PCD exports |
 
-Stage context: this is the persistence part of Stage 5. It consumes the final DAV3 frame iterator once. It records poses, writes each final dense depth frame, records the single shared recovered intrinsics vector once, updates the configured PCD fusion path or paths online during the loop, and then performs the final PCD extraction/write step. It does not write an RGB video. The saved depth artifact is also the disk contract used by the ScanNet benchmark adapter.
+Stage context: this is the persistence part of Stage 5. It consumes the final DAV3 frame iterator once. It records poses, writes each final dense depth frame, records the single shared recovered intrinsics vector once, updates the configured PCD fusion path or paths online during the loop, and then performs the final PCD extraction/write step. It does not write an RGB video. The saved pose/depth/intrinsics artifacts are also the disk contract referenced by the ScanNet benchmark manifest.
 
 #### Diagram
 
@@ -2084,7 +2071,7 @@ np.save(buffer, depth, allow_pickle=False)
 depth_zip.writestr(f"{frame_idx:06d}.npy", buffer.getvalue())
 ```
 
-So `depth/color.zip` is a zip container of NumPy arrays, not EXR images. Each `.npy` stores shape and dtype metadata. The stored dtype is `float16` for compactness; the benchmark adapter preserves that `float16` depth dtype when packing `results.npz`.
+So `depth/color.zip` is a zip container of NumPy arrays, not EXR images. Each `.npy` stores shape and dtype metadata. The stored dtype is `float16` for compactness; the benchmark evaluator reads the same `float16` frames directly through the ViPE manifest path.
 
 At the end:
 
@@ -2270,7 +2257,7 @@ So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled
 | --- | --- | --- |
 | Frame input type | frame directory | Reads sorted images directly from `streams.base_path`. |
 | Camera type | `pinhole` | GeoCalib and DAV3 path assume pinhole. |
-| Initial poses | absent | SLAM estimates poses from scratch. |
+| SLAM pose source | estimated from the frame sequence | SLAM starts from internal identity and constant-velocity initialization, then optimizes poses with frontend/backend BA. |
 | SLAM keyframe depth anchor | `pipeline.depth.keyframe_model`, default DAV3 `DA3METRIC-LARGE` | DAV3 metric depth regularizes keyframe disparities. |
 | Final dense depth | `pipeline.depth.final_model`, default DAV3 `DA3-GIANT` | Final dense depth comes from DAV3 posed multi-frame inference. |
 | `save_artifacts` | `true` in your command | Pose, depth zip, intrinsics JSON, and configured PCD artifacts are written. |
@@ -2288,7 +2275,7 @@ So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled
 
 ## ScanNet Benchmark Adapter And Reconstruction Eval
 
-The standalone run writes ViPE-native artifacts. The ScanNet benchmark script turns those artifacts into the DA3 evaluator format and then calls the DA3 evaluator. The packaging path is intentionally disk-based:
+The standalone run writes ViPE-native artifacts. The ScanNet benchmark script now keeps those artifacts native and writes a small DA3-side manifest instead of repacking everything into a huge `results.npz`.
 
 ```mermaid
 flowchart TD
@@ -2298,38 +2285,60 @@ flowchart TD
     B --> E[scannet_vipe_bench_evaluator.py]
     C --> E
     D --> E
-    E --> F[DA3 results.npz]
-    E --> G[DA3 gt_meta.npz]
-    F --> H[DA3 Evaluator.eval]
+    E --> F[exports/vipe_manifest.json]
+    E --> G[exports/gt_meta.npz]
+    F --> H[DA3 ScanNet direct ViPE loader]
     G --> H
-    H --> I[TSDF reconstruction eval]
-    H --> J[Backproject reconstruction eval]
+    H --> I[Pose eval]
+    H --> J[TSDF reconstruction eval]
+    H --> K[Backproject reconstruction eval]
 ```
 
 Normal benchmark mode:
 
 ```text
-run ViPE -> read ViPE artifacts from disk -> rebuild results.npz -> write gt_meta.npz -> call DA3 evaluator
+run ViPE -> write vipe_manifest.json -> write gt_meta.npz -> call DA3 evaluator
 ```
 
 `--eval-only` mode:
 
 ```text
-read existing ViPE artifacts from disk -> rebuild results.npz -> write gt_meta.npz -> call DA3 evaluator
+reuse existing ViPE artifacts -> write vipe_manifest.json -> write gt_meta.npz -> call DA3 evaluator
 ```
 
-So `--eval-only` skips only the ViPE inference run. It still repackages `results.npz` from `pose/color.npz`, `depth/color.zip`, and `intrinsics/color.json` before evaluation.
+So `--eval-only` skips only the ViPE inference run. It still refreshes the lightweight benchmark manifest and GT metadata, but it no longer rebuilds a duplicated `results.npz`.
 
-The benchmark `results.npz` contains:
+The ViPE manifest is written at:
 
-| Key | Shape | Meaning |
-| --- | --- | --- |
-| `depth` | `(N,H,W)` | Final ViPE/DAV3 dense depth loaded from `depth/color.zip` and stored as `float16`. |
-| `conf` | `(N,H,W)` | `float16` ones, because ViPE artifacts do not persist DAV3 confidence maps. |
-| `extrinsics` | `(N,4,4)` | World-to-camera matrices computed as inverse of saved ViPE camera-to-world poses. |
-| `intrinsics` | `(N,3,3)` | Shared pinhole matrix expanded to every benchmark frame. |
+```text
+workspace/.../model_results/scannet/<scene>/{unposed,posed}/exports/vipe_manifest.json
+```
 
-The adapter writes `results.npz` with uncompressed `np.savez`, not `np.savez_compressed`, so packaging avoids the slow single-process zip/deflate compression step. If both posed and unposed exports are needed, the second `results.npz` path is a hardlink to the first one because the numeric payload is identical before mode-specific evaluator prep.
+It contains:
+
+| Key | Meaning |
+| --- | --- |
+| `format` | Manifest version, currently `vipe_artifacts_v1`. |
+| `scene` | ScanNet scene name. |
+| `artifact_name` | Frame stream artifact basename, usually `color`. |
+| `vipe_output_dir` | Root of the native ViPE artifacts for this scene. |
+| `pose_path` | Native ViPE pose artifact, e.g. `pose/color.npz`. |
+| `depth_path` | Native ViPE final dense depth artifact, e.g. `depth/color.zip`. |
+| `intrinsics_path` | Native ViPE intrinsics artifact, e.g. `intrinsics/color.json`. |
+| `frame_indices` | Exact ViPE frame indices included in the benchmark subset. |
+
+For ScanNet, the DA3 evaluator asks the dataset for its prediction artifact path, and the current ScanNet dataset returns `exports/vipe_manifest.json`. The ViPE benchmark path does not write, read, hardlink, or delete `exports/mini_npz/results.npz`.
+
+The direct ViPE loader reconstructs the same logical arrays the DA3 evaluator used before, but on demand from native artifacts:
+
+| Logical field | Direct source |
+| --- | --- |
+| Predicted depth | `depth/color.zip`, reading `000000.npy`, `000001.npy`, etc. from `frame_indices`. |
+| Predicted extrinsics | `pose/color.npz`, converting saved ViPE camera-to-world poses to world-to-camera matrices. |
+| Predicted intrinsics | `intrinsics/color.json`, expanded to a `3x3` pinhole matrix per benchmark frame. |
+| GT metadata | `exports/gt_meta.npz`, containing the sampled ScanNet GT extrinsics, intrinsics, and image file list. |
+
+No fake `conf=np.ones(...)` array is produced anymore because ScanNet reconstruction metrics do not use confidence. Pose eval also reads predicted extrinsics through the same dataset loader, so it no longer requires a result NPZ.
 
 The evaluator then runs two reconstruction methods for each reconstruction mode:
 
@@ -2344,7 +2353,7 @@ Those PLY paths are relative to each mode-specific export directory, so unposed 
 
 The two evaluator reconstruction methods share the same prepared inputs for a given mode. For `recon_unposed`, evaluator prep aligns predicted ViPE poses to GT with Umeyama/RANSAC and scales depth by the recovered Sim3 scale. For `recon_posed`, evaluator prep uses GT poses and GT intrinsics while still scaling predicted depth by the same alignment scale. Both methods resize depth to original RGB size, apply the ScanNet GT valid-depth mask, enforce `max_depth=5.0`, and compare to the GT mesh after the same AABB crop, voxel downsample, and distance-threshold metric logic.
 
-This means the standalone `pcd/color_tsdf.ply` and `pcd/color_backproject.ply` are inspection/use artifacts built directly from raw ViPE outputs, while benchmark `pcd_tsdf.ply` and `pcd_backproject.ply` are evaluator-controlled reconstructions built from the packaged `results.npz`.
+This means the standalone `pcd/color_tsdf.ply` and `pcd/color_backproject.ply` are inspection/use artifacts built directly during ViPE artifact saving, while benchmark `pcd_tsdf.ply` and `pcd_backproject.ply` are evaluator-controlled reconstructions built from the same native ViPE pose/depth/intrinsics artifacts through `vipe_manifest.json`.
 
 The key computational distinction is:
 

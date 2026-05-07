@@ -5,15 +5,11 @@ import json
 import os
 import subprocess
 import sys
-import time
-import zipfile
 
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from tqdm import tqdm
 
 from vipe.utils.determinism import seed_everything
 from vipe.utils.misc import sort_image_sequence
@@ -56,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-only",
         action="store_true",
-        help="Skip ViPE inference, rebuild DA3 benchmark exports from existing ViPE artifacts, then evaluate",
+        help="Skip ViPE inference, write benchmark manifests from existing ViPE artifacts, then evaluate",
     )
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
@@ -165,15 +161,6 @@ def run_vipe(overrides: list[str]) -> None:
     pipeline.run(stream)
 
 
-def _intrinsics_3x3(intr: np.ndarray) -> np.ndarray:
-    if intr.shape == (3, 3):
-        return intr.astype(np.float32)
-    if intr.shape[0] < 4:
-        raise ValueError(f"Expected ViPE pinhole intrinsics [fx, fy, cx, cy], got shape {intr.shape}")
-    fx, fy, cx, cy = intr[:4]
-    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
-
-
 def _subset_scene_data(scene_data, keep_indices: list[int]):
     from addict import Dict
 
@@ -240,40 +227,7 @@ def _artifact_name(frame_dir: Path) -> str:
     return frame_dir.name
 
 
-def _load_pose_artifact(vipe_output_dir: Path, artifact_name: str) -> dict[int, np.ndarray]:
-    pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
-    if not pose_path.exists():
-        raise FileNotFoundError(f"Missing ViPE pose artifact: {pose_path}")
-
-    pose_npz = np.load(pose_path)
-    return {int(idx): pose.astype(np.float32) for idx, pose in zip(pose_npz["inds"], pose_npz["data"])}
-
-
-def _load_intrinsics_artifact(vipe_output_dir: Path, artifact_name: str) -> np.ndarray:
-    intr_path = vipe_output_dir / "intrinsics" / f"{artifact_name}.json"
-    if not intr_path.exists():
-        raise FileNotFoundError(f"Missing ViPE intrinsics artifact: {intr_path}")
-
-    data = json.loads(intr_path.read_text(encoding="utf-8"))
-    return np.array(data["params"], dtype=np.float32)
-
-
-def _read_depth_artifact(depth_zip: zipfile.ZipFile, frame_idx: int) -> np.ndarray:
-    name = f"{frame_idx:06d}.npy"
-    try:
-        raw = depth_zip.read(name)
-    except KeyError as exc:
-        raise KeyError(f"Missing ViPE depth frame {name}") from exc
-    return np.load(BytesIO(raw), allow_pickle=False).astype(np.float16, copy=False)
-
-
-def _file_size_summary(path: Path) -> str:
-    stat = path.stat()
-    disk_mb = stat.st_blocks * 512 / 1024 / 1024
-    return f"{disk_mb:.1f} MB"
-
-
-def _export_vipe_scene(
+def _write_vipe_manifest(
     args: argparse.Namespace,
     evaluator,
     scene: str,
@@ -283,81 +237,45 @@ def _export_vipe_scene(
     vipe_output_dir: Path,
     artifact_name: str,
 ) -> None:
-    print(f"[INFO] Packing ViPE benchmark export | {scene} | frames={len(frame_indices)}", flush=True)
+    print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={len(frame_indices)}", flush=True)
 
-    poses_c2w = _load_pose_artifact(vipe_output_dir, artifact_name)
-    intrinsics = _load_intrinsics_artifact(vipe_output_dir, artifact_name)
+    pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     depth_path = vipe_output_dir / "depth" / f"{artifact_name}.zip"
-    if not depth_path.exists():
-        raise FileNotFoundError(f"Missing ViPE depth artifact: {depth_path}")
+    intrinsics_path = vipe_output_dir / "intrinsics" / f"{artifact_name}.json"
+    missing_artifacts = [path for path in [pose_path, depth_path, intrinsics_path] if not path.exists()]
+    if missing_artifacts:
+        raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
 
-    depths_out = []
-    extrinsics_out = []
-    intrinsics_out = []
-    missing = []
-    with zipfile.ZipFile(depth_path, "r") as depth_zip:
-        for frame_idx in tqdm(
-            frame_indices,
-            total=len(frame_indices),
-            desc=f"[ViPE export] pack {scene}",
-            unit="frame",
-            dynamic_ncols=True,
-        ):
-            if frame_idx not in poses_c2w:
-                missing.append(f"missing pose frame {frame_idx}")
-                continue
-            try:
-                depth = _read_depth_artifact(depth_zip, frame_idx)
-            except KeyError as exc:
-                missing.append(str(exc))
-                continue
-
-            depths_out.append(depth)
-            extrinsics_out.append(np.linalg.inv(poses_c2w[frame_idx]).astype(np.float32))
-            intrinsics_out.append(_intrinsics_3x3(intrinsics))
-
-    if missing:
-        raise ValueError("ViPE artifacts do not cover the benchmark frame set:\n" + "\n".join(missing[:20]))
-
-    if not depths_out:
-        raise ValueError("No frames exported for benchmark")
-
-    depth_arr = np.stack(depths_out).astype(np.float16, copy=False)
-    result_payload = {
-        "depth": depth_arr,
-        "conf": np.ones(depth_arr.shape, dtype=np.float16),
-        "extrinsics": np.stack(extrinsics_out).astype(np.float32, copy=False),
-        "intrinsics": np.stack(intrinsics_out).astype(np.float32, copy=False),
+    manifest = {
+        "format": "vipe_artifacts_v1",
+        "scene": scene,
+        "artifact_name": artifact_name,
+        "vipe_output_dir": str(vipe_output_dir.resolve()),
+        "pose_path": str(pose_path.resolve()),
+        "depth_path": str(depth_path.resolve()),
+        "intrinsics_path": str(intrinsics_path.resolve()),
+        "frame_indices": [int(idx) for idx in frame_indices],
     }
 
     exported_scene_data = _subset_scene_data(full_scene_data, kept_scene_indices)
     need_unposed = {"pose", "recon_unposed"} & set(args.modes)
     need_posed = {"recon_posed"} & set(args.modes)
-    first_result_path = None
     for posed in [False, True]:
         if posed and not need_posed:
             continue
         if not posed and not need_unposed:
             continue
         export_dir = Path(evaluator._export_dir("scannet", scene, posed=posed))
-        result_path = export_dir / "exports" / "mini_npz" / "results.npz"
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-        if first_result_path is None:
-            print(f"[INFO] Writing ViPE NPZ | {scene} | {result_path}", flush=True)
-            start_time = time.perf_counter()
-            np.savez(result_path, **result_payload)
-            elapsed = time.perf_counter() - start_time
-            print(f"[INFO] Saved ViPE NPZ | {scene} | {elapsed:.2f}s | {_file_size_summary(result_path)}", flush=True)
-            first_result_path = result_path
-        else:
-            if result_path.exists():
-                result_path.unlink()
-            print(f"[INFO] Linking ViPE NPZ | {scene} | posed={posed} | {result_path}", flush=True)
-            os.link(first_result_path, result_path)
+        exports_dir = export_dir / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_path = exports_dir / "vipe_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        print(f"[INFO] Wrote ViPE manifest | {scene} | posed={posed} | {manifest_path}", flush=True)
         print(f"[INFO] Writing GT metadata | {scene} | posed={posed}", flush=True)
         evaluator._save_gt_meta(str(export_dir), exported_scene_data)
 
-    print(f"[INFO] Exported ViPE benchmark data for {scene} to DA3 layout under {args.work_dir}")
+    print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
 
 def _load_evaluator(args: argparse.Namespace):
@@ -466,7 +384,7 @@ def prepare_vipe_benchmark_exports(
         )
         if run_vipe_first:
             run_vipe(scene_overrides)
-        _export_vipe_scene(
+        _write_vipe_manifest(
             args,
             evaluator,
             scene,
