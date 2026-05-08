@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -30,6 +32,9 @@ from .components.inner_filler import InnerFiller
 from .components.motion_filter import MotionFilter, MotionFilterResult
 from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
+
+
+logger = logging.getLogger(__name__)
 
 
 class StandardResizeFrameProcessor:
@@ -174,9 +179,8 @@ class SLAMSystem:
 
         self._build_components()
 
-        for frame_idx, frame_data in pbar(
-            enumerate(frame_stream), desc="SLAM Pass (1/2)", total=total_n_frames
-        ):
+        pass1_pbar = pbar(enumerate(frame_stream), desc="SLAM Pass (1/2)", total=total_n_frames)
+        for frame_idx, frame_data in pass1_pbar:
             frame_data = self._attach_intrinsics(frame_data, intrinsics, camera_type)
             frame_data = resizer(frame_data)
             images = self._rgb_bchw(frame_data)
@@ -187,8 +191,26 @@ class SLAMSystem:
 
             self.frontend.run()
 
+            if hasattr(pass1_pbar, "set_postfix"):
+                pass1_pbar.set_postfix(
+                    kf=self.buffer.n_frames,
+                    act_fac=self.frontend.graph.num_factors,
+                )
+
+        logger.info(
+            "SLAM pass 1 complete: keyframes=%d act_fac=%d",
+            self.buffer.n_frames,
+            self.frontend.graph.num_factors,
+        )
+
         # Run a global BA over the keyframes.
-        self.backend.run(self.config.backend_iters)
+        backend_active_factors = self.backend.run(self.config.backend_iters)
+        logger.info(
+            "SLAM backend complete: keyframes=%d act_fac=%d",
+            self.buffer.n_frames,
+            backend_active_factors,
+        )
+
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.start_after_keyframes(self.buffer.n_frames)

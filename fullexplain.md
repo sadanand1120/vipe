@@ -492,24 +492,27 @@ def stage_2_slam_pass_1_frontend(frame_stream, intrinsics):
         if not frontend.is_initialized and buffer.n_frames == config.warmup:
             frontend.t1 = buffer.n_frames
             frontend.graph.add_neighborhood_factors(0, frontend.t1, r=1)
-            for _ in range(8):
-                frontend.graph.update(t0=1, use_inactive=True)
+            for _ in range(config.frontend_init_updates):
+                frontend.graph.update(
+                    t0=1,
+                    itrs=config.frontend_ba_iters,
+                )
 
             frontend.initialize_next_pose_and_disparity()
             frontend.is_initialized = True
 
         elif frontend.is_initialized and frontend.t1 < buffer.n_frames:
-            frontend.graph.rm_factors(frontend.graph.age > frontend.max_age, store=True)
+            frontend.graph.rm_factors(frontend.graph.age > config.frontend_max_age)
             frontend.graph.add_proximity_factors(...)
 
-            for _ in range(frontend.iters1):
-                frontend.graph.update(use_inactive=True)
+            for _ in range(config.frontend_update_iters1):
+                frontend.graph.update(itrs=config.frontend_ba_iters)
 
             if second_newest_keyframe_is_too_close():
                 frontend.graph.rm_second_newest_keyframe(...)
             else:
-                for _ in range(frontend.iters2):
-                    frontend.graph.update(use_inactive=True)
+                for _ in range(config.frontend_update_iters2):
+                    frontend.graph.update(itrs=config.frontend_ba_iters)
 
             frontend.initialize_next_pose_and_disparity()
 
@@ -918,7 +921,7 @@ Default `warmup=8`.
 3. Runs 8 graph updates:
    ```python
    for _ in range(8):
-       self.graph.update(t0=1, use_inactive=True)
+       self.graph.update(t0=1, itrs=self.frontend_ba_iters)
    ```
 4. Initialize the next pose by constant velocity from the latest optimized keyframe poses:
    ```python
@@ -929,9 +932,9 @@ Default `warmup=8`.
    self.video.disps[self.t1] = self.video.disps[self.t1 - 4:self.t1].mean()
    ```
 6. Set `self.is_initialized=True`.
-7. Remove factors older than `warmup - 4`, storing them as inactive:
+7. Remove factors older than `warmup - 4`:
    ```python
-   self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
+   self.graph.rm_factors(self.graph.ii < self.warmup - 4)
    ```
 
 #### Frontend Incremental Update
@@ -951,7 +954,7 @@ elif self.is_initialized and self.t1 < self.video.n_frames:
    ```
 2. Drops old active factors whose age is too high:
    ```python
-   self.graph.rm_factors(self.graph.age > self.max_age, store=True)
+   self.graph.rm_factors(self.graph.age > self.frontend_max_age)
    ```
 3. Adds proximity factors:
    ```python
@@ -965,10 +968,10 @@ elif self.is_initialized and self.t1 < self.video.n_frames:
        remove=True,
    )
    ```
-4. Runs 4 graph updates:
+4. Runs `frontend_update_iters1` graph updates:
    ```python
-   for _ in range(self.iters1):  # iters1 = 4
-       self.graph.update(use_inactive=True)
+   for _ in range(self.frontend_update_iters1):  # default 4
+       self.graph.update(itrs=self.frontend_ba_iters)
    ```
 5. Computes dense-disparity frame distance between the second-newest and third-newest keyframes:
    ```python
@@ -979,10 +982,10 @@ elif self.is_initialized and self.t1 < self.video.n_frames:
    self.graph.rm_second_newest_keyframe(self.t1 - 2)
    self.t1 -= 1
    ```
-7. Else run 2 more graph updates:
+7. Else run `frontend_update_iters2` more graph updates:
    ```python
-   for _ in range(self.iters2):  # iters2 = 2
-       self.graph.update(use_inactive=True)
+   for _ in range(self.frontend_update_iters2):  # default 2
+       self.graph.update(itrs=self.frontend_ba_iters)
    ```
 8. Seed the next buffer slot pose and disparity for the next possible keyframe.
 
@@ -1205,7 +1208,7 @@ def stage_3_backend_global_ba(buffer):
     graph = FactorGraph(
         net=droid_net,
         buffer=buffer,
-        max_factors=16 * t,
+        max_factors=config.backend_max_factors_per_keyframe * t,
         incremental=False,
     )
 
@@ -1252,7 +1255,7 @@ def stage_3_backend_global_ba(buffer):
             jj=graph.jj,
             t0=1,
             t1=t,
-            n_iters=8,
+            n_iters=config.backend_ba_iters,
             pose_damping=1e-5,
             pose_ep=1e-2,
             motion_only=False,
@@ -1310,7 +1313,7 @@ graph = FactorGraph(
     self.net,
     self.video,
     self.device,
-    max_factors=16 * t,
+    max_factors=self.args.backend_max_factors_per_keyframe * t,
     incremental=False,
 )
 ```
@@ -1349,8 +1352,9 @@ If the graph has edges, the backend calls `_iterate`.
 
 ```python
 graph.update_batch(
-    itrs=8,
+    itrs=self.args.backend_ba_iters,
     steps=steps,
+    batch_size=self.args.backend_batch_size,
     solver_verbose=True,
 )
 ```
@@ -1367,7 +1371,7 @@ For each batch step:
 
 1. Reproject current dense disparities to get `coords1`.
 2. Build motion features.
-3. Process graph edges in source-index chunks of size `s=8`.
+3. Process graph edges in source-index chunks of size `backend_batch_size`.
 4. Sample alt correlation only for the chunk.
 5. Run the DROID update module.
 6. Update target coordinates, weights, and damping.

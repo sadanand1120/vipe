@@ -41,7 +41,7 @@ class SLAMFrontend:
             net,
             video,
             device,
-            max_factors=48,
+            max_factors=args.frontend_max_factors,
             incremental=True,
         )
 
@@ -50,10 +50,6 @@ class SLAMFrontend:
 
         # frontend variables
         self.is_initialized = False
-
-        self.max_age = 25
-        self.iters1 = 4
-        self.iters2 = 2
 
         # Number of frames to wait before initializing (default 8)
         self.args = args
@@ -64,6 +60,11 @@ class SLAMFrontend:
         self.frontend_window = args.frontend_window
         self.frontend_thresh = args.frontend_thresh
         self.frontend_radius = args.frontend_radius
+        self.frontend_max_age = args.frontend_max_age
+        self.frontend_init_updates = args.frontend_init_updates
+        self.frontend_update_iters1 = args.frontend_update_iters1
+        self.frontend_update_iters2 = args.frontend_update_iters2
+        self.frontend_ba_iters = args.frontend_ba_iters
 
     def __init_pose(self):
         assert self.t1 > 1
@@ -83,7 +84,7 @@ class SLAMFrontend:
         # t1 - 3 is the frame before the previous frame
 
         if self.graph.corr is not None:
-            self.graph.rm_factors(self.graph.age > self.max_age, store=True)
+            self.graph.rm_factors(self.graph.age > self.frontend_max_age)
 
         self.graph.add_proximity_factors(
             self.t1 - 5,
@@ -95,8 +96,8 @@ class SLAMFrontend:
             remove=True,
         )
 
-        for _ in range(self.iters1):
-            self.graph.update(use_inactive=True)
+        for _ in range(self.frontend_update_iters1):
+            self.graph.update(itrs=self.frontend_ba_iters)
 
         # remove frame t1-2 if it is too close to t1-3, so the new keyframes will be [t1-3, t1-1]
         d = self.video.frame_distance_dense_disp(
@@ -109,8 +110,8 @@ class SLAMFrontend:
             self.graph.rm_second_newest_keyframe(self.t1 - 2)
             self.t1 -= 1
         else:
-            for _ in range(self.iters2):
-                self.graph.update(use_inactive=True)
+            for _ in range(self.frontend_update_iters2):
+                self.graph.update(itrs=self.frontend_ba_iters)
 
         # set pose for next itration
         self.__init_pose()
@@ -122,15 +123,15 @@ class SLAMFrontend:
         self.t1 = self.video.n_frames
 
         self.graph.add_neighborhood_factors(0, self.t1, r=1)
-        for _ in range(8):
-            self.graph.update(t0=1, use_inactive=True)
+        for _ in range(self.frontend_init_updates):
+            self.graph.update(t0=1, itrs=self.frontend_ba_iters)
 
         self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 4 : self.t1].mean()
 
         # initialization complete
         self.is_initialized = True
-        self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
+        self.graph.rm_factors(self.graph.ii < self.warmup - 4)
 
     def run(self):
         """main update"""

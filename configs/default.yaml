@@ -1,8 +1,3 @@
-defaults:
-  - _self_                                # Load this file before Hydra logging overrides.
-  - override hydra/hydra_logging: none    # Disable Hydra's own logging config.
-  - override hydra/job_logging: disabled  # Keep app logging controlled by vipe.utils.logging.
-
 streams:
   base_path: ??       # Required input frame directory.
   fps: ??             # Required input frame rate.
@@ -23,10 +18,19 @@ pipeline:
     frontend_window: 25                  # Number of recent keyframes considered by frontend optimization.
     frontend_radius: 2                   # Local radius for forced frontend graph edges.
     frontend_nms: 1                      # Non-max suppression radius for frontend proximity edges.
+    frontend_max_factors: 48             # Max active factors kept in the incremental frontend graph.
+    frontend_max_age: 25                 # Delete active frontend factors after this many graph updates.
+    frontend_init_updates: 8             # Graph update calls during frontend warmup initialization.
+    frontend_update_iters1: 4            # First graph update loop after adding a new frontend keyframe.
+    frontend_update_iters2: 2            # Extra graph update loop when the candidate keyframe is retained.
+    frontend_ba_iters: 3                 # Inner BA solver iterations per frontend graph update.
     backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
     backend_radius: 2                    # Local radius for forced backend graph edges.
     backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
     backend_iters: 31                    # Global backend BA iteration steps.
+    backend_ba_iters: 8                  # Inner BA solver iterations per backend graph update.
+    backend_max_factors_per_keyframe: 16 # Backend factor budget multiplier: max factors = value * keyframes.
+    backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
     init_disp: 1.0                       # Initial disparity value before metric depth is injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     map_filter_thresh: 0.05              # Relative depth-consistency threshold for extracting the SLAM map.

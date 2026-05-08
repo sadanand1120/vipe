@@ -23,10 +23,12 @@ disable_progress_bar: bool = False
 
 def configure_logging() -> logging.Logger:
     """
-    Configure the logging system. This will detach all loggers under vipe from the root.
-    To use the package in a bigger project you probably don't want to call this function and instead manage logging yourself.
+    Configure ViPE logging. This owns every logger under ``vipe.*`` so Hydra
+    entrypoints and direct script entrypoints emit the same messages.
     """
     logger = logging.getLogger("vipe")
+    logger.handlers.clear()
+    logger.disabled = False
 
     # Define a custom logging handler to use tqdm.write
     class TqdmLoggingHandler(logging.Handler):
@@ -41,6 +43,12 @@ def configure_logging() -> logging.Logger:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+
+    for name, child in logging.Logger.manager.loggerDict.items():
+        if name.startswith("vipe.") and isinstance(child, logging.Logger):
+            child.disabled = False
+            child.setLevel(logging.NOTSET)
+            child.propagate = True
 
     return logger
 

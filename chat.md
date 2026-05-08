@@ -15,11 +15,11 @@ frontend.run()
 
 Current values:
 - `warmup = 8` config
-- `iters1 = 4` hardcoded
-- `iters2 = 2` hardcoded
-- `BA n_iters = 3` default arg in `FactorGraph.update`, hardcoded default
-- `max_age = 25` hardcoded
-- `max_factors = 48` hardcoded for frontend graph
+- `frontend_update_iters1 = 4` config
+- `frontend_update_iters2 = 2` config
+- `frontend_ba_iters = 3` config
+- `frontend_max_age = 25` config
+- `frontend_max_factors = 48` config
 
 ### Frontend init pseudocode
 
@@ -31,8 +31,8 @@ frontend.t1 = buffer.n_frames  # 8
 
 frontend.graph.add_neighborhood_factors(0, 8, r=1)  # hardcoded adjacent sequential initialization
 
-repeat 8 times:  # hardcoded
-    frontend.graph.update(t0=1, use_inactive=True)
+repeat frontend_init_updates=8 times:  # config
+    frontend.graph.update(t0=1, itrs=frontend_ba_iters)
 ```
 
 Inside each `graph.update(...)`:
@@ -84,8 +84,7 @@ Runs **multiple times** through pass 1: once per newly accepted keyframe after i
 frontend.t1 += 1
 
 if graph already has corr:
-    remove active factors with age > 25  # max_age hardcoded
-    store them as inactive
+    remove active factors with age > frontend_max_age=25  # config
 
 frontend.graph.add_proximity_factors(...)
 ```
@@ -93,8 +92,8 @@ frontend.graph.add_proximity_factors(...)
 Then:
 
 ```python
-repeat iters1=4 times:  # hardcoded
-    frontend.graph.update(use_inactive=True)
+repeat frontend_update_iters1=4 times:  # config
+    frontend.graph.update(itrs=frontend_ba_iters)
 ```
 
 Each `graph.update`:
@@ -112,8 +111,8 @@ if d < keyframe_thresh=4.0 config:
     buffer slot removed
     graph edge indices adjusted
 else:
-    repeat iters2=2 times:  # hardcoded
-        frontend.graph.update(use_inactive=True)
+    repeat frontend_update_iters2=2 times:  # config
+        frontend.graph.update(itrs=frontend_ba_iters)
 ```
 
 So per kept keyframe:
@@ -139,7 +138,7 @@ Fixed during whole frontend lifetime:
 ```text
 GraphBuffer object identity
 frontend.graph object identity
-frontend.graph max_factors=48
+frontend.graph max_factors=frontend_max_factors=48
 DROID network weights
 intrinsics
 ```
@@ -157,7 +156,6 @@ FactorGraph.ii/jj
 FactorGraph.age
 FactorGraph.corr/f_net/inp
 FactorGraph.target/weight
-FactorGraph inactive ii_inac/jj_inac/target_inac/weight_inac
 ```
 
 Changes once per `graph.update` outer step:
@@ -187,8 +185,9 @@ backend.run(steps=backend_iters)
 
 Current values:
 - `backend_iters = 31` config
-- `itrs = 8` hardcoded in `SLAMBackend._iterate`
-- `max_factors = 16 * t` hardcoded formula
+- `backend_ba_iters = 8` config
+- `backend_max_factors_per_keyframe = 16` config, so `max_factors = 16 * t`
+- `backend_batch_size = 8` config
 - `incremental = False` hardcoded for backend graph
 
 ### Backend pseudocode
@@ -200,7 +199,7 @@ t = buffer.n_frames  # number of keyframes
 graph = FactorGraph(
     net=droid_net,
     buffer=same GraphBuffer,
-    max_factors=16*t,
+    max_factors=backend_max_factors_per_keyframe*t,
     incremental=False,
 )
 
@@ -224,7 +223,7 @@ same GraphBuffer is mutated
 Then:
 
 ```python
-graph.update_batch(itrs=8, steps=31)
+graph.update_batch(itrs=backend_ba_iters, steps=backend_iters, batch_size=backend_batch_size)
 ```
 
 Inside `update_batch`:
@@ -235,7 +234,7 @@ corr_op = AltCorrBlock(buffer.fmaps)
 repeat steps=31 times:  # config backend_iters
     coords1 = reproject using current GraphBuffer.poses/disps
 
-    for edges in batches of s=8 source index range:  # hardcoded
+    for edges in source-index batches of backend_batch_size=8:  # config
         corr = corr_op(...)
         net, delta, weight, damping = DROID update network(...)
 
@@ -243,10 +242,10 @@ repeat steps=31 times:  # config backend_iters
         FactorGraph.weight[edges] = weight
         FactorGraph.damping[frames] = damping
 
-    GraphBuffer.bundle_adjustment(..., n_iters=8)
+    GraphBuffer.bundle_adjustment(..., n_iters=backend_ba_iters)
 ```
 
-Inside each backend `bundle_adjustment(n_iters=8)`:
+Inside each backend `bundle_adjustment(n_iters=backend_ba_iters)`:
 
 ```python
 # edge list fixed

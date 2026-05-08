@@ -320,10 +320,10 @@ Created in two places:
 
 ```python
 SLAMFrontend.__init__:
-    self.graph = FactorGraph(..., max_factors=48, incremental=True)
+    self.graph = FactorGraph(..., max_factors=frontend_max_factors, incremental=True)
 
 SLAMBackend.run:
-    graph = FactorGraph(..., max_factors=16*t, incremental=False)
+    graph = FactorGraph(..., max_factors=backend_max_factors_per_keyframe*t, incremental=False)
 ```
 
 `FactorGraph` owns the graph edges. An edge is a directed pair:
@@ -362,10 +362,8 @@ This means active directed edges:
 | `buffer` | The shared `GraphBuffer` whose states are optimized. |
 | `ii`, `jj` | Active directed edge list. |
 | `age` | Number of frontend updates since each edge was added. |
-| `ii_inac`, `jj_inac` | Removed/inactive edges stored for possible use in frontend BA. |
 | `target` | Learned target coordinates for each edge and low-res pixel. |
 | `weight` | Learned residual weights for each edge and low-res pixel. |
-| `target_inac`, `weight_inac` | Stored targets/weights for inactive edges. |
 | `corr` | Incremental correlation object for active edges, frontend only. |
 | `f_net` | DROID recurrent hidden state for each active edge/source frame. |
 | `inp` | DROID context input for each active edge/source frame, frontend only. |
@@ -381,7 +379,7 @@ Adds directed edges.
 Steps:
 
 1. Convert inputs to tensors.
-2. Remove repeats already present in active or inactive edge sets.
+2. Remove repeats already present in the active edge set.
 3. If frontend graph would exceed `max_factors` and `remove=True`, remove old factors.
 4. If `incremental=True`, precompute/append correlation blocks:
    ```python
@@ -398,15 +396,9 @@ Steps:
 
 Initial `target` is not a measurement yet. It starts as the current projection. The DROID update network later modifies it into a learned target.
 
-### `rm_factors(mask, store=False)`
+### `rm_factors(mask)`
 
-Removes active edges. If `store=True`, it moves those edges into inactive storage:
-
-```text
-ii_inac, jj_inac, target_inac, weight_inac
-```
-
-Frontend uses inactive factors in later BA when `use_inactive=True`.
+Removes active edges and their associated correlation/state/target/weight tensors.
 
 ### `rm_second_newest_keyframe(ix)`
 
@@ -495,7 +487,7 @@ The exact backend BA call path is:
 SLAMBackend.run
 -> graph = FactorGraph(..., incremental=False)
 -> graph.add_proximity_factors(...)
--> graph.update_batch(itrs=8, steps=backend_iters)
+-> graph.update_batch(itrs=backend_ba_iters, steps=backend_iters, batch_size=backend_batch_size)
 -> GraphBuffer.bundle_adjustment(...)
 -> Solver.run_inplace(...)
 ```
@@ -504,12 +496,14 @@ In current config:
 
 ```yaml
 backend_iters: 31
+backend_ba_iters: 8
+backend_batch_size: 8
 ```
 
 So backend executes 31 outer update steps. Each step calls:
 
 ```python
-buffer.bundle_adjustment(..., n_iters=8, ...)
+buffer.bundle_adjustment(..., n_iters=backend_ba_iters, ...)
 ```
 
 That means each backend step runs 8 internal solver iterations after updating DROID targets/weights.
@@ -519,7 +513,7 @@ That means each backend step runs 8 internal solver iterations after updating DR
 `frontend.graph` is a persistent object:
 
 ```python
-self.graph = FactorGraph(..., max_factors=48, incremental=True)
+self.graph = FactorGraph(..., max_factors=frontend_max_factors, incremental=True)
 ```
 
 It lives across pass-1. As new keyframes arrive, it adds/removes edges and carries recurrent DROID state for those edges.
@@ -527,7 +521,7 @@ It lives across pass-1. As new keyframes arrive, it adds/removes edges and carri
 The backend graph is a temporary local object:
 
 ```python
-graph = FactorGraph(..., max_factors=16*t, incremental=False)
+graph = FactorGraph(..., max_factors=backend_max_factors_per_keyframe*t, incremental=False)
 ```
 
 It is created fresh once after pass-1 ends. It sees the final keyframe set in `GraphBuffer`, builds denser proximity edges, optimizes globally, then is discarded.
@@ -627,7 +621,7 @@ High-level steps:
    ```python
    d = buffer.frame_distance_dense_disp(ii, jj, beta)
    ```
-3. Suppress pairs already active/inactive.
+3. Suppress pairs already active.
 4. Reject near-diagonal pairs:
    ```python
    d[(ii - rad < jj) | (d > thresh)] = inf
@@ -683,8 +677,8 @@ backend_thresh: 22.0
 So:
 
 ```text
-frontend proximity = recent/local, capped by max_factors=48, incremental
-backend proximity = denser whole-keyframe-set graph, max_factors=16*t
+frontend proximity = recent/local, capped by frontend_max_factors, incremental
+backend proximity = denser whole-keyframe-set graph, capped by backend_max_factors_per_keyframe*t
 ```
 
 ### Solver Factor Types
@@ -831,7 +825,7 @@ age = 0
 Call:
 
 ```python
-graph.update(t0=1, use_inactive=True)
+graph.update(t0=1, itrs=frontend_ba_iters)
 ```
 
 For edge `0 -> 1`, suppose current projection for pixel 0 is:
@@ -901,7 +895,7 @@ The reduced path always does:
 ```python
 graph.add_neighborhood_factors(0, warmup, r=1)
 for _ in range(8):
-    graph.update(t0=1, use_inactive=True)
+    graph.update(t0=1, itrs=frontend_ba_iters)
 ```
 
 Solver-level terms during each `graph.update`:
@@ -924,17 +918,17 @@ SLAMFrontend.__update()
 It does:
 
 ```python
-graph.rm_factors(age > max_age, store=True)
+graph.rm_factors(age > frontend_max_age)
 graph.add_proximity_factors(...)
-for _ in range(iters1=4):
-    graph.update(use_inactive=True)
+for _ in range(frontend_update_iters1):
+    graph.update(itrs=frontend_ba_iters)
 ```
 
 Then it may prune the second-newest keyframe. If it does not prune:
 
 ```python
-for _ in range(iters2=2):
-    graph.update(use_inactive=True)
+for _ in range(frontend_update_iters2):
+    graph.update(itrs=frontend_ba_iters)
 ```
 
 Graph-construction factors:
@@ -973,7 +967,11 @@ graph.add_proximity_factors(
     thresh=backend_thresh,
     beta=beta,
 )
-graph.update_batch(itrs=8, steps=backend_iters)
+graph.update_batch(
+    itrs=backend_ba_iters,
+    steps=backend_iters,
+    batch_size=backend_batch_size,
+)
 ```
 
 Graph-construction factors:

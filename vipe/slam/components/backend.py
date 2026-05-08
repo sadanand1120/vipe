@@ -40,8 +40,9 @@ class SLAMBackend:
 
     def _iterate(self, graph: FactorGraph, steps: int):
         graph.update_batch(
-            itrs=8,
+            itrs=self.args.backend_ba_iters,
             steps=steps,
+            batch_size=self.args.backend_batch_size,
             solver_verbose=True,
         )
 
@@ -55,7 +56,7 @@ class SLAMBackend:
             self.net,
             self.video,
             self.device,
-            max_factors=16 * t,
+            max_factors=self.args.backend_max_factors_per_keyframe * t,
             incremental=False,
         )
 
@@ -75,3 +76,5 @@ class SLAMBackend:
                 self.video.disps_sens[0],
                 self.video.disps[0],
             )
+
+        return graph.num_factors

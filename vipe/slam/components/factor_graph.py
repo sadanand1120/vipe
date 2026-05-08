@@ -71,17 +71,13 @@ class FactorGraph:
 
         self.corr, self.f_net, self.inp = None, None, None
 
-        self.ii_inac = torch.as_tensor([], dtype=torch.long, device=device)
-        self.jj_inac = torch.as_tensor([], dtype=torch.long, device=device)
-        self.target_inac = torch.zeros([1, 0, ht, wd, 2], device=device, dtype=torch.float)
-        self.weight_inac = torch.zeros([1, 0, ht, wd, 2], device=device, dtype=torch.float)
+    @property
+    def num_factors(self) -> int:
+        return int(self.ii.shape[0])
 
     def __filter_repeated_edges(self, ii, jj):
         keep = torch.zeros(ii.shape[0], dtype=torch.bool, device=ii.device)
-        eset = set(
-            [(i.item(), j.item()) for i, j in zip(self.ii, self.jj)]
-            + [(i.item(), j.item()) for i, j in zip(self.ii_inac, self.jj_inac)]
-        )
+        eset = set((i.item(), j.item()) for i, j in zip(self.ii, self.jj))
 
         for k, (i, j) in enumerate(zip(ii, jj)):
             keep[k] = (i.item(), j.item()) not in eset
@@ -106,7 +102,7 @@ class FactorGraph:
             and remove
         ):
             ix = torch.arange(len(self.age))[torch.argsort(self.age).cpu()]
-            self.rm_factors(ix >= self.max_factors - ii.shape[0], store=True)
+            self.rm_factors(ix >= self.max_factors - ii.shape[0])
 
         if self.incremental:
             fmap1 = self.buffer.fmaps[ii][None]
@@ -133,13 +129,7 @@ class FactorGraph:
         self.weight = torch.cat([self.weight, weight], 1)
 
     @torch.amp.autocast("cuda", enabled=True)
-    def rm_factors(self, mask: torch.Tensor, store: bool = False):
-        if store:
-            self.ii_inac = torch.cat([self.ii_inac, self.ii[mask]], 0)
-            self.jj_inac = torch.cat([self.jj_inac, self.jj[mask]], 0)
-            self.target_inac = torch.cat([self.target_inac, self.target[:, mask]], 1)
-            self.weight_inac = torch.cat([self.weight_inac, self.weight[:, mask]], 1)
-
+    def rm_factors(self, mask: torch.Tensor):
         self.ii = self.ii[~mask]
         self.jj = self.jj[~mask]
         self.age = self.age[~mask]
@@ -158,20 +148,10 @@ class FactorGraph:
     def rm_second_newest_keyframe(self, ix: int):
         self.buffer.remove_second_newest(ix)
 
-        m = (self.ii_inac == ix) | (self.jj_inac == ix)
-        self.ii_inac[self.ii_inac >= ix] -= 1
-        self.jj_inac[self.jj_inac >= ix] -= 1
-
-        if torch.any(m):
-            self.ii_inac = self.ii_inac[~m]
-            self.jj_inac = self.jj_inac[~m]
-            self.target_inac = self.target_inac[:, ~m]
-            self.weight_inac = self.weight_inac[:, ~m]
-
         m = (self.ii == ix) | (self.jj == ix)
         self.ii[self.ii >= ix] -= 1
         self.jj[self.jj >= ix] -= 1
-        self.rm_factors(m, store=False)
+        self.rm_factors(m)
 
     @torch.amp.autocast("cuda", enabled=True)
     def update(
@@ -179,7 +159,6 @@ class FactorGraph:
         t0: int | None = None,
         t1: int | None = None,
         itrs: int = 3,
-        use_inactive: bool = False,
         motion_only: bool = False,
     ):
         assert self.incremental
@@ -208,25 +187,16 @@ class FactorGraph:
             self.weight = weight.to(dtype=torch.float)
             self.damping[di] = damping
 
-            if use_inactive:
-                m = (self.ii_inac >= t0 - 3) & (self.jj_inac >= t0 - 3)
-                ii = torch.cat([self.ii_inac[m], self.ii], 0)
-                jj = torch.cat([self.jj_inac[m], self.jj], 0)
-                target = torch.cat([self.target_inac[:, m], self.target], 1)
-                weight = torch.cat([self.weight_inac[:, m], self.weight], 1)
-            else:
-                ii, jj, target, weight = self.ii, self.jj, self.target, self.weight
-
             ht, wd = self.coords0.shape[0:2]
-            target = rearrange(target, "1 k h w c -> k (h w) c", c=2, h=ht, w=wd)
-            weight = rearrange(weight, "1 k h w c -> k (h w) c", c=2, h=ht, w=wd)
+            target = rearrange(self.target, "1 k h w c -> k (h w) c", c=2, h=ht, w=wd)
+            weight = rearrange(self.weight, "1 k h w c -> k (h w) c", c=2, h=ht, w=wd)
 
             self.buffer.bundle_adjustment(
                 target=target,
                 weight=weight,
                 disp_damping=self.damping,
-                ii=ii,
-                jj=jj,
+                ii=self.ii,
+                jj=self.jj,
                 t0=t0,
                 t1=t1,
                 n_iters=itrs,
@@ -243,6 +213,7 @@ class FactorGraph:
         self,
         itrs: int,
         steps: int,
+        batch_size: int,
         solver_verbose: bool = False,
     ):
         if self.incremental:
@@ -259,10 +230,9 @@ class FactorGraph:
                 motn = torch.cat([coords1 - self.coords0, self.target - coords1], dim=-1)
                 motn = motn.permute(0, 1, 4, 2, 3).clamp(-64.0, 64.0)
 
-            s = 8
             assert self.jj.max() >= self.ii.max()
-            for i in range(0, self.jj.max() + 1, s):
-                v = (self.ii >= i) & (self.ii < i + s)
+            for i in range(0, self.jj.max() + 1, batch_size):
+                v = (self.ii >= i) & (self.ii < i + batch_size)
                 if not torch.any(v):
                     continue
                 iis, jjs = self.ii[v], self.jj[v]
@@ -343,9 +313,6 @@ class FactorGraph:
 
         for i, j in zip(self.ii.cpu().numpy(), self.jj.cpu().numpy()):
             _suppress_nms(i, j)
-        for i, j in zip(self.ii_inac.cpu().numpy(), self.jj_inac.cpu().numpy()):
-            _suppress_nms(i, j)
-
         d[(ii - rad < jj) | (d > thresh)] = np.inf
 
         es = []
