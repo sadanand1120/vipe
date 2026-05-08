@@ -16,6 +16,7 @@ import numpy as np
 
 PROGRAM_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = PROGRAM_DIR.parent
+PROMPT_DIR = PROGRAM_DIR / "prompts"
 for import_dir in (PROGRAM_DIR, SCRIPT_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
@@ -61,60 +62,15 @@ TASK_PROGRAM_SCHEMA = {
 }
 
 
-TASK_PROGRAM_INSTRUCTIONS = f"""
-You synthesize small spatial grounding programs for a mobile robot base-pose viewer.
-
-Return JSON matching the provided schema. Do not return prose.
-
-Available program operations:
-- clip_grounding: grounds an open-vocabulary object class. Use source=null, dist=null, wholeobj=true.
-- close_to, in_front, on_the_side, behind, on_top, below: spatial predicates with source=<previous var>, class=<target object class>, dist=<meters>, wholeobj=<bool>.
-
-Execution automatically branches if a step returns multiple candidate instances. Do not write loops.
-
-Interpret a natural-language task by ignoring the downstream action verb itself, and only grounding the objects and spatial predicates needed to place a mobile robot on floor points where the task can be done.
-
-The final returned variable must be points on the floor, so the last step should target class="floor" with wholeobj=false.
-For any step that targets class="floor", always use dist=0.8.
-
-Set threshold to {DEFAULT_THRESHOLD} unless there is a strong reason not to.
-Choose dist thresholds from object context and typical object size. The minimum allowed distance is {MIN_DIST} meters and the maximum allowed distance is {MAX_DIST} meters.
-
-Example:
-Task: Throw the trash in the trash can near the door
-Program:
-{{
-  "steps": [
-    {{"var": "door", "op": "clip_grounding", "source": null, "class": "door", "dist": null, "wholeobj": true, "threshold": 0.95}},
-    {{"var": "trashcan", "op": "close_to", "source": "door", "class": "trash can", "dist": 1.0, "wholeobj": true, "threshold": 0.95}},
-    {{"var": "goal", "op": "in_front", "source": "trashcan", "class": "floor", "dist": 0.8, "wholeobj": false, "threshold": 0.95}}
-  ],
-  "return": "goal"
-}}
-
-Example:
-Task: Pick up the helmet from bed
-Program:
-{{
-  "steps": [
-    {{"var": "bed", "op": "clip_grounding", "source": null, "class": "bed", "dist": null, "wholeobj": true, "threshold": 0.95}},
-    {{"var": "helmet", "op": "on_top", "source": "bed", "class": "helmet", "dist": 0.5, "wholeobj": true, "threshold": 0.95}},
-    {{"var": "goal", "op": "close_to", "source": "helmet", "class": "floor", "dist": 0.8, "wholeobj": false, "threshold": 0.95}}
-  ],
-  "return": "goal"
-}}
-
-Example:
-Task: Replace the bicycle front tire
-Program:
-{{
-  "steps": [
-    {{"var": "bicycle", "op": "clip_grounding", "source": null, "class": "bicycle", "dist": null, "wholeobj": true, "threshold": 0.95}},
-    {{"var": "front_tire", "op": "in_front", "source": "bicycle", "class": "floor", "dist": 0.8, "wholeobj": false, "threshold": 0.95}}
-  ],
-  "return": "front_tire"
-}}
-""".strip()
+TASK_PROGRAM_INSTRUCTIONS = (
+    (PROMPT_DIR / "task_program_instructions.txt")
+    .read_text()
+    .replace("{{DEFAULT_THRESHOLD}}", f"{DEFAULT_THRESHOLD:g}")
+    .replace("{{MIN_DIST}}", f"{MIN_DIST:g}")
+    .replace("{{MAX_DIST}}", f"{MAX_DIST:g}")
+    .strip()
+)
+TASK_PROGRAM_USER_PROMPT_TEMPLATE = (PROMPT_DIR / "task_program_user_prompt.txt").read_text()
 
 
 HTML = r"""
@@ -375,7 +331,7 @@ def parse_args() -> argparse.Namespace:
 
 def synthesize_program(task: str, model: str) -> dict[str, object]:
     return llm_json_call(
-        f"Task: {task}",
+        TASK_PROGRAM_USER_PROMPT_TEMPLATE.replace("{{task}}", task),
         schema=TASK_PROGRAM_SCHEMA,
         schema_name="mobile_robot_task_program",
         model=model,

@@ -61,12 +61,16 @@ class VideoWriter:
         return self
 
     def write(self, frame: np.ndarray):
+        if frame.dtype in [np.float32, np.float64]:
+            frame = (frame * 255).astype(np.uint8)
+        h, w = frame.shape[:2]
+        if h % 2 != 0 or w % 2 != 0:
+            pad = ((0, h % 2), (0, w % 2)) + ((0, 0),) * (frame.ndim - 2)
+            frame = np.pad(frame, pad, mode="edge")
+
         if self.vw is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.vw = imageio.get_writer(str(self.path), fps=self.fps, codec="libx264", macro_block_size=None)
-
-        if frame.dtype in [np.float32, np.float64]:
-            frame = (frame * 255).astype(np.uint8)
 
         assert self.vw is not None
         self.vw.append_data(frame)

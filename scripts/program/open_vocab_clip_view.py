@@ -14,6 +14,7 @@ import numpy as np
 
 PROGRAM_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = PROGRAM_DIR.parent
+PROMPT_DIR = PROGRAM_DIR / "prompts"
 for import_dir in (PROGRAM_DIR, SCRIPT_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
@@ -28,7 +29,6 @@ RGB_FILE = "rgb.ply"
 CLIP_FILE = "clip.npz"
 DEFAULT_NEGATIVE_TEXT = "object"
 DEFAULT_TEMPERATURE = 0.01
-VLM_MAX_CHECK_SCORE = 0.999
 BEST_VIEWS_DIR = "best_views"
 VLM_CONCURRENCY = 16
 VLM_RESPONSE_SCHEMA = {
@@ -40,12 +40,8 @@ VLM_RESPONSE_SCHEMA = {
     },
     "required": ["is_correct", "reason"],
 }
-VLM_INSTRUCTIONS = (
-    "You are validating open-vocabulary 3D instance retrieval results. "
-    "The image is side-by-side: left is the original RGB view; right is the same view with one red bounding box. "
-    "Return is_correct=true only when the red bounding box clearly covers the requested object. "
-    "Reject background, nearby objects, occluders, ambiguous boxes, or cases where the target is only near the box."
-)
+VLM_INSTRUCTIONS = (PROMPT_DIR / "open_vocab_vlm_instructions.txt").read_text().strip()
+VLM_INSTANCE_PROMPT_TEMPLATE = (PROMPT_DIR / "open_vocab_vlm_instance_prompt.txt").read_text()
 HEATMAP_STOPS = np.asarray(
     [
         [49, 54, 149],
@@ -379,6 +375,20 @@ def load_instance_ids(pcd_dir: Path) -> np.ndarray:
     return vertices["instance_id"].astype(np.int32, copy=False)
 
 
+def load_instance_label_texts(pcd_dir: Path, instance_ids: np.ndarray) -> dict[int, str]:
+    data = np.load(pcd_dir / CLIP_FILE)
+    point_label_ids = data["point_label_ids"].astype(np.int32, copy=False)
+    point_instance_ids = load_instance_ids(pcd_dir)
+    label_texts = [str(label) for label in data["label_texts"].tolist()]
+    labels: dict[int, str] = {}
+    for instance_id in instance_ids.tolist():
+        mask = (point_instance_ids == int(instance_id)) & (point_label_ids >= 0)
+        ids, counts = np.unique(point_label_ids[mask], return_counts=True)
+        if len(ids):
+            labels[int(instance_id)] = label_texts[int(ids[np.argmax(counts)])]
+    return labels
+
+
 class ClipScorer:
     def __init__(self, pcd_dir: Path, temperature: float) -> None:
         if temperature <= 0:
@@ -463,6 +473,7 @@ class ClipScorer:
 class VlmRejector:
     def __init__(self, pcd_dir: Path, instance_ids: np.ndarray) -> None:
         self.best_views_dir = pcd_dir / BEST_VIEWS_DIR
+        self.instance_label_texts = load_instance_label_texts(pcd_dir, instance_ids)
         if not self.best_views_dir.exists():
             raise FileNotFoundError(f"Missing required best-view dir: {self.best_views_dir}")
 
@@ -473,12 +484,9 @@ class VlmRejector:
     async def _check_instance(self, client, text: str, instance_id: int, score: float, semaphore: asyncio.Semaphore) -> dict[str, object]:
         async with semaphore:
             prompt = (
-                f'Query object class: "{text}"\n'
-                f"Candidate instance id: {instance_id}\n"
-                f"CLIP instance score: {score:.6f}\n\n"
-                "Look at the right panel only for the candidate red bounding box. "
-                "Decide if the red bounding box covers the queried object class. "
-                "The left panel is only context. Return the structured answer."
+                VLM_INSTANCE_PROMPT_TEMPLATE.replace("{{query_object_class}}", text)
+                .replace("{{instance_id}}", str(int(instance_id)))
+                .replace("{{clip_score}}", f"{score:.6f}")
             )
             result = await async_vlm_json_call(
                 prompt,
@@ -502,10 +510,15 @@ class VlmRejector:
             }
 
     async def reject(self, text: str, instance_scores: dict[int, float], threshold: float) -> dict[str, object]:
+        query = text.lower()
         passed = [
             (int(instance_id), float(score))
             for instance_id, score in instance_scores.items()
-            if np.isfinite(score) and threshold <= float(score) <= VLM_MAX_CHECK_SCORE
+            if (
+                np.isfinite(score)
+                and threshold <= float(score)
+                and self.instance_label_texts.get(int(instance_id), "").lower() != query
+            )
         ]
         passed.sort(key=lambda item: (-item[1], item[0]))
         if not passed:

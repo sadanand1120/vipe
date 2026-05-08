@@ -15,6 +15,7 @@
 
 
 import logging
+import struct
 from pathlib import Path
 from typing import Iterator
 
@@ -33,6 +34,56 @@ from vipe.utils.misc import unpack_optional
 logger = logging.getLogger(__name__)
 
 
+def _colmap_qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
+    return np.array(
+        [
+            [
+                1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+                2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
+            ],
+            [
+                2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
+            ],
+            [
+                2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+                2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
+            ],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _load_colmap_image_poses(images_bin: Path) -> dict[str, np.ndarray]:
+    poses: dict[str, np.ndarray] = {}
+    with images_bin.open("rb") as f:
+        (num_images,) = struct.unpack("<Q", f.read(8))
+        for _ in range(num_images):
+            data = struct.unpack("<idddddddi", f.read(64))
+            qvec = np.asarray(data[1:5], dtype=np.float32)
+            tvec = np.asarray(data[5:8], dtype=np.float32)
+            name_bytes = bytearray()
+            while True:
+                char = f.read(1)
+                if char == b"\x00":
+                    break
+                name_bytes.extend(char)
+            name = Path(name_bytes.decode("utf-8")).name
+            (num_points2d,) = struct.unpack("<Q", f.read(8))
+            f.seek(24 * num_points2d, 1)
+
+            w2c_rot = _colmap_qvec_to_rotmat(qvec)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = w2c_rot.T
+            c2w[:3, 3] = -w2c_rot.T @ tvec
+            poses[name] = c2w
+            poses[Path(name).stem] = c2w
+    return poses
+
+
 class ScanNetGTProcessor(FrameProcessor):
     def __init__(
         self,
@@ -46,6 +97,12 @@ class ScanNetGTProcessor(FrameProcessor):
         self.depth_dir = scene_dir / "depth"
         self.use_gt_pose = use_gt_pose
         self.use_gt_depth = use_gt_depth
+        self.colmap_poses = None
+        if self.use_gt_pose and not self.pose_dir.exists():
+            images_bin = scene_dir / "sparse" / "0" / "images.bin"
+            if not images_bin.exists():
+                raise FileNotFoundError(f"Missing ScanNet pose dir or COLMAP images.bin: {self.pose_dir} | {images_bin}")
+            self.colmap_poses = _load_colmap_image_poses(images_bin)
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         attributes = set(previous_attributes)
@@ -59,8 +116,16 @@ class ScanNetGTProcessor(FrameProcessor):
         frame_id = self.frame_files[frame.raw_frame_idx].stem
 
         if self.use_gt_pose:
-            pose_path = self.pose_dir / f"{frame_id}.txt"
-            pose = np.loadtxt(pose_path, dtype=np.float32)
+            if self.colmap_poses is None:
+                pose_path = self.pose_dir / f"{frame_id}.txt"
+                pose = np.loadtxt(pose_path, dtype=np.float32)
+            else:
+                frame_name = self.frame_files[frame.raw_frame_idx].name
+                pose = self.colmap_poses.get(frame_name)
+                if pose is None:
+                    pose = self.colmap_poses.get(frame_id)
+                if pose is None:
+                    raise FileNotFoundError(f"Missing COLMAP pose for frame: {frame_name}")
             frame.pose = se3_matrix_to_se3(pose).cuda()
 
         if self.use_gt_depth:

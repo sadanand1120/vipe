@@ -1,0 +1,5 @@
+Query object class: "{{query_object_class}}"
+Candidate instance id: {{instance_id}}
+CLIP instance score: {{clip_score}}
+
+Look at the right panel only for the candidate red bounding box. Decide if the red bounding box covers the queried object class. The left panel is only context. Return the structured answer.

@@ -582,6 +582,18 @@ def _write_scannet_annotation_pcds(
 ) -> None:
     if vertex_count == 0:
         return
+    scene_dir = source_frame_dir.parent
+    scene = scene_dir.name
+    raw_scene_dir = SCANNET_RAW_ROOT / scene
+    required_paths = [
+        raw_scene_dir / f"{scene}_vh_clean_2.ply",
+        raw_scene_dir / f"{scene}_vh_clean_2.0.010000.segs.json",
+        raw_scene_dir / f"{scene}.aggregation.json",
+        scene_dir / f"{scene}_vh_clean_2.vertex_normals.npy",
+    ]
+    if any(not path.exists() for path in required_paths):
+        logger.info(f"Skipping ScanNet annotation PLYs; GT files not found for scene {scene}")
+        return
 
     from scipy.spatial import cKDTree
 
