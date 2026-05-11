@@ -174,3 +174,4 @@ csrc/include/
 outputs/
 workspace/
 data/
+.tmp_openai_key

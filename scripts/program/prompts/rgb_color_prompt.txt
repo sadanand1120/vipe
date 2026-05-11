@@ -1,0 +1,3 @@
+Color description: {{color_text}}
+
+Return the representative sRGB color.

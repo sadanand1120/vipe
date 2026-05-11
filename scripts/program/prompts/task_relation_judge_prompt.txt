@@ -1,0 +1,13 @@
+Task: {{task}}
+Relation: {{relation}}
+Reference object: {{source_class}} instance {{source_instance_id}}
+Target object: {{target_class}} instance {{target_instance_id}}
+CLIP target score: {{target_score}}
+
+Measurements:
+- horizontal_surface_distance_m: {{horizontal_surface_distance_m}}
+- front_m: {{front_m}}
+- lateral_m: {{lateral_m}}
+- vertical_m: {{vertical_m}}
+
+Should this target be kept for this relation in this task?

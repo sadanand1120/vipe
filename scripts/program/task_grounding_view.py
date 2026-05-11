@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import mimetypes
@@ -21,16 +22,21 @@ for import_dir in (PROGRAM_DIR, SCRIPT_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
 
-from openai_utils import DEFAULT_LLM_MODEL, llm_json_call
+from openai_utils import DEFAULT_LLM_MODEL, async_llm_json_call, llm_json_call, make_async_client
 from open_vocab_clip_view import DEFAULT_TEMPERATURE
+from relation_judge import (
+    DEFAULT_POINT_SELECTION_DIST_M,
+    RELATION_JUDGE_INSTRUCTIONS,
+    RELATION_JUDGE_SCHEMA,
+    RELATION_LLM_CONCURRENCY,
+    make_relation_judge_prompt,
+)
 from spatial_relation_view import RELATIONS, RGB_FILE, RelationEngine, validate_inputs
 from view_pcd import DEFAULT_HOST, DEFAULT_PCD_DIR, DEFAULT_POINT_SIZE
 
 
 DEFAULT_PORT = 8091
 DEFAULT_THRESHOLD = 0.95
-MIN_DIST = 0.5
-MAX_DIST = 6.0
 OPS = ("clip_grounding", *RELATIONS)
 
 
@@ -49,11 +55,10 @@ TASK_PROGRAM_SCHEMA = {
                     "op": {"type": "string", "enum": list(OPS)},
                     "source": {"type": ["string", "null"]},
                     "class": {"type": "string"},
-                    "dist": {"type": ["number", "null"]},
                     "wholeobj": {"type": "boolean"},
                     "threshold": {"type": "number"},
                 },
-                "required": ["var", "op", "source", "class", "dist", "wholeobj", "threshold"],
+                "required": ["var", "op", "source", "class", "wholeobj", "threshold"],
             },
         },
         "return": {"type": "string"},
@@ -66,8 +71,6 @@ TASK_PROGRAM_INSTRUCTIONS = (
     (PROMPT_DIR / "task_program_instructions.txt")
     .read_text()
     .replace("{{DEFAULT_THRESHOLD}}", f"{DEFAULT_THRESHOLD:g}")
-    .replace("{{MIN_DIST}}", f"{MIN_DIST:g}")
-    .replace("{{MAX_DIST}}", f"{MAX_DIST:g}")
     .strip()
 )
 TASK_PROGRAM_USER_PROMPT_TEMPLATE = (PROMPT_DIR / "task_program_user_prompt.txt").read_text()
@@ -199,6 +202,10 @@ HTML = r"""
           colors[j] = 0.0;
           colors[j + 1] = 0.45;
           colors[j + 2] = 1.0;
+        } else if (mask[i] === 3) {
+          colors[j] = 1.0;
+          colors[j + 1] = 0.05;
+          colors[j + 2] = 0.05;
         }
       }
       colorAttr.needsUpdate = true;
@@ -235,7 +242,7 @@ HTML = r"""
         const executeResponse = await fetch('/execute', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({program: programPayload.program}),
+          body: JSON.stringify({program: programPayload.program, task}),
         });
         if (!executeResponse.ok) throw new Error(await executeResponse.text());
         const payload = await executeResponse.json();
@@ -313,6 +320,7 @@ HTML = r"""
 @dataclass
 class Branch:
     instance_id: int
+    object_class: str
     point_indices: np.ndarray
     referential_instance_id: int
     trace: tuple[str, ...]
@@ -352,10 +360,9 @@ def format_program_text(program: dict[str, object]) -> str:
             lines.append(f'{var} = clip_grounding("{obj_class}"{threshold_text})')
         else:
             source = str(step["source"])
-            dist = float(step["dist"])
             wholeobj = bool(step["wholeobj"])
             lines.append(
-                f'{var} = {op}({source}, "{obj_class}", dist={dist:g}, wholeobj={wholeobj}{threshold_text})'
+                f'{var} = {op}({source}, "{obj_class}", wholeobj={wholeobj}{threshold_text})'
             )
     lines.append(f'return {program["return"]}')
     return "\n".join(lines)
@@ -398,29 +405,87 @@ class TaskExecutor:
         self.ground_cache[key] = result
         return result
 
+    def relation_measurements(
+        self,
+        source: Branch,
+        target_id: int,
+        target_points: np.ndarray,
+        focus_points: np.ndarray,
+        focus_centroid: np.ndarray,
+        front: np.ndarray,
+        side: np.ndarray,
+        top: np.ndarray,
+        nearest_distances: np.ndarray,
+    ) -> dict[str, float]:
+        from scipy.spatial import cKDTree
+
+        target_centroid = target_points.mean(axis=0)
+        delta = target_centroid - focus_centroid
+        horizontal_surface, _ = cKDTree(focus_points[:, :2]).query(target_points[:, :2], k=1)
+        return {
+            "source_instance_id": int(source.instance_id),
+            "target_instance_id": int(target_id),
+            "horizontal_surface_distance_m": float(np.min(horizontal_surface)),
+            "front_m": float(np.dot(delta, front)),
+            "lateral_m": float(np.dot(delta, side)),
+            "vertical_m": float(np.dot(delta, top)),
+        }
+
+    async def judge_whole_object_relations(
+        self,
+        cases: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        if not cases:
+            return []
+        client = make_async_client()
+        semaphore = asyncio.Semaphore(RELATION_LLM_CONCURRENCY)
+
+        async def judge(case: dict[str, object]) -> dict[str, object]:
+            async with semaphore:
+                result = await async_llm_json_call(
+                    str(case["prompt"]),
+                    schema=RELATION_JUDGE_SCHEMA,
+                    schema_name="spatial_relation_judge",
+                    model=self.model,
+                    instructions=RELATION_JUDGE_INSTRUCTIONS,
+                    max_output_tokens=1024,
+                    client=client,
+                )
+                keep = result.get("keep")
+                reason = result.get("reason")
+                if not isinstance(keep, bool) or not isinstance(reason, str):
+                    raise ValueError(f"Invalid relation judge output: {result}")
+                case["keep"] = bool(keep)
+                case["reason"] = reason[:220]
+                return case
+
+        try:
+            return await asyncio.gather(*(judge(case) for case in cases))
+        finally:
+            await client.close()
+
     def relation_branches(
         self,
         source_branches: list[Branch],
         relation: str,
         obj_class: str,
-        dist: float,
         wholeobj: bool,
         threshold: float,
+        task: str,
     ) -> tuple[list[Branch], list[str]]:
         if relation not in RELATIONS:
             raise ValueError(f"Unknown relation op: {relation}")
-        if dist < MIN_DIST or dist > MAX_DIST:
-            raise ValueError(f"dist for {relation} must be in [{MIN_DIST}, {MAX_DIST}], got {dist}")
 
         from scipy.spatial import cKDTree
 
         grounding = self.ground_instances(obj_class, threshold)
         target_ids = grounding["candidate_ids"]
         logs = [
-            f'{relation}(..., "{obj_class}", dist={dist:g}, wholeobj={wholeobj}) targets={target_ids} '
+            f'{relation}(..., "{obj_class}", wholeobj={wholeobj}) targets={target_ids} '
             f'vlm={grounding["vlm"]}'
         ]
         outputs: list[Branch] = []
+        llm_cases: list[dict[str, object]] = []
         workers = max(1, int(os.environ.get("OMP_NUM_THREADS", "1")))
 
         for source in source_branches:
@@ -435,43 +500,139 @@ class TaskExecutor:
                     continue
                 target_indices = self.engine.indices_by_instance[int(target_id)]
                 target_points = self.engine.points[target_indices]
-                nearest_distances, _ = focus_tree.query(target_points, k=1, workers=workers)
-                point_mask, stats = self.engine.point_relation_mask(
-                    relation,
-                    nearest_distances,
-                    target_points,
-                    focus_centroid,
-                    front,
-                    side,
-                    top,
-                    dist,
-                )
-                pass_count = int(np.count_nonzero(point_mask))
-                if not pass_count:
-                    continue
-                selected = target_indices if wholeobj else target_indices[point_mask]
                 score = float(grounding["instance_scores"][int(target_id)])
+                if wholeobj or not self.engine.is_floor_query(obj_class):
+                    nearest_distances, _ = focus_tree.query(target_points, k=1, workers=workers)
+                if wholeobj:
+                    measurements = self.relation_measurements(
+                        source,
+                        int(target_id),
+                        target_points,
+                        focus_points,
+                        focus_centroid,
+                        front,
+                        side,
+                        top,
+                        nearest_distances,
+                    )
+                    llm_cases.append(
+                        {
+                            "source": source,
+                            "target_id": int(target_id),
+                            "target_indices": target_indices,
+                            "score": score,
+                            "measurements": measurements,
+                            "prompt": make_relation_judge_prompt(
+                                task=task,
+                                relation=relation,
+                                source_class=source.object_class,
+                                target_class=obj_class,
+                                target_score=score,
+                                measurements=measurements,
+                            ),
+                        }
+                    )
+                    continue
+
+                if self.engine.is_floor_query(obj_class):
+                    selected, stats = self.engine.floor_point_band_selection(
+                        relation,
+                        target_indices,
+                        focus_points,
+                        focus_centroid,
+                        front,
+                        side,
+                        top,
+                        workers,
+                    )
+                    pass_count = int(stats["directional_unoccupied_point_count"])
+                    floor_filtered_count = int(len(target_indices) - stats["unoccupied_floor_point_count"])
+                    mode = f"floor-band width={stats['floor_band_max'] - stats['floor_band_min']:.3f}"
+                else:
+                    point_mask, stats = self.engine.point_relation_mask(
+                        relation,
+                        nearest_distances,
+                        target_points,
+                        focus_points,
+                        focus_centroid,
+                        front,
+                        side,
+                        top,
+                        DEFAULT_POINT_SELECTION_DIST_M,
+                    )
+                    pass_count = int(np.count_nonzero(point_mask))
+                    selected = target_indices[point_mask]
+                    floor_filtered_count = 0
+                    mode = f"point-threshold dist={DEFAULT_POINT_SELECTION_DIST_M:g}"
+                if not len(selected):
+                    logs.append(
+                        f"  source {source.instance_id} -> target {target_id}: "
+                        f"mode={mode}, "
+                        f"pass_pts={pass_count}, selected_pts=0, floor_unoccupied_filtered={floor_filtered_count}, "
+                        f"score={score:.3f}, nearest={stats['nearest_distance']:.3f}, "
+                        f"horizontal={stats['horizontal_distance']:.3f}, "
+                        f"front={stats['front']:.3f}, side={stats['side']:.3f}, top={stats['top']:.3f}"
+                    )
+                    continue
                 outputs.append(
                     Branch(
                         instance_id=int(target_id),
+                        object_class=obj_class,
                         point_indices=selected,
                         referential_instance_id=int(source.instance_id),
                         trace=(
                             *source.trace,
-                            f"{relation}->{target_id} score={score:.3f} pass_pts={pass_count} selected_pts={len(selected)} stats={stats}",
+                            f"{relation}->{target_id} score={score:.3f} pass_pts={pass_count} selected_pts={len(selected)} "
+                            f"floor_unoccupied_filtered={floor_filtered_count} stats={stats}",
                         ),
                     )
                 )
                 logs.append(
                     f"  source {source.instance_id} -> target {target_id}: "
+                    f"mode={mode}, "
                     f"pass_pts={pass_count}, selected_pts={len(selected)}, "
+                    f"floor_unoccupied_filtered={floor_filtered_count}, "
                     f"score={score:.3f}, nearest={stats['nearest_distance']:.3f}, "
+                    f"horizontal={stats['horizontal_distance']:.3f}, "
                     f"front={stats['front']:.3f}, side={stats['side']:.3f}, top={stats['top']:.3f}"
+                )
+
+        if llm_cases:
+            judged_cases = asyncio.run(self.judge_whole_object_relations(llm_cases))
+            for case in judged_cases:
+                source = case["source"]
+                target_id = int(case["target_id"])
+                measurements = case["measurements"]
+                score = float(case["score"])
+                keep = bool(case["keep"])
+                reason = str(case["reason"])
+                logs.append(
+                    f"  source {source.instance_id} -> target {target_id}: "
+                    f"mode=llm-object keep={keep}, score={score:.3f}, "
+                    f"horizontal_surface={measurements['horizontal_surface_distance_m']:.3f}, "
+                    f"front={measurements['front_m']:.3f}, lateral={measurements['lateral_m']:.3f}, "
+                    f"vertical={measurements['vertical_m']:.3f}, reason={reason}"
+                )
+                if not keep:
+                    continue
+                target_indices = case["target_indices"]
+                outputs.append(
+                    Branch(
+                        instance_id=target_id,
+                        object_class=obj_class,
+                        point_indices=target_indices,
+                        referential_instance_id=int(source.instance_id),
+                        trace=(
+                            *source.trace,
+                            f"{relation}->{target_id} score={score:.3f} selected_pts={len(target_indices)} "
+                            f"measurements={measurements} llm_reason={reason}",
+                        ),
+                    )
                 )
         logs.append(f"{relation} produced {len(outputs)} branch(es)")
         return outputs, logs
 
-    def execute_program(self, program: dict[str, object]) -> tuple[np.ndarray, dict[str, object]]:
+    def execute_program(self, program: dict[str, object], task: str = "") -> tuple[np.ndarray, dict[str, object]]:
         steps = program.get("steps")
         return_var = program.get("return")
         if not isinstance(steps, list) or not isinstance(return_var, str):
@@ -498,6 +659,7 @@ class TaskExecutor:
                 branches = [
                     Branch(
                         instance_id=int(instance_id),
+                        object_class=obj_class,
                         point_indices=self.engine.indices_by_instance[int(instance_id)],
                         referential_instance_id=int(instance_id),
                         trace=(f'clip_grounding("{obj_class}") -> {instance_id}',),
@@ -514,9 +676,8 @@ class TaskExecutor:
             source_name = step["source"]
             if not isinstance(source_name, str) or source_name not in env:
                 raise ValueError(f"step {var} references unknown source: {source_name}")
-            dist = float(step["dist"])
             wholeobj = bool(step["wholeobj"])
-            branches, step_logs = self.relation_branches(env[source_name], op, obj_class, dist, wholeobj, threshold)
+            branches, step_logs = self.relation_branches(env[source_name], op, obj_class, wholeobj, threshold, task)
             env[var] = branches
             logs.extend([f"{var}: {line}" for line in step_logs])
 
@@ -556,7 +717,7 @@ class TaskExecutor:
 
     def execute_task(self, task: str) -> tuple[np.ndarray, dict[str, object]]:
         program = synthesize_program(task, self.model)
-        return self.execute_program(program)
+        return self.execute_program(program, task)
 
     def synthesize_task(self, task: str) -> dict[str, object]:
         program = synthesize_program(task, self.model)
@@ -632,7 +793,7 @@ def make_handler(pcd_dir: Path, point_size: float, vertex_count: int, executor: 
                 program = request["program"]
                 if not isinstance(program, dict):
                     raise ValueError("program must be an object")
-                mask, meta = executor.execute_program(program)
+                mask, meta = executor.execute_program(program, str(request.get("task", "")).strip())
             except Exception as exc:
                 self.send_plain_error(500, f"Request failed: {exc}")
                 return

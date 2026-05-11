@@ -94,14 +94,17 @@ class ScanNetGTProcessor(FrameProcessor):
     ) -> None:
         self.frame_files = frame_files
         self.pose_dir = scene_dir / "pose"
+        if not self.pose_dir.exists() and (scene_dir / "poses").exists():
+            self.pose_dir = scene_dir / "poses"
         self.depth_dir = scene_dir / "depth"
         self.use_gt_pose = use_gt_pose
         self.use_gt_depth = use_gt_depth
         self.colmap_poses = None
         if self.use_gt_pose and not self.pose_dir.exists():
-            images_bin = scene_dir / "sparse" / "0" / "images.bin"
-            if not images_bin.exists():
-                raise FileNotFoundError(f"Missing ScanNet pose dir or COLMAP images.bin: {self.pose_dir} | {images_bin}")
+            colmap_pose_paths = [scene_dir / "sparse" / "0" / "images.bin", scene_dir / "sparse" / "images.bin"]
+            images_bin = next((path for path in colmap_pose_paths if path.exists()), None)
+            if images_bin is None:
+                raise FileNotFoundError(f"Missing pose/poses dir or COLMAP images.bin under: {scene_dir}")
             self.colmap_poses = _load_colmap_image_poses(images_bin)
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:

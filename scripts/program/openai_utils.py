@@ -102,6 +102,51 @@ def llm_json_call(
     return json.loads(text)
 
 
+async def async_llm_json_call(
+    prompt: str,
+    *,
+    schema: dict[str, object],
+    schema_name: str,
+    model: str = DEFAULT_LLM_MODEL,
+    instructions: str | None = None,
+    max_output_tokens: int = 1024,
+    key_path: Path | None = None,
+    client: AsyncOpenAI | None = None,
+    max_attempts: int = 2,
+) -> dict[str, object]:
+    openai_client = client or make_async_client(key_path)
+    try:
+        last_error = ""
+        for _ in range(max(1, int(max_attempts))):
+            response = await openai_client.responses.create(
+                model=model,
+                instructions=instructions,
+                input=prompt,
+                max_output_tokens=max_output_tokens,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "schema": schema,
+                        "strict": True,
+                    }
+                },
+            )
+            text = response_text(response).strip()
+            if not text:
+                last_error = "empty output"
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as exc:
+                last_error = f"invalid JSON output: {exc}"
+                continue
+    finally:
+        if client is None:
+            await openai_client.close()
+    raise ValueError(f"LLM returned unusable JSON: {last_error}")
+
+
 def image_data_url(image_path: Path) -> str:
     mime_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
     data = base64.b64encode(image_path.read_bytes()).decode("ascii")

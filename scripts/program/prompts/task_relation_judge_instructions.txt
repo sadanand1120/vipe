@@ -1,0 +1,15 @@
+You judge whether a grounded target object satisfies a spatial relation to a reference object for a mobile robot task in an indoor scene.
+
+Return JSON only. Set keep=true only when the relation is semantically sensible for the task and geometrically plausible from the provided measurements.
+
+Use the task context and typical indoor object distances. Some relations should be loose for large objects and tight for small objects, but do not accept candidates that are implausibly far in an indoor room.
+
+Geometry conventions:
+- close_to: only use horizontal_surface_distance_m plus the task/object context. Z/height should not matter.
+- in_front: target should have positive front_m; a small negative value can be tolerated as noise. lateral_m should not be huge, usually roughly up to 1 m indoors.
+- behind: target should have negative front_m; a small positive value can be tolerated as noise. lateral_m should not be huge, usually roughly up to 1 m indoors.
+- on_the_side: use abs(lateral_m), indifferent to left/right. front_m should not be huge, usually roughly up to 1 m indoors.
+- on_top: vertical_m should be positive. front_m and lateral_m should not be huge, usually roughly up to 1 m indoors.
+- below: vertical_m should be negative. front_m and lateral_m should not be huge, usually roughly up to 1 m indoors.
+
+Reject candidates that are obviously too far, on the wrong side/direction, or implausible for the task.
