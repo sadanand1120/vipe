@@ -37,7 +37,7 @@ Useful output knobs:
 - `pipeline.output.pcd_fusion_mode=tsdf`: save `pcd/color_tsdf.ply`.
 - `pipeline.output.pcd_max_points=8000000`: cap saved point cloud points.
 - `pipeline.depth.keyframe_model=depth-anything/DA3METRIC-LARGE`: DAV3 metric model used to anchor SLAM keyframe depth.
-- `pipeline.depth.final_model=depth-anything/DA3-GIANT`: DAV3 posed model used for final per-frame dense depth.
+- `pipeline.depth.final_model=depth-anything/DA3-GIANT-1.1`: DAV3 posed model used for final per-frame dense depth.
 - `pipeline.depth.window_size=10`: final DAV3 sliding-window size.
 - `pipeline.depth.overlap_size=3`: final DAV3 overlap blended between windows.
 
@@ -65,5 +65,7 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
 ## Notes
 
 The repo is intentionally configured through `configs/default.yaml`; `run.py` and the ScanNet benchmark both compose that config and instantiate `VipePipeline` directly.
+
+Logging is centralized through `vipe.utils.logging.configure_logging()`. `run.py` and the ScanNet benchmark use the same ViPE logger setup, so SLAM/backend progress logs from `vipe.*` child modules are emitted consistently.
 
 The standalone artifact path is intentionally lean but complete for benchmarking: RGB videos are not written, while pose, depth, intrinsics, and configured point clouds are written. The ScanNet benchmark reads those artifacts through a lightweight DA3-side ViPE manifest and reports reconstruction metrics for both TSDF and direct backprojection.

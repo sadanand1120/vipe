@@ -63,6 +63,7 @@ Source files:
 | --- | --- |
 | `run.py` | Hydra entrypoint, direct frame-dir source construction, and pipeline launch |
 | `configs/default.yaml` | Single config file |
+| `vipe/utils/logging.py` | ViPE logger setup shared by `run.py` and benchmark scripts |
 | `vipe/pipeline.py` | `VipePipeline` |
 | `vipe/streams/base.py` | `FrameDir`, `FrameData`, `FrameStream` |
 
@@ -123,6 +124,8 @@ frame_stream = FrameDir(
     frame_skip=args.streams.frame_skip,
 )
 ```
+
+`configure_logging()` owns the `vipe` logger tree. It clears duplicate handlers on the top-level `vipe` logger, installs one tqdm-compatible INFO handler, and re-enables `vipe.*` child loggers so module logs from `vipe.slam.system`, `vipe.slam.components.buffer`, `vipe.pipeline`, and artifact saving all propagate consistently in both `run.py` and the ScanNet benchmark adapter.
 
 Then it constructs one pipeline directly:
 
@@ -918,9 +921,9 @@ Default `warmup=8`.
    self.graph.add_neighborhood_factors(0, self.t1, r=1)
    ```
    The reduced path always uses adjacent sequential initialization, so `r=1`.
-3. Runs 8 graph updates:
+3. Runs `frontend_init_updates` graph updates, default `8`:
    ```python
-   for _ in range(8):
+   for _ in range(self.frontend_init_updates):
        self.graph.update(t0=1, itrs=self.frontend_ba_iters)
    ```
 4. Initialize the next pose by constant velocity from the latest optimized keyframe poses:
@@ -1833,7 +1836,7 @@ This is the final post-SLAM DAV3 depth model. It is different from the SLAM keyf
 | Use | Model |
 | --- | --- |
 | SLAM keyframe inverse-depth anchor | `pipeline.depth.keyframe_model`, default `depth-anything/DA3METRIC-LARGE` |
-| Final depth for every frame | `pipeline.depth.final_model`, default `depth-anything/DA3-GIANT` |
+| Final depth for every frame | `pipeline.depth.final_model`, default `depth-anything/DA3-GIANT-1.1` |
 
 #### Keyframe Context Prep
 
@@ -2263,7 +2266,7 @@ So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled
 | Camera type | `pinhole` | GeoCalib and DAV3 path assume pinhole. |
 | SLAM pose source | estimated from the frame sequence | SLAM starts from internal identity and constant-velocity initialization, then optimizes poses with frontend/backend BA. |
 | SLAM keyframe depth anchor | `pipeline.depth.keyframe_model`, default DAV3 `DA3METRIC-LARGE` | DAV3 metric depth regularizes keyframe disparities. |
-| Final dense depth | `pipeline.depth.final_model`, default DAV3 `DA3-GIANT` | Final dense depth comes from DAV3 posed multi-frame inference. |
+| Final dense depth | `pipeline.depth.final_model`, default DAV3 `DA3-GIANT-1.1` | Final dense depth comes from DAV3 posed multi-frame inference. |
 | `save_artifacts` | `true` in your command | Pose, depth zip, intrinsics JSON, and configured PCD artifacts are written. |
 | `pcd_fusion_mode` | `both` in your command and default config | Both `pcd/color_backproject.ply` and `pcd/color_tsdf.ply` are written. |
 

@@ -894,7 +894,7 @@ The reduced path always does:
 
 ```python
 graph.add_neighborhood_factors(0, warmup, r=1)
-for _ in range(8):
+for _ in range(frontend_init_updates):
     graph.update(t0=1, itrs=frontend_ba_iters)
 ```
 

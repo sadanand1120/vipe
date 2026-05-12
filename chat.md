@@ -48,15 +48,15 @@ FactorGraph.target = coords1 + delta      # updated once per graph.update call
 FactorGraph.weight = weight               # updated once per graph.update call
 FactorGraph.damping = damping             # updated once per graph.update call
 
-GraphBuffer.bundle_adjustment(..., n_iters=3)
+GraphBuffer.bundle_adjustment(..., n_iters=frontend_ba_iters)
 ```
 
-Inside `bundle_adjustment(n_iters=3)`:
+Inside `bundle_adjustment(n_iters=frontend_ba_iters)`:
 
 ```python
-# target/weight/damping are fixed during these 3 inner solver iterations
+# target/weight/damping are fixed during these inner solver iterations
 
-repeat 3 times:
+repeat frontend_ba_iters=3 times:  # config
     build/use same solver terms:
         DenseDepthFlowTerm
         DispSensRegularizationTerm
@@ -99,7 +99,7 @@ repeat frontend_update_iters1=4 times:  # config
 Each `graph.update`:
 - keeps current edge list fixed during that call
 - refreshes DROID `target/weight/damping` once
-- runs `bundle_adjustment(n_iters=3)`
+- runs `bundle_adjustment(n_iters=frontend_ba_iters)`
 
 Then keyframe pruning check:
 
