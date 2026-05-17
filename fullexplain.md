@@ -22,14 +22,14 @@ python run.py \
 
 The current standalone run is easiest to read as five computation stages. Each stage hands one explicit object/state bundle to the next stage. There is no iterative feedback from a later stage back into an earlier stage.
 
-The implementation details below are still split into smaller chunks because the code has separate classes for stream construction, initialization, SLAM frontend, backend BA, infill, DAV3 depth, and artifact writing. Those chunks should be read under this five-stage lens.
+The implementation details below follow those five stages directly. Subsections are kept only where they separate materially different computation, not just because the code has another helper class.
 
 ```mermaid
 flowchart LR
     S1[Stage 1: initialization and stream setup] -->|FrameDir plus one GeoCalib intrinsics tensor| S2[Stage 2: SLAM pass 1 frontend loop]
     S2 -->|keyframe buffer: poses, DROID features, disparities, DAV3 keyframe depth anchors| S3[Stage 3: backend global BA over keyframes]
     S3 -->|refined keyframe poses/disparities in GraphBuffer| S4[Stage 4: SLAM pass 2 pose infill loop]
-    S4 -->|SLAMOutput: pose for every frame, recovered intrinsics, SLAM keyframe map| S5[Stage 5: replay, final DAV3 depth, artifact/PCD writing]
+    S4 -->|SLAMOutput: full trajectory, recovered intrinsics, keyframe indices| S5[Stage 5: replay, final DAV3 depth, artifact/PCD writing]
 ```
 
 The execution grain is:
@@ -39,23 +39,12 @@ The execution grain is:
 | Stage 1: initialization and stream setup | Creates one `FrameDir` and estimates one shared pinhole intrinsics vector from three sampled frames with GeoCalib. No full-sequence cache or stream wrapper is created. |
 | Stage 2: SLAM pass 1 frontend loop | Loops over frames once, attaches the shared intrinsics, resizes each frame for SLAM, runs DROID motion-filter features on every frame, stores accepted keyframes with DROID feature/context tensors and DAV3 metric depth anchors, and runs incremental frontend BA as keyframes arrive. |
 | Stage 3: backend global BA | Runs once over the complete pass-1 keyframe set with `steps=backend_iters`. It builds one fresh non-incremental factor graph and optimizes all keyframes as a sequence-level solve. |
-| Stage 4: SLAM pass 2 pose infill loop | Loops over every frame again, appends frames in chunks, initializes non-keyframe poses from neighboring keyframes, optimizes those appended poses motion-only, returns one pose per original frame, and extracts the internal low-resolution keyframe map. |
-| Stage 5: final DAV3 depth and outputs | Re-reads original-resolution frames, assigns final SLAM pose/intrinsics, runs final DAV3 depth in sliding windows, writes artifacts, and writes the configured PCD export or exports. |
-
-The detailed chunks map to the five stages like this:
-
-| Detailed chunks | Stage | Loop or sequence-once? | Handoff produced |
-| --- | --- | --- | --- |
-| Chunks 1.1-1.3 | Stage 1 | `FrameDir` construction once; GeoCalib samples three frames once; shared intrinsics are returned as one CUDA tensor. | Original `FrameDir` plus shared intrinsics tensor. |
-| Chunks 2.1-2.2 | Stage 2 | Per-frame SLAM pass-1 loop with incremental updates as keyframes arrive. | Optimized frontend keyframe buffer. |
-| Chunk 3.1 | Stage 3 | Sequence-level backend BA over all keyframes, not a per-frame loop. | Refined keyframe poses/disparities in `GraphBuffer`. |
-| Chunk 4.1 | Stage 4 | Per-frame pass-2 loop plus chunked infill solves. | `SLAMOutput` containing full-frame trajectory, recovered intrinsics, and `SLAMMap`. |
-| Chunks 5.1-5.3 | Stage 5 | Re-reads original frames; DAV3 directly gathers SLAM keyframes by index and then runs one sliding-window pass; artifact writing loops once over final yielded frames. | Saved artifacts and configured PCD export or exports. |
+| Stage 4: SLAM pass 2 pose infill loop | Loops over every frame again, appends frames in chunks, initializes non-keyframe poses from neighboring keyframes, optimizes those appended poses motion-only, and returns one pose per original frame plus the selected-frame indices of SLAM keyframes. |
+| Stage 5: final DAV3 depth and outputs | Re-reads original-resolution frames, assigns final SLAM pose/intrinsics, adds neighboring SLAM keyframes as DAV3 context frames, runs final DAV3 depth in sliding windows, writes artifacts, and writes the configured PCD export or exports. |
 
 ## Stage 1: Initialization And Stream Setup
 
-<a id="chunk-1-1"></a>
-### Chunk 1.1: Shell, Hydra Config, And Runtime Construction
+### Runtime Construction
 
 Source files:
 
@@ -167,8 +156,7 @@ logger.info(f"Finished processing {frame_stream.name()}")
 | `save_artifacts` | `true`, so artifacts are written. |
 | `pcd_fusion_mode` | `both` for the command shown. This is also the default, so both PCD exports are written. |
 
-<a id="chunk-1-2"></a>
-### Chunk 1.2: Frame Directory Source And Frame Ordering
+### Frame Directory Source And Frame Ordering
 
 Source files:
 
@@ -298,8 +286,7 @@ FrameData(
 | `frame_skip > 1` | Reads every `frame_skip`-th image and divides FPS by `frame_skip`. |
 | Image read fails | Raises `ValueError`. |
 
-<a id="chunk-1-3"></a>
-### Chunk 1.3: GeoCalib Intrinsics
+### GeoCalib Intrinsics
 
 Source files:
 
@@ -522,8 +509,7 @@ def stage_2_slam_pass_1_frontend(frame_stream, intrinsics):
     return buffer  # keyframe poses/disparities/features/DAV3 depth anchors for Stage 3
 ```
 
-<a id="chunk-2-1"></a>
-### Chunk 2.1: SLAM Standard Resize, Graph Buffer, And Model Setup
+### SLAM Setup: Resize, Graph Buffer, And Models
 
 Source files:
 
@@ -691,8 +677,7 @@ DepthAnything3.from_pretrained(pipeline.depth.keyframe_model)
 
 This keyframe model is separate from the final post-processing multiview DAV3 model. It is used to anchor SLAM keyframe inverse depths during bundle adjustment.
 
-<a id="chunk-2-2"></a>
-### Chunk 2.2: SLAM Pass 1, Motion Filtering, Keyframe Addition, And Frontend BA
+### Pass 1 Loop, Motion Filtering, Keyframes, And Frontend BA
 
 Source files:
 
@@ -1268,8 +1253,7 @@ def stage_3_backend_global_ba(buffer):
     return buffer  # same GraphBuffer, globally refined in-place
 ```
 
-<a id="chunk-3-1"></a>
-### Chunk 3.1: Backend Global BA Over Keyframes
+### Backend Graph And Batch Updates
 
 Source files:
 
@@ -1279,7 +1263,7 @@ Source files:
 | `vipe/slam/components/factor_graph.py` | Batch graph update with low-memory correlation |
 | `vipe/slam/components/buffer.py` | Global frame-distance graph state |
 
-Stage context: this is Stage 3. It is a sequence-level solve over the pass-1 keyframes. It does not loop over raw frames. The handoff into this chunk is the complete keyframe buffer from Stage 2. The handoff out is the same keyframe buffer with globally refined keyframe poses/disparities.
+Stage context: this is Stage 3. It is a sequence-level solve over the pass-1 keyframes. It does not loop over raw frames. The handoff into this stage is the complete keyframe buffer from Stage 2. The handoff out is the same keyframe buffer with globally refined keyframe poses/disparities.
 
 #### Diagram
 
@@ -1388,6 +1372,7 @@ For each batch step:
 def stage_4_slam_pass_2_pose_infill(refined_keyframe_buffer, frame_stream, intrinsics, resizer):
     inner_filler.start_after_keyframes(refined_keyframe_buffer.n_frames)
     keyframe_count = refined_keyframe_buffer.n_frames
+    keyframe_indices = refined_keyframe_buffer.tstamp[:keyframe_count].cpu().tolist()
     total_n_frames = len(frame_stream)
 
     for frame_idx, frame_data in enumerate(frame_stream):
@@ -1437,18 +1422,16 @@ def stage_4_slam_pass_2_pose_infill(refined_keyframe_buffer, frame_stream, intri
             refined_keyframe_buffer.n_frames = keyframe_count  # discard appended frames from keyframe graph
 
     filled_w2c_poses = inner_filler.get_result().poses
-    slam_map = refined_keyframe_buffer.extract_slam_map(filter_thresh=config.map_filter_thresh)
     original_intrinsics = resizer.recover_intrinsics(refined_keyframe_buffer.intrinsics)
 
     return SLAMOutput(
         trajectory=filled_w2c_poses.inv(),  # camera-to-world pose for every raw frame
         intrinsics=original_intrinsics,
-        slam_map=slam_map,
+        keyframe_indices=keyframe_indices,
     )
 ```
 
-<a id="chunk-4-1"></a>
-### Chunk 4.1: SLAM Pass 2 And Non-Keyframe Pose Infill
+### Pass 2 Loop And Non-Keyframe Pose Infill
 
 Source files:
 
@@ -1457,10 +1440,10 @@ Source files:
 | `vipe/slam/system.py` | Pass 2 loop |
 | `vipe/slam/components/inner_filler.py` | Pose interpolation and optimization for every original frame |
 | `vipe/slam/components/factor_graph.py` | Infill graph updates |
-| `vipe/slam/components/buffer.py` | SLAM keyframe map extraction after pass 2 |
-| `vipe/slam/interface.py` | `SLAMMap`, `SLAMOutput` |
+| `vipe/slam/components/buffer.py` | Shared keyframe/infill state table mutated by infill BA |
+| `vipe/slam/interface.py` | `SLAMOutput` |
 
-Stage context: this is Stage 4. It loops over the original sequence again; its primary purpose is to produce poses for frames that were not retained as pass-1 keyframes. After that loop, it extracts the internal keyframe map and returns `SLAMOutput`. The handoff into this chunk is the globally refined keyframe buffer from Stage 3. The handoff out is `SLAMOutput`: camera-to-world pose for every original frame, recovered original-resolution intrinsics, and the internal low-resolution `SLAMMap`.
+Stage context: this is Stage 4. It loops over the original sequence again; its primary purpose is to produce poses for frames that were not retained as pass-1 keyframes. The handoff into this stage is the globally refined keyframe buffer from Stage 3. The handoff out is `SLAMOutput`: camera-to-world pose for every original frame, recovered original-resolution intrinsics, and selected-frame indices of the SLAM keyframes.
 
 #### Diagram
 
@@ -1479,9 +1462,8 @@ flowchart TD
     J --> K[Append filled poses]
     K --> L[Reset buffer.n_frames back to keyframe count]
     L --> M[get_result returns poses for all N frames]
-    M --> N[extract_slam_map from refined keyframes]
-    N --> O[recover original-resolution intrinsics]
-    O --> P[Return SLAMOutput]
+    M --> N[Recover original-resolution intrinsics]
+    N --> O[Return SLAMOutput]
 ```
 
 #### Computation
@@ -1613,62 +1595,13 @@ filled_return = self.inner_filler.get_result()
 
 `filled_return.poses` has one world-to-camera pose for every original frame.
 
-After `filled_return` is available, `SLAMSystem.run` extracts the internal keyframe map:
-
-```python
-slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
-```
-
-Default:
-
-```text
-map_filter_thresh = 0.05
-```
-
-`GraphBuffer.extract_slam_map`:
-
-1. Chooses all keyframe buffer indices if `t_range is None`.
-2. Converts stored world-to-camera poses to camera-to-world:
-   ```python
-   c2w_se3 = SE3(self.poses[t_range]).inv()
-   ```
-3. Takes low-res colors:
-   ```python
-   images = self.images[t_range, :, 3::8, 3::8].moveaxis(1, -1)
-   ```
-   Example shape: `(K,48,64,3)`.
-4. Build a camera model from resized intrinsics.
-5. Scale intrinsics by `1/8`.
-6. Inverse project every low-res disparity pixel into camera coordinates.
-7. Transform points into world coordinates.
-8. Compute consistency count with `slam_ext.depth_filter`.
-9. Build the valid point mask:
-   ```python
-   masks = (
-       (count >= min(2, n_frames - 1))
-       & (disps > 0.5 * disps.mean(dim=[1,2], keepdim=True))
-   )
-   ```
-10. Pack only valid points into `SLAMMap.from_masked_dense_disp`.
-
-`SLAMMap` stores:
-
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `dense_disp_xyz` | `(M,3)` | world-space keyframe map points |
-| `dense_disp_rgb` | `(M,3)` | RGB colors in `0..1` |
-| `dense_disp_packinfo` | `(K,2)` | for each keyframe: start offset and count in packed point arrays |
-| `dense_disp_frame_inds` | list length `K` | raw frame ids of keyframes |
-
-This SLAM map is not the final saved TSDF/backproject point cloud. It is an internal low-resolution keyframe map; in the current output path, Stage 5 uses its `dense_disp_frame_inds` keyframe list to choose DAV3 context frames.
-
-Then `SLAMSystem.run` returns:
+`SLAMSystem.run` then recovers original-resolution intrinsics and returns:
 
 ```python
 SLAMOutput(
     trajectory=filled_return.poses.inv(),  # camera-to-world
     intrinsics=original_intrinsics,
-    slam_map=slam_map,
+    keyframe_indices=keyframe_indices,
 )
 ```
 
@@ -1693,8 +1626,7 @@ original_intrinsics = [20.7846, 20.7846, 16.0, 12.0]
 
 ## Stage 5: Final DAV3 Depth And Outputs
 
-<a id="chunk-5-1"></a>
-### Chunk 5.1: Re-Reading Original Frames And Assigning SLAM Results
+### Final DAV3 Depth Pass
 
 Source files:
 
@@ -1703,22 +1635,7 @@ Source files:
 | `vipe/pipeline.py` | `DAV3DepthEstimator`, final Stage 5 call site |
 | `vipe/streams/base.py` | `FrameData.dav3_conditions` |
 
-Stage context: this starts Stage 5. `run.py` has already received `SLAMOutput` from Stage 4. The pipeline now prepares final DAV3 depth by re-reading original frames, assigning final camera-to-world poses, assigning recovered raw-resolution SLAM intrinsics, setting the camera type to pinhole, and yielding frames with final dense depth.
-
-#### Diagram
-
-```mermaid
-flowchart TD
-    A[SLAMOutput ready] --> B[Original FrameDir]
-    A --> C[DAV3DepthEstimator.estimate]
-    B --> C
-    C --> D[Random-access SLAM keyframe context frames]
-    C --> E[Sliding-window frame loop]
-    E --> F[Attach c2w pose, recovered intrinsics, PINHOLE]
-    D --> G[Final DAV3 inference]
-    F --> G
-    G --> H[Final frame iterator yields pose, intrinsics, metric depth, confidence]
-```
+Stage context: this starts Stage 5. `run.py` has already received `SLAMOutput` from Stage 4. The pipeline now prepares final DAV3 depth by re-reading original frames, assigning final camera-to-world poses, assigning recovered raw-resolution SLAM intrinsics, adding neighboring SLAM keyframes as DAV3 context, setting the camera type to pinhole, and yielding frames with final dense depth.
 
 #### Re-Reading Original Frames
 
@@ -1754,52 +1671,23 @@ FrameData(
 
 `slam_output.trajectory` is a length-`N` batch of camera-to-world poses. `slam_output.intrinsics` is one recovered original-resolution pinhole intrinsic vector with shape `(4,)`, so the same tensor is assigned to every frame.
 
-#### Keyframe Context Loading
-
-Final DAV3 needs neighboring SLAM keyframes as posed context. These indices are already stored in:
-
-```python
-keyframes_inds = slam_output.slam_map.dense_disp_frame_inds
-```
-
-The estimator directly random-accesses those selected frame indices:
-
-```python
-keyframes_data = [
-    self._attach_slam_output(frame_stream, frame_idx, slam_output)
-    for frame_idx in keyframes_inds
-]
-```
-
-There is no separate keyframe-recording stream pass. Keyframes are loaded once by index, then the estimator runs one forward sliding-window loop over all selected frames.
+`slam_output.keyframe_indices` is a plain Python list of selected-frame indices for the optimized SLAM keyframes. It is not a dense map or point cloud; it only lets Stage 5 re-read nearby original-resolution keyframe images as extra DAV3 context.
 
 The important consequence is that artifact writing receives original-resolution frames, not the resized SLAM frames. SLAM’s resized/cropped intrinsics are recovered back to original size before assignment, so final DAV3 and final PCD construction operate in the original input image coordinate system.
 
-<a id="chunk-5-2"></a>
-### Chunk 5.2: Final DAV3 Depth For Every Frame
-
-Source files:
-
-| File | Role |
-| --- | --- |
-| `vipe/pipeline.py` | `DAV3DepthEstimator` |
-| `vipe/streams/base.py` | `FrameData.dav3_conditions` |
-
-Stage context: this is the depth-estimation part of Stage 5. It is not a single global DAV3 call over the entire scene. `DAV3DepthEstimator` first loads SLAM keyframe context frames by random access, then runs posed DAV3-GIANT over sliding windows and yields final original-resolution frames with metric depth and confidence.
-
-#### Diagram
+#### Sliding Window DAV3 Inference
 
 ```mermaid
 flowchart TD
-    A[SLAMOutput.slam_map.dense_disp_frame_inds] --> B[Random-access original keyframe frames]
-    B --> C[Store keyframe context frames]
-    C --> D[Frame loop 0..N-1]
-    D --> E[Build sliding window of up to configured window_size frames]
-    E --> F{Window full or last frame?}
-    F -->|no| E
-    F -->|yes| G[Probe neighboring keyframes]
-    G --> H[Build DAV3 image, extrinsic, intrinsic lists]
-    H --> I[Configured DepthAnything3 final posed multi-frame inference]
+    A[Frame loop 0..N-1] --> B[Attach final pose/intrinsics to original frame]
+    B --> C[Append to current sliding window]
+    C --> D{Window full or last frame?}
+    D -->|no| A
+    D -->|yes| E[Probe left/right SLAM keyframes near window frames]
+    E --> F[Re-read context keyframes not already in window]
+    F --> G[Build DAV3 image, extrinsic, intrinsic lists]
+    G --> H[Configured DepthAnything3 final posed multi-frame inference]
+    H --> I[Keep only current-window depth/confidence outputs]
     I --> J[Interpolate depth/confidence to original frame size]
     J --> K{Trailing overlap exists?}
     K -->|yes| L[Linearly blend overlap depths/confidences]
@@ -1838,22 +1726,14 @@ This is the final post-SLAM DAV3 depth model. It is different from the SLAM keyf
 | SLAM keyframe inverse-depth anchor | `pipeline.depth.keyframe_model`, default `depth-anything/DA3METRIC-LARGE` |
 | Final depth for every frame | `pipeline.depth.final_model`, default `depth-anything/DA3-GIANT-1.1` |
 
-#### Keyframe Context Prep
+#### Sliding Window State
 
-At the start of `estimate(frame_stream, slam_output)`, keyframe indices come from the final SLAM map:
+At the start of `estimate(frame_stream, slam_output)`, the estimator uses the frame count and the keyframe index list from `SLAMOutput`:
 
 ```python
-keyframes_inds = unpack_optional(slam_output.slam_map).dense_disp_frame_inds
-keyframes_data = [
-    self._attach_slam_output(frame_stream, frame_idx, slam_output)
-    for frame_idx in keyframes_inds
-]
 n_frames = len(frame_stream)
+keyframe_indices = slam_output.keyframe_indices
 ```
-
-Each `keyframes_data[k]` contains original-resolution RGB plus final pose/intrinsics. These context frames are appended to DAV3 inference windows when useful, but their depth outputs are discarded because final artifacts only need the current sliding-window frames.
-
-#### Sliding Window Depth
 
 The main frame loop maintains:
 
@@ -1872,41 +1752,41 @@ len(current_sliding_window) == window_size or is_last_frame
 
 For each ready window:
 
-1. Find neighboring keyframes for every frame index in the window:
+1. Probe neighboring SLAM keyframes for every frame index in the current window:
    ```python
-   sw_keyframe_inds = sorted({
+   context_indices = sorted({
        keyframe_idx
        for i in current_sliding_window_idx
-       for keyframe_idx in self._probe_keyframe_indices(keyframes_inds, i)
+       for keyframe_idx in _probe_keyframe_indices(slam_output.keyframe_indices, i)
    })
    ```
-2. Exclude keyframes already in the sliding window:
+2. Remove context frames already present in the current window:
    ```python
-   sw_keyframe_inds = [
-       t for t in sw_keyframe_inds
-       if keyframes_inds[t] not in current_sliding_window_idx
-   ]
+   context_indices = [i for i in context_indices if i not in current_sliding_window_idx]
    ```
-3. Convert window frames to DAV3 conditions:
+3. Convert the current window frames to DAV3 conditions:
    ```python
    sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
    ```
-4. Convert extra keyframe context frames to DAV3 conditions.
-5. Run:
+4. Re-read each context keyframe from the original `FrameDir`, attach its final pose/intrinsics, and convert it to DAV3 conditions.
+5. Run final DAV3 on current window frames plus context keyframes:
    ```python
    dav3_api.inference(
-       list(sw_images + kf_images),
-       extrinsics=np.stack(sw_exts + kf_exts, axis=0),
-       intrinsics=np.stack(sw_ints + kf_ints, axis=0),
+       list(sw_images + ctx_images),
+       extrinsics=np.stack(sw_exts + ctx_exts, axis=0),
+       intrinsics=np.stack(sw_ints + ctx_ints, axis=0),
        process_res_method="lower_bound_resize",
    )
    ```
-6. Keep only the first `len(sw_images)` outputs, because appended keyframes were context only.
+6. Keep only the first `len(sw_images)` outputs, because appended keyframes are context only:
+   ```python
+   sw_depth = torch.from_numpy(dav3_inference_result.depth[:len(sw_images)]).float().cuda()
+   ```
 7. Interpolate depth to the original frame size:
    ```python
    sw_depth = interpolate(sw_depth[:, None], frame.size(), mode="bilinear")[:,0]
    ```
-8. Do the same for confidence if present.
+8. Do the same slicing, conversion, and interpolation for confidence if DAV3 returns confidence.
 
 `FrameData.dav3_conditions()` returns:
 
@@ -1950,8 +1830,7 @@ n_frames_to_yield = window_size - overlap_size if not is_last_frame else len(cur
 
 Default normal window yields `10 - 3 = 7` frames and keeps 3 trailing frames for the next window. Last window yields everything.
 
-<a id="chunk-5-3"></a>
-### Chunk 5.3: Artifact Saving And PCD Fusion
+### Artifact Saving And PCD Fusion
 
 Source files:
 

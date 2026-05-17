@@ -302,6 +302,18 @@ GraphBuffer.disps_sens
 FactorGraph.ii/jj edge set
 ```
 
+### After backend
+
+Pass 2 appends original frames in infill chunks, initializes their poses from neighboring keyframes, and runs motion-only graph updates for those appended poses. The final SLAM handoff is:
+
+```text
+SLAMOutput.trajectory  # camera-to-world pose for every input frame
+SLAMOutput.intrinsics  # one recovered original-resolution pinhole intrinsics vector
+SLAMOutput.keyframe_indices  # selected-frame indices of optimized SLAM keyframes
+```
+
+Final DAV3 depth uses `keyframe_indices` only to re-read neighboring keyframes as context frames. No `FactorGraph` or dense keyframe-map object is passed to the output stage.
+
 ### One-line mental model
 
 ```text

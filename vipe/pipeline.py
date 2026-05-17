@@ -30,7 +30,6 @@ from vipe.streams.base import FrameData, FrameStream
 from vipe.utils import io
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
-from vipe.utils.misc import unpack_optional
 
 
 logger = logging.getLogger(__name__)
@@ -65,7 +64,6 @@ class DAV3DepthEstimator:
     Depth is conditioned on camera poses and intrinsics from SLAM.
 
     Depth is estimated in a sliding-window manner, and overlapped frames are linearly averaged to sharp transitions.
-    To create enough parallax to improve estimation confidence, each window also includes neighboring keyframes.
     """
 
     def __init__(
@@ -90,13 +88,14 @@ class DAV3DepthEstimator:
         self.dav3_api = DepthAnything3.from_pretrained(model_name)
         self.dav3_api = self.dav3_api.cuda().eval()
 
-    def _probe_keyframe_indices(self, keyframes_inds: list[int], frame_idx: int) -> list[int]:
-        inds: list[int] = []
-        left_idx = np.searchsorted(keyframes_inds, frame_idx, side="right").item() - 1
-        inds.append(left_idx)
-        if frame_idx < keyframes_inds[-1]:
-            inds.append(left_idx + 1)
-        return inds
+    @staticmethod
+    def _probe_keyframe_indices(keyframe_indices: list[int], frame_idx: int) -> list[int]:
+        assert keyframe_indices
+        left = max(0, np.searchsorted(keyframe_indices, frame_idx, side="right").item() - 1)
+        indices = [keyframe_indices[left]]
+        if frame_idx < keyframe_indices[-1] and left + 1 < len(keyframe_indices):
+            indices.append(keyframe_indices[left + 1])
+        return indices
 
     def _attach_slam_output(self, frame_stream: FrameStream, frame_idx: int, slam_output: SLAMOutput) -> FrameData:
         frame = frame_stream[frame_idx]
@@ -106,11 +105,6 @@ class DAV3DepthEstimator:
         return frame
 
     def estimate(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> Iterator[FrameData]:
-        keyframes_inds = unpack_optional(slam_output.slam_map).dense_disp_frame_inds
-        keyframes_data = [
-            self._attach_slam_output(frame_stream, frame_idx, slam_output)
-            for frame_idx in keyframes_inds
-        ]
         n_frames = len(frame_stream)
 
         current_sliding_window: list[FrameData] = []
@@ -124,31 +118,30 @@ class DAV3DepthEstimator:
             is_last_frame = frame_idx == n_frames - 1
 
             if len(current_sliding_window) == self.window_size or is_last_frame:
-                # Neighboring keyframes anchor each current sliding window.
-                sw_keyframe_inds = sorted(
+                context_indices = sorted(
                     {
                         keyframe_idx
                         for i in current_sliding_window_idx
-                        for keyframe_idx in self._probe_keyframe_indices(keyframes_inds, i)
+                        for keyframe_idx in self._probe_keyframe_indices(slam_output.keyframe_indices, i)
                     }
                 )
-                sw_keyframe_inds = [
-                    t for t in sw_keyframe_inds if keyframes_inds[t] not in current_sliding_window_idx
-                ]
+                context_indices = [i for i in context_indices if i not in current_sliding_window_idx]
 
                 sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
-
-                if len(sw_keyframe_inds) > 0:
-                    kf_images, kf_exts, kf_ints = zip(
-                        *[keyframes_data[t].dav3_conditions() for t in sw_keyframe_inds]
+                if context_indices:
+                    ctx_images, ctx_exts, ctx_ints = zip(
+                        *[
+                            self._attach_slam_output(frame_stream, frame_idx, slam_output).dav3_conditions()
+                            for frame_idx in context_indices
+                        ]
                     )
                 else:
-                    kf_images, kf_exts, kf_ints = tuple(), tuple(), tuple()
+                    ctx_images, ctx_exts, ctx_ints = tuple(), tuple(), tuple()
 
                 dav3_inference_result = self.dav3_api.inference(
-                    list(sw_images + kf_images),
-                    extrinsics=np.stack(sw_exts + kf_exts, axis=0),
-                    intrinsics=np.stack(sw_ints + kf_ints, axis=0),
+                    list(sw_images + ctx_images),
+                    extrinsics=np.stack(sw_exts + ctx_exts, axis=0),
+                    intrinsics=np.stack(sw_ints + ctx_ints, axis=0),
                     process_res_method="lower_bound_resize",
                 )
                 sw_depth = torch.from_numpy(dav3_inference_result.depth[: len(sw_images)]).float().cuda()

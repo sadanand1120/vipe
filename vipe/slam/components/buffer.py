@@ -25,14 +25,12 @@ import torch
 from einops import rearrange
 from omegaconf.dictconfig import DictConfig
 
-from vipe.ext import slam_ext
 from vipe.ext.lietorch.groups import SE3
 from vipe.priors.depth.base import DepthEstimationInput, DepthEstimationModel
 from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector
 from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm
-from ..interface import SLAMMap
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, PoseRetractor
 
@@ -250,48 +248,3 @@ class GraphBuffer:
             d = 0.5 * (d + d2)
 
         return d
-
-    def extract_slam_map(
-        self,
-        filter_thresh: float,
-        t_range: torch.Tensor | None = None,
-        is_local: bool = False,
-    ) -> SLAMMap:
-        if t_range is None:
-            t_range = torch.arange(self.n_frames, device=self.device)
-
-        c2w_se3 = SE3(self.poses[t_range]).inv()
-        images = self.images[t_range, :, 3::8, 3::8].moveaxis(1, -1)
-        n_frames, _, _ = self.disps[t_range].shape
-
-        disps = self.disps[t_range].contiguous()
-        camera_model = self.camera_type.build_camera_model(self.intrinsics)
-        pts, _, _ = geom.iproj_disp(
-            disps,
-            None,
-            camera_model.scaled(1 / 8.0).intrinsics[None].expand((n_frames, -1)),
-            camera_type=self.camera_type,
-        )
-        if not is_local:
-            pts = c2w_se3[:, None, None].act(pts)
-        pts = pts[..., :3] / pts[..., 3:]
-
-        filter_thresh_abs = filter_thresh * (1.0 / disps.mean().item())
-        count = slam_ext.depth_filter(
-            c2w_se3.inv().data,
-            disps,
-            camera_model.pinhole().intrinsics / 8.0,
-            torch.arange(n_frames, device=self.device),
-            torch.full((n_frames,), filter_thresh_abs, device=self.device),
-        )
-        masks = (
-            (count >= min(2, n_frames - 1))
-            & (disps > 0.5 * disps.mean(dim=[1, 2], keepdim=True))
-        )
-
-        return SLAMMap.from_masked_dense_disp(
-            pts,
-            images,
-            masks,
-            self.tstamp[t_range],
-        )

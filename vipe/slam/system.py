@@ -211,6 +211,7 @@ class SLAMSystem:
             backend_active_factors,
         )
 
+        keyframe_indices = [int(t) for t in self.buffer.tstamp[: self.buffer.n_frames].detach().cpu().tolist()]
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.start_after_keyframes(self.buffer.n_frames)
@@ -230,13 +231,11 @@ class SLAMSystem:
         if infill_result.poses.shape[0] != total_n_frames:
             raise ValueError("Your video might be malformed or unreadable.")
 
-        slam_map = self.buffer.extract_slam_map(filter_thresh=self.config.map_filter_thresh)
-
         # Scale back the intrinsics to the original size.
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics)
 
         return SLAMOutput(
             trajectory=infill_result.poses.inv(),
             intrinsics=original_intrinsics,
-            slam_map=slam_map,
+            keyframe_indices=keyframe_indices,
         )

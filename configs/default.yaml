@@ -33,7 +33,6 @@ pipeline:
     backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
     init_disp: 1.0                       # Initial disparity value before metric depth is injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
-    map_filter_thresh: 0.05              # Relative depth-consistency threshold for extracting the SLAM map.
     ba:
       dense_disp_alpha: 0.001            # Weight for sensor/DAV3 depth regularization in BA.
 
@@ -45,7 +44,7 @@ pipeline:
 
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.
-    save_artifacts: false                # Save pose, intrinsics, and point-cloud artifacts.
+    save_artifacts: false                # Save pose, depth, intrinsics, and point-cloud artifacts.
     pcd_fusion_mode: both                # Point cloud mode: backproject, tsdf, or both.
     pcd_max_points: 8000000              # Max saved points per point-cloud output.
     pcd_conf_threshold_coef: 0.75        # DAV3 confidence threshold = mean confidence times this factor.

@@ -140,7 +140,9 @@ poses -> optimized by BA
 disps -> optimized by BA
 ```
 
-Everything else supports feature matching, depth anchoring, bookkeeping, or output extraction.
+Everything else supports feature matching, depth anchoring, or keyframe/infill bookkeeping.
+
+`GraphBuffer` remains an internal SLAM workspace. The final output handoff is `SLAMOutput`, which contains the full-frame camera-to-world trajectory, recovered original-resolution intrinsics, and the selected-frame indices of optimized SLAM keyframes. Stage 5 uses those indices only to re-read nearby keyframes as DAV3 context frames.
 
 ### How Slots Get Filled
 
