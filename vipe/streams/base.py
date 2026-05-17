@@ -38,6 +38,7 @@ class FrameData:
       - For the D part, this will be the distortion coefficients of the camera.
       - For panorama images, this will all be zeros.
     - metric_depth: The depth map of the frame. The shape is (H, W). Value is in metric scale.
+    - sensor_depth: Optional loaded sensor/GT depth. This is input data, not the pipeline output depth.
     - depth_confidence: The depth confidence map of the frame. The shape is (H, W).
     - information: Additional information about the frame
     """
@@ -48,6 +49,7 @@ class FrameData:
     camera_type: CameraType | None = None
     intrinsics: torch.Tensor | None = None
     metric_depth: torch.Tensor | None = None
+    sensor_depth: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
     information: str = ""
 
@@ -65,6 +67,7 @@ class FrameData:
             raw_frame_idx=self.raw_frame_idx,
             rgb=self.rgb.cpu(),
             metric_depth=map_cpu(self.metric_depth),
+            sensor_depth=map_cpu(self.sensor_depth),
             depth_confidence=map_cpu(self.depth_confidence),
             pose=map_cpu(self.pose),
             intrinsics=map_cpu(self.intrinsics),
@@ -79,6 +82,7 @@ class FrameData:
             raw_frame_idx=self.raw_frame_idx,
             rgb=self.rgb.cuda(),
             metric_depth=map_cuda(self.metric_depth),
+            sensor_depth=map_cuda(self.sensor_depth),
             depth_confidence=map_cuda(self.depth_confidence),
             pose=map_cuda(self.pose),
             intrinsics=map_cuda(self.intrinsics),
@@ -105,6 +109,12 @@ class FrameData:
                 0, 0
             ]
 
+        new_sensor_depth = None
+        if self.sensor_depth is not None:
+            new_sensor_depth = torch.nn.functional.interpolate(self.sensor_depth[None, None], size, mode="nearest")[
+                0, 0
+            ]
+
         new_depth_confidence = None
         if self.depth_confidence is not None:
             new_depth_confidence = torch.nn.functional.interpolate(
@@ -123,6 +133,7 @@ class FrameData:
             raw_frame_idx=self.raw_frame_idx,
             rgb=new_rgb,
             metric_depth=new_metric_depth,
+            sensor_depth=new_sensor_depth,
             depth_confidence=new_depth_confidence,
             pose=self.pose,
             intrinsics=new_intrinsics,
@@ -143,6 +154,10 @@ class FrameData:
         if self.metric_depth is not None:
             new_metric_depth = self.metric_depth[top:bottom, left:right]
 
+        new_sensor_depth = None
+        if self.sensor_depth is not None:
+            new_sensor_depth = self.sensor_depth[top:bottom, left:right]
+
         new_depth_confidence = None
         if self.depth_confidence is not None:
             new_depth_confidence = self.depth_confidence[top:bottom, left:right]
@@ -159,6 +174,7 @@ class FrameData:
             raw_frame_idx=self.raw_frame_idx,
             rgb=new_rgb,
             metric_depth=new_metric_depth,
+            sensor_depth=new_sensor_depth,
             depth_confidence=new_depth_confidence,
             pose=self.pose,
             intrinsics=new_intrinsics,
@@ -219,6 +235,7 @@ class FrameDir(FrameStream):
         frame_end: int = -1,
         frame_skip: int = 1,
         name: str | None = None,
+        load_sensor_depth: bool = False,
     ) -> None:
         path = Path(path)
         self.path = path
@@ -246,6 +263,17 @@ class FrameDir(FrameStream):
         self.end = len(self.frame_files) if frame_end == -1 else min(frame_end, len(self.frame_files))
         self.step = frame_skip
         self._fps = fps / self.step
+        self.load_sensor_depth = load_sensor_depth
+
+        if self.load_sensor_depth:
+            depth_dir = path.parent / "depth"
+            missing = [
+                depth_dir / f"{frame_path.stem}.png"
+                for frame_path in self.frame_files
+                if not (depth_dir / f"{frame_path.stem}.png").exists()
+            ]
+            if missing:
+                raise FileNotFoundError(f"Missing sensor depth file: {missing[0]}")
 
     def frame_size(self) -> tuple[int, int]:
         return (self._height, self._width)
@@ -274,7 +302,21 @@ class FrameDir(FrameStream):
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
-        return FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb)
+
+        sensor_depth = None
+        if self.load_sensor_depth:
+            depth_path = self.path.parent / "depth" / f"{frame_path.stem}.png"
+            raw_depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            if raw_depth is None:
+                raise ValueError(f"Could not read sensor depth: {depth_path}")
+            if raw_depth.shape[:2] != frame.shape[:2]:
+                raw_depth = cv2.resize(raw_depth, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+            sensor = raw_depth.astype(np.float32) / 1000.0
+            sensor[~np.isfinite(sensor)] = 0.0
+            sensor[sensor <= 0.0] = 0.0
+            sensor_depth = torch.as_tensor(sensor).float().cuda()
+
+        return FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb, sensor_depth=sensor_depth)
 
     def __iter__(self) -> Iterator[FrameData]:
         for frame_idx in range(len(self)):

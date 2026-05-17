@@ -145,17 +145,18 @@ def run_vipe(overrides: list[str]) -> None:
         cfg = hydra.compose("default", overrides=overrides)
 
     logger = configure_logging()
+    pipeline = VipePipeline(
+        slam=cfg.pipeline.slam,
+        depth=cfg.pipeline.depth,
+        output=cfg.pipeline.output,
+    )
     stream = FrameDir(
         path=cfg.streams.base_path,
         fps=cfg.streams.fps,
         frame_start=cfg.streams.frame_start,
         frame_end=cfg.streams.frame_end,
         frame_skip=cfg.streams.frame_skip,
-    )
-    pipeline = VipePipeline(
-        slam=cfg.pipeline.slam,
-        depth=cfg.pipeline.depth,
-        output=cfg.pipeline.output,
+        load_sensor_depth=cfg.pipeline.depth.use_gt_sens_depths is not None,
     )
     logger.info(f"Running ViPE on {stream.name()}")
     pipeline.run(stream)

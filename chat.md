@@ -148,6 +148,7 @@ Changes when keyframe is added:
 GraphBuffer.n_frames
 GraphBuffer.tstamp/images/fmaps/nets/inps
 GraphBuffer.disps_sens
+GraphBuffer.disps_sens_weight
 ```
 
 Changes when factors are added/removed:
@@ -299,6 +300,7 @@ GraphBuffer.images
 GraphBuffer.fmaps
 GraphBuffer.nets/inps
 GraphBuffer.disps_sens
+GraphBuffer.disps_sens_weight
 FactorGraph.ii/jj edge set
 ```
 
@@ -312,7 +314,7 @@ SLAMOutput.intrinsics  # one recovered original-resolution pinhole intrinsics ve
 SLAMOutput.keyframe_indices  # selected-frame indices of optimized SLAM keyframes
 ```
 
-Final DAV3 depth uses `keyframe_indices` only to re-read neighboring keyframes as context frames. No `FactorGraph` or dense keyframe-map object is passed to the output stage.
+Final DAV3 depth uses `keyframe_indices` only to re-read neighboring keyframes as context frames when the final depth mode runs DAV3. No `FactorGraph` or dense keyframe-map object is passed to the output stage.
 
 ### One-line mental model
 

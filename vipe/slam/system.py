@@ -78,10 +78,17 @@ class StandardResizeFrameProcessor:
 class SLAMSystem:
     """Solver-defined SLAM"""
 
-    def __init__(self, device: torch.device, config: DictConfig, keyframe_depth_model: str) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        config: DictConfig,
+        keyframe_depth_model: str,
+        use_gt_sens_depths: str | None,
+    ) -> None:
         self.device = device
         self.config = config.copy()
         self.keyframe_depth_model = keyframe_depth_model
+        self.use_gt_sens_depths = use_gt_sens_depths
         OmegaConf.set_struct(self.config, False)
 
     def _build_components(self):
@@ -103,7 +110,7 @@ class SLAMSystem:
         self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device)
         self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device)
         self.inner_filler = InnerFiller(self.droid_net, self.buffer, self.config, device=self.device)
-        self.metric_depth = DepthAnything3Model(self.keyframe_depth_model)
+        self.metric_depth = DepthAnything3Model(self.keyframe_depth_model, self.use_gt_sens_depths)
 
     def _store_buffer_frame(
         self,
@@ -143,7 +150,7 @@ class SLAMSystem:
             net=motion_result.net,
             inp=motion_result.inp,
         )
-        self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx)
+        self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx, frame_data=frame_data)
 
     def _add_infill_frame(self, frame_idx: int, images: torch.Tensor, frame_data: FrameData):
         self._store_buffer_frame(frame_idx, images, frame_data)

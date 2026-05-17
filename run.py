@@ -11,17 +11,18 @@ from vipe.utils.logging import configure_logging
 def run(args: DictConfig) -> None:
     seed_everything(args.seed)
     logger = configure_logging()
+    pipeline = VipePipeline(
+        slam=args.pipeline.slam,
+        depth=args.pipeline.depth,
+        output=args.pipeline.output,
+    )
     frame_stream = FrameDir(
         path=args.streams.base_path,
         fps=args.streams.fps,
         frame_start=args.streams.frame_start,
         frame_end=args.streams.frame_end,
         frame_skip=args.streams.frame_skip,
-    )
-    pipeline = VipePipeline(
-        slam=args.pipeline.slam,
-        depth=args.pipeline.depth,
-        output=args.pipeline.output,
+        load_sensor_depth=args.pipeline.depth.use_gt_sens_depths is not None,
     )
     logger.info(f"Processing {frame_stream.name()}")
     pipeline.run(frame_stream)

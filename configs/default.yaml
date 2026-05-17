@@ -41,6 +41,7 @@ pipeline:
     final_model: depth-anything/DA3-GIANT-1.1      # DAV3 posed model used for final per-frame dense depth.
     window_size: 10                                # Number of frames per final DAV3 sliding window.
     overlap_size: 3                                # Number of overlapped frames blended between windows.
+    use_gt_sens_depths: null                       # null=DAV3 depth; scale=scale DAV3 to GT sensor depth; direct=use GT sensor depth directly.
 
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.

@@ -23,6 +23,7 @@ except ModuleNotFoundError:
     DepthAnything3 = dav3_logger = None
 
 from vipe.utils.cameras import CameraType
+from vipe.utils.depth import scale_depth_to_sensor
 from vipe.utils.misc import unpack_optional
 
 from .base import DepthEstimationInput, DepthEstimationModel, DepthEstimationResult, DepthType
@@ -33,8 +34,13 @@ class DepthAnything3Model(DepthEstimationModel):
     https://github.com/ByteDance-Seed/Depth-Anything-3
     """
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, use_gt_sens_depths: str | None = None) -> None:
         super().__init__()
+        self.use_gt_sens_depths = use_gt_sens_depths
+        if self.use_gt_sens_depths == "direct":
+            self.model = None
+            return
+
         if DepthAnything3 is None or dav3_logger is None:
             raise RuntimeError(
                 "depth-anything-3 is not found. You can install it via `pip install --no-build-isolation -e .[dav3]`"
@@ -57,6 +63,16 @@ class DepthAnything3Model(DepthEstimationModel):
         assert rgb.dtype == torch.float32, "Input image should be float32"
 
         assert src.camera_type == CameraType.PINHOLE, "DAv3 only supports pinhole cameras"
+        if self.use_gt_sens_depths == "direct":
+            sensor_depth = unpack_optional(src.sensor_depth).float()
+            valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0)
+            metric_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
+            return DepthEstimationResult(
+                metric_depth=metric_depth,
+                confidence=valid.float(),
+                valid_mask=valid.float(),
+            )
+
         intrinsics = unpack_optional(src.intrinsics)
         focal_length: float = ((intrinsics[0] + intrinsics[1]) / 2).item()
 
@@ -91,6 +107,12 @@ class DepthAnything3Model(DepthEstimationModel):
             dav3_confidence = torch.nn.functional.interpolate(
                 dav3_confidence, rgb.shape[1:3], mode="bilinear"
             )[:, 0]
+
+        if self.use_gt_sens_depths == "scale":
+            sensor_depth = unpack_optional(src.sensor_depth).float()
+            if sensor_depth.dim() == 2:
+                sensor_depth = sensor_depth[None]
+            dav3_metric_depth, _ = scale_depth_to_sensor(dav3_metric_depth, sensor_depth.to(dav3_metric_depth))
 
         if not batch_dim:
             dav3_metric_depth = dav3_metric_depth.squeeze(0)

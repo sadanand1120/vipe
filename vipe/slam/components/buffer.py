@@ -27,6 +27,7 @@ from omegaconf.dictconfig import DictConfig
 
 from vipe.ext.lietorch.groups import SE3
 from vipe.priors.depth.base import DepthEstimationInput, DepthEstimationModel
+from vipe.streams.base import FrameData
 from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector
@@ -76,6 +77,7 @@ class GraphBuffer:
         # Dense disparity tensors at 1/8 SLAM resolution.
         self.disps = torch.ones(buffer_size, dd_height, dd_width, device=device, dtype=torch.float) * init_disp
         self.disps_sens = torch.zeros(buffer_size, dd_height, dd_width, device=device, dtype=torch.float)
+        self.disps_sens_weight = torch.ones(buffer_size, dd_height, dd_width, device=device, dtype=torch.float)
 
         # DROID feature/context state, all at 1/8 SLAM resolution.
         self.fmaps = torch.zeros(buffer_size, 128, dd_height, dd_width, device=device, dtype=torch.half)
@@ -89,22 +91,29 @@ class GraphBuffer:
         self.poses[ix] = self.poses[ix + 1]
         self.disps[ix] = self.disps[ix + 1]
         self.disps_sens[ix] = self.disps_sens[ix + 1]
+        self.disps_sens_weight[ix] = self.disps_sens_weight[ix + 1]
         self.nets[ix] = self.nets[ix + 1]
         self.inps[ix] = self.inps[ix + 1]
         self.fmaps[ix] = self.fmaps[ix + 1]
         self.n_frames -= 1
 
-    def update_disps_sens(self, depth_model: DepthEstimationModel, frame_idx: int):
+    def update_disps_sens(self, depth_model: DepthEstimationModel, frame_idx: int, frame_data: FrameData):
         depth_input = DepthEstimationInput(
             rgb=self.images[frame_idx].moveaxis(0, -1).float(),
             intrinsics=self.intrinsics,
+            sensor_depth=frame_data.sensor_depth,
             camera_type=self.camera_type,
         )
-        metric_depth = depth_model.estimate(depth_input).metric_depth
+        result = depth_model.estimate(depth_input)
+        metric_depth = result.metric_depth
         assert metric_depth is not None
         disp_sens = metric_depth[3::8, 3::8]
         disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
         self.disps_sens[frame_idx] = disp_sens
+        if result.valid_mask is None:
+            self.disps_sens_weight[frame_idx] = 1.0
+        else:
+            self.disps_sens_weight[frame_idx] = result.valid_mask[3::8, 3::8].float()
 
     def bundle_adjustment(
         self,
@@ -152,6 +161,7 @@ class GraphBuffer:
 
         if not motion_only:
             disps_sens = rearrange(self.disps_sens, "n h w -> n (h w)")
+            disps_sens_weight = rearrange(self.disps_sens_weight, "n h w -> n (h w)")
             sens_i_inds = di_unique[disps_sens[di_unique].sum(1) > 0.0]
             if len(sens_i_inds) > 0:
                 solver.add_term(
@@ -159,6 +169,7 @@ class GraphBuffer:
                         i_inds=sens_i_inds,
                         alpha=self.ba_config.dense_disp_alpha,
                         disps_sens=disps_sens,
+                        disps_sens_weight=disps_sens_weight,
                     )
                 )
             solver.set_retractor("dense_disp", DenseDispRetractor())

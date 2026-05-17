@@ -42,6 +42,7 @@ class DepthEstimationResult:
 
     metric_depth: torch.Tensor | None = None
     confidence: torch.Tensor | None = None
+    valid_mask: torch.Tensor | None = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -56,6 +57,7 @@ class DepthEstimationInput:
 
     rgb: torch.Tensor | None = None
     intrinsics: torch.Tensor | None = None
+    sensor_depth: torch.Tensor | None = None
     camera_type: CameraType = CameraType.PINHOLE
 
 

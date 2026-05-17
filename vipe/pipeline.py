@@ -29,10 +29,16 @@ from vipe.slam.system import SLAMSystem
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils import io
 from vipe.utils.cameras import CameraType
+from vipe.utils.depth import scale_depth_to_sensor
 from vipe.utils.logging import pbar
 
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_gt_sens_depth_mode(mode: str | None) -> None:
+    if mode not in {None, "scale", "direct"}:
+        raise ValueError(f"Invalid pipeline.depth.use_gt_sens_depths: {mode}")
 
 
 def estimate_geocalib_intrinsics(frame_stream: FrameStream, gap_sec: float = 1.0) -> torch.Tensor:
@@ -71,10 +77,16 @@ class DAV3DepthEstimator:
         model_name: str,
         window_size: int = 10,
         overlap_size: int = 3,
+        use_gt_sens_depths: str | None = None,
     ):
         super().__init__()
         self.window_size = window_size
         self.overlap_size = overlap_size
+        self.use_gt_sens_depths = use_gt_sens_depths
+
+        if self.use_gt_sens_depths == "direct":
+            self.dav3_api = None
+            return
 
         try:
             from depth_anything_3.api import DepthAnything3
@@ -104,7 +116,22 @@ class DAV3DepthEstimator:
         frame.camera_type = CameraType.PINHOLE
         return frame
 
+    def _estimate_direct(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> Iterator[FrameData]:
+        for frame_idx in pbar(range(len(frame_stream)), desc="Loading sensor depth"):
+            frame = self._attach_slam_output(frame_stream, frame_idx, slam_output)
+            if frame.sensor_depth is None:
+                raise ValueError("Sensor depth is required when pipeline.depth.use_gt_sens_depths=direct")
+            sensor_depth = frame.sensor_depth.float()
+            valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0)
+            frame.metric_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
+            frame.depth_confidence = valid.float()
+            yield frame
+
     def estimate(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> Iterator[FrameData]:
+        if self.use_gt_sens_depths == "direct":
+            yield from self._estimate_direct(frame_stream, slam_output)
+            return
+
         n_frames = len(frame_stream)
 
         current_sliding_window: list[FrameData] = []
@@ -153,6 +180,12 @@ class DAV3DepthEstimator:
                         sw_confidence[:, None], frame.size(), mode="bilinear"
                     )[:, 0]
 
+                if self.use_gt_sens_depths == "scale":
+                    if any(frame.sensor_depth is None for frame in current_sliding_window):
+                        raise ValueError("Sensor depth is required when pipeline.depth.use_gt_sens_depths=scale")
+                    sw_sensor = torch.stack([frame.sensor_depth for frame in current_sliding_window]).to(sw_depth)
+                    sw_depth, _ = scale_depth_to_sensor(sw_depth, sw_sensor)
+
                 n_frames_to_yield = (
                     self.window_size - self.overlap_size if not is_last_frame else len(current_sliding_window)
                 )
@@ -184,6 +217,7 @@ class VipePipeline:
         self.slam_cfg = slam
         self.depth_cfg = depth
         self.out_cfg = output
+        _validate_gt_sens_depth_mode(self.depth_cfg.use_gt_sens_depths)
         self.out_path = Path(self.out_cfg.path)
         self.out_path.mkdir(exist_ok=True, parents=True)
 
@@ -195,6 +229,7 @@ class VipePipeline:
             device=torch.device("cuda"),
             config=self.slam_cfg,
             keyframe_depth_model=self.depth_cfg.keyframe_model,
+            use_gt_sens_depths=self.depth_cfg.use_gt_sens_depths,
         )
         return slam_pipeline.run(frame_stream, intrinsics, camera_type=CameraType.PINHOLE)
 
@@ -203,6 +238,7 @@ class VipePipeline:
             model_name=self.depth_cfg.final_model,
             window_size=self.depth_cfg.window_size,
             overlap_size=self.depth_cfg.overlap_size,
+            use_gt_sens_depths=self.depth_cfg.use_gt_sens_depths,
         )
         return depth_estimator.estimate(frame_stream, slam_output)
 

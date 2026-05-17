@@ -206,34 +206,46 @@ class DispSensRegularizationTerm(SolverTerm):
         alpha: float
         i_inds: torch.Tensor
         disps_sens_res: torch.Tensor
+        disps_sens_weight: torch.Tensor
 
         def jtwj(self, group_name_row: str, group_name_col: str) -> SparseBlockMatrix:
             assert group_name_row == group_name_col == "dense_disp"
             return SparseMDiagonalBlockMatrix(
                 i_inds=self.i_inds,
                 j_inds=self.i_inds,
-                data=torch.full_like(self.disps_sens_res, self.alpha).unsqueeze(-1),
+                data=(self.alpha * self.disps_sens_weight).unsqueeze(-1),
             )
 
         def nwjtr(self, group_name: str) -> SparseBlockVector:
             assert group_name == "dense_disp"
-            return SparseBlockVector(inds=self.i_inds, data=-self.alpha * self.disps_sens_res)
+            return SparseBlockVector(
+                inds=self.i_inds,
+                data=-self.alpha * self.disps_sens_weight * self.disps_sens_res,
+            )
 
         def remove_jcol_inds(self, group_name: str, col_inds: torch.Tensor):
             assert group_name == "dense_disp"
             keep_mask = torch.isin(self.i_inds, col_inds, invert=True)
             self.i_inds = self.i_inds[keep_mask]
             self.disps_sens_res = self.disps_sens_res[keep_mask]
+            self.disps_sens_weight = self.disps_sens_weight[keep_mask]
 
         def residual(self) -> torch.Tensor:
-            return self.alpha * (self.disps_sens_res**2).sum(dim=1)
+            return self.alpha * (self.disps_sens_weight * self.disps_sens_res**2).sum(dim=1)
 
-    def __init__(self, i_inds: torch.Tensor, alpha: float, disps_sens: torch.Tensor) -> None:
+    def __init__(
+        self,
+        i_inds: torch.Tensor,
+        alpha: float,
+        disps_sens: torch.Tensor,
+        disps_sens_weight: torch.Tensor,
+    ) -> None:
         super().__init__()
 
         self.i_inds = i_inds
         self.alpha = alpha
         self.disps_sens = disps_sens
+        self.disps_sens_weight = disps_sens_weight
 
     def group_names(self) -> set[str]:
         return {"dense_disp"}
@@ -247,9 +259,11 @@ class DispSensRegularizationTerm(SolverTerm):
 
         assert isinstance(dense_disp, torch.Tensor)
         assert dense_disp.shape == self.disps_sens.shape
+        assert dense_disp.shape == self.disps_sens_weight.shape
 
         return self.ThisTermEvalReturn(
             alpha=self.alpha,
             i_inds=self.i_inds,
             disps_sens_res=dense_disp[self.i_inds] - self.disps_sens[self.i_inds],
+            disps_sens_weight=self.disps_sens_weight[self.i_inds],
         )
