@@ -52,12 +52,14 @@ class DepthEstimationInput:
 
     - rgb: The source image ([B,], H, W, 3), should be within 0-1 float.
     - intrinsics: The intrinsics of the camera.
+    - image_valid_mask: Optional mask for pixels that have valid source RGB after camera normalization.
     - camera_type: The type of camera.
     """
 
     rgb: torch.Tensor | None = None
     intrinsics: torch.Tensor | None = None
     sensor_depth: torch.Tensor | None = None
+    image_valid_mask: torch.Tensor | None = None
     camera_type: CameraType = CameraType.PINHOLE
 
 

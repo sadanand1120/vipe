@@ -58,6 +58,23 @@ class DepthAnything3Model(DepthEstimationModel):
         """
         return DepthType.METRIC_DEPTH
 
+    @staticmethod
+    def _image_valid_mask(
+        src: DepthEstimationInput,
+        shape: torch.Size,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if src.image_valid_mask is None:
+            return None
+        mask = src.image_valid_mask.to(device=device, dtype=torch.bool)
+        if len(shape) == 3 and mask.dim() == 2:
+            mask = mask[None]
+        if len(shape) == 2 and mask.dim() == 3:
+            assert mask.shape[0] == 1
+            mask = mask[0]
+        assert mask.shape == shape, f"image_valid_mask shape {mask.shape} does not match expected {shape}"
+        return mask
+
     def estimate(self, src: DepthEstimationInput) -> DepthEstimationResult:
         rgb: torch.Tensor = unpack_optional(src.rgb)
         assert rgb.dtype == torch.float32, "Input image should be float32"
@@ -65,7 +82,10 @@ class DepthAnything3Model(DepthEstimationModel):
         assert src.camera_type == CameraType.PINHOLE, "DAv3 only supports pinhole cameras"
         if self.use_gt_sens_depths == "direct":
             sensor_depth = unpack_optional(src.sensor_depth).float()
+            image_valid = self._image_valid_mask(src, sensor_depth.shape, sensor_depth.device)
             valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0)
+            if image_valid is not None:
+                valid &= image_valid
             metric_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
             return DepthEstimationResult(
                 metric_depth=metric_depth,
@@ -80,6 +100,7 @@ class DepthAnything3Model(DepthEstimationModel):
             rgb, batch_dim = rgb[None], False
         else:
             batch_dim = True
+        image_valid = self._image_valid_mask(src, rgb.shape[:3], rgb.device)
 
         rgb_images = [(rgb[idx].cpu().numpy() * 255).astype(np.uint8) for idx in range(rgb.shape[0])]
 
@@ -100,6 +121,9 @@ class DepthAnything3Model(DepthEstimationModel):
         dav3_metric_depth = dav3_metric_depth * (~dav3_sky_mask).astype(dav3_metric_depth.dtype)
         dav3_metric_depth = torch.from_numpy(dav3_metric_depth).cuda()[None]
         dav3_metric_depth = torch.nn.functional.interpolate(dav3_metric_depth, rgb.shape[1:3], mode="nearest")[:, 0]
+        valid = torch.isfinite(dav3_metric_depth) & (dav3_metric_depth > 0.0)
+        if image_valid is not None:
+            valid &= image_valid
 
         dav3_confidence = None
         if dav3_inference_result.conf is not None:
@@ -112,11 +136,24 @@ class DepthAnything3Model(DepthEstimationModel):
             sensor_depth = unpack_optional(src.sensor_depth).float()
             if sensor_depth.dim() == 2:
                 sensor_depth = sensor_depth[None]
-            dav3_metric_depth, _ = scale_depth_to_sensor(dav3_metric_depth, sensor_depth.to(dav3_metric_depth))
+            dav3_metric_depth, _ = scale_depth_to_sensor(
+                dav3_metric_depth,
+                sensor_depth.to(dav3_metric_depth),
+                valid,
+            )
+
+        dav3_metric_depth = torch.where(valid, dav3_metric_depth, torch.zeros_like(dav3_metric_depth))
+        if dav3_confidence is not None:
+            dav3_confidence = torch.where(valid, dav3_confidence, torch.zeros_like(dav3_confidence))
 
         if not batch_dim:
             dav3_metric_depth = dav3_metric_depth.squeeze(0)
+            valid = valid.squeeze(0)
             if dav3_confidence is not None:
                 dav3_confidence = dav3_confidence.squeeze(0)
 
-        return DepthEstimationResult(metric_depth=dav3_metric_depth, confidence=dav3_confidence)
+        return DepthEstimationResult(
+            metric_depth=dav3_metric_depth,
+            confidence=dav3_confidence,
+            valid_mask=valid.float(),
+        )

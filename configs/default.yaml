@@ -4,6 +4,8 @@ streams:
   frame_start: 0      # First frame index to read from the sorted frame list.
   frame_end: -1       # Exclusive end index; -1 means read through the end.
   frame_skip: 1       # Read every Nth frame; also divides effective stream FPS by N.
+  input_camera_model: pinhole # GeoCalib camera models currently supported here: pinhole, radial, simple_radial, simple_divisional, simple_mei.
+  use_gt_intrinsics: false # If true, load intrinsic/intrinsic_color.json if present, else intrinsic_color.txt, and skip GeoCalib.
 
 seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels.
 
@@ -47,7 +49,7 @@ pipeline:
     path: vipe_results/                  # Output directory for all saved artifacts.
     save_artifacts: false                # Save pose, depth, intrinsics, and point-cloud artifacts.
     pcd_fusion_mode: both                # Point cloud mode: backproject, tsdf, or both.
-    pcd_max_points: 8000000              # Max saved points per point-cloud output.
+    pcd_max_points: 10000000             # Max saved points per point-cloud output.
     pcd_conf_threshold_coef: 0.75        # DAV3 confidence threshold = mean confidence times this factor.
     pcd_sample_ratio: 0.015              # Per-frame sampling ratio before max-point downsampling.
     pcd_tsdf_voxel_length: 0.02          # TSDF voxel size in meters.

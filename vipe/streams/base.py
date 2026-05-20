@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -24,6 +26,29 @@ import torch
 from vipe.ext.lietorch.groups import SE3
 from vipe.utils.cameras import CameraType
 from vipe.utils.misc import sort_image_sequence
+
+
+@dataclass(frozen=True, slots=True)
+class SensorCamera:
+    """
+    Loaded RGB/color camera calibration for the input frame directory.
+    """
+
+    source_path: Path
+    input_k: np.ndarray
+    output_k: np.ndarray
+    width: int
+    height: int
+    distortion_model: str | None = None
+    distortion_coefficients: np.ndarray | None = None
+
+    @property
+    def has_distortion(self) -> bool:
+        return self.distortion_coefficients is not None and not np.allclose(self.distortion_coefficients, 0.0)
+
+    def pinhole_intrinsics(self) -> torch.Tensor:
+        k = self.output_k
+        return torch.as_tensor([k[0, 0], k[1, 1], k[0, 2], k[1, 2]], dtype=torch.float32).cuda()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -39,6 +64,7 @@ class FrameData:
       - For panorama images, this will all be zeros.
     - metric_depth: The depth map of the frame. The shape is (H, W). Value is in metric scale.
     - sensor_depth: Optional loaded sensor/GT depth. This is input data, not the pipeline output depth.
+    - image_valid_mask: Optional input-image validity mask. False means this output pixel has no valid source RGB.
     - depth_confidence: The depth confidence map of the frame. The shape is (H, W).
     - information: Additional information about the frame
     """
@@ -50,6 +76,7 @@ class FrameData:
     intrinsics: torch.Tensor | None = None
     metric_depth: torch.Tensor | None = None
     sensor_depth: torch.Tensor | None = None
+    image_valid_mask: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
     information: str = ""
 
@@ -68,6 +95,7 @@ class FrameData:
             rgb=self.rgb.cpu(),
             metric_depth=map_cpu(self.metric_depth),
             sensor_depth=map_cpu(self.sensor_depth),
+            image_valid_mask=map_cpu(self.image_valid_mask),
             depth_confidence=map_cpu(self.depth_confidence),
             pose=map_cpu(self.pose),
             intrinsics=map_cpu(self.intrinsics),
@@ -83,6 +111,7 @@ class FrameData:
             rgb=self.rgb.cuda(),
             metric_depth=map_cuda(self.metric_depth),
             sensor_depth=map_cuda(self.sensor_depth),
+            image_valid_mask=map_cuda(self.image_valid_mask),
             depth_confidence=map_cuda(self.depth_confidence),
             pose=map_cuda(self.pose),
             intrinsics=map_cuda(self.intrinsics),
@@ -115,6 +144,12 @@ class FrameData:
                 0, 0
             ]
 
+        new_image_valid_mask = None
+        if self.image_valid_mask is not None:
+            new_image_valid_mask = torch.nn.functional.interpolate(
+                self.image_valid_mask.float()[None, None], size, mode="nearest"
+            )[0, 0].bool()
+
         new_depth_confidence = None
         if self.depth_confidence is not None:
             new_depth_confidence = torch.nn.functional.interpolate(
@@ -134,6 +169,7 @@ class FrameData:
             rgb=new_rgb,
             metric_depth=new_metric_depth,
             sensor_depth=new_sensor_depth,
+            image_valid_mask=new_image_valid_mask,
             depth_confidence=new_depth_confidence,
             pose=self.pose,
             intrinsics=new_intrinsics,
@@ -158,6 +194,10 @@ class FrameData:
         if self.sensor_depth is not None:
             new_sensor_depth = self.sensor_depth[top:bottom, left:right]
 
+        new_image_valid_mask = None
+        if self.image_valid_mask is not None:
+            new_image_valid_mask = self.image_valid_mask[top:bottom, left:right]
+
         new_depth_confidence = None
         if self.depth_confidence is not None:
             new_depth_confidence = self.depth_confidence[top:bottom, left:right]
@@ -175,6 +215,7 @@ class FrameData:
             rgb=new_rgb,
             metric_depth=new_metric_depth,
             sensor_depth=new_sensor_depth,
+            image_valid_mask=new_image_valid_mask,
             depth_confidence=new_depth_confidence,
             pose=self.pose,
             intrinsics=new_intrinsics,
@@ -215,6 +256,9 @@ class FrameStream:
     def fps(self) -> float:
         raise NotImplementedError
 
+    def sensor_camera(self) -> SensorCamera | None:
+        return None
+
     def __len__(self) -> int:
         raise NotImplementedError
 
@@ -236,6 +280,7 @@ class FrameDir(FrameStream):
         frame_skip: int = 1,
         name: str | None = None,
         load_sensor_depth: bool = False,
+        load_sensor_intrinsics: bool = False,
     ) -> None:
         path = Path(path)
         self.path = path
@@ -264,6 +309,7 @@ class FrameDir(FrameStream):
         self.step = frame_skip
         self._fps = fps / self.step
         self.load_sensor_depth = load_sensor_depth
+        self._sensor_camera = self._load_sensor_camera() if load_sensor_intrinsics else None
 
         if self.load_sensor_depth:
             depth_dir = path.parent / "depth"
@@ -275,6 +321,88 @@ class FrameDir(FrameStream):
             if missing:
                 raise FileNotFoundError(f"Missing sensor depth file: {missing[0]}")
 
+    @staticmethod
+    def _json_matrix(meta: dict, key: str, shape: tuple[int, int]) -> np.ndarray | None:
+        value = meta.get(key)
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            value = value["data"]
+        matrix = np.asarray(value, dtype=np.float32)
+        return matrix.reshape(shape)
+
+    def _load_sensor_camera_json(self, path: Path) -> SensorCamera:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        camera_matrix = self._json_matrix(meta, "camera_matrix", (3, 3))
+        scannet_matrix = self._json_matrix(meta, "scannet_intrinsic_matrix", (4, 4))
+        projection_matrix = self._json_matrix(meta, "projection_matrix", (3, 4))
+
+        if camera_matrix is not None:
+            input_k = camera_matrix
+        elif scannet_matrix is not None:
+            input_k = scannet_matrix[:3, :3]
+        else:
+            intr = meta["intrinsics"]
+            input_k = np.array(
+                [[intr["fx"], 0.0, intr["cx"]], [0.0, intr["fy"], intr["cy"]], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+
+        distortion_coefficients = meta.get("distortion_coefficients")
+        if distortion_coefficients is not None:
+            distortion_coefficients = np.asarray(distortion_coefficients, dtype=np.float32).reshape(-1)
+
+        output_k = input_k
+        if distortion_coefficients is not None and not np.allclose(distortion_coefficients, 0.0):
+            if projection_matrix is not None:
+                output_k = projection_matrix[:3, :3]
+            distortion_model = meta.get("distortion_model")
+            if distortion_model not in {"plumb_bob", "rational_polynomial"}:
+                raise ValueError(f"Unsupported distortion model in {path}: {distortion_model}")
+        else:
+            distortion_model = meta.get("distortion_model")
+
+        width = int(meta.get("width", self._width))
+        height = int(meta.get("height", self._height))
+        if (height, width) != (self._height, self._width):
+            raise ValueError(
+                f"Sensor intrinsics size {width}x{height} does not match RGB frames {self._width}x{self._height}"
+            )
+
+        return SensorCamera(
+            source_path=path,
+            input_k=input_k.astype(np.float32),
+            output_k=output_k.astype(np.float32),
+            width=width,
+            height=height,
+            distortion_model=distortion_model,
+            distortion_coefficients=distortion_coefficients,
+        )
+
+    def _load_sensor_camera_txt(self, path: Path) -> SensorCamera:
+        matrix = np.loadtxt(path, dtype=np.float32)
+        if matrix.shape != (4, 4):
+            raise ValueError(f"Expected 4x4 ScanNet intrinsic matrix in {path}, got {matrix.shape}")
+        k = matrix[:3, :3].astype(np.float32)
+        return SensorCamera(
+            source_path=path,
+            input_k=k,
+            output_k=k,
+            width=self._width,
+            height=self._height,
+        )
+
+    def _load_sensor_camera(self) -> SensorCamera:
+        intrinsic_dir = self.path.parent / "intrinsic"
+        json_path = intrinsic_dir / "intrinsic_color.json"
+        txt_path = intrinsic_dir / "intrinsic_color.txt"
+
+        if json_path.exists():
+            return self._load_sensor_camera_json(json_path)
+        if txt_path.exists():
+            return self._load_sensor_camera_txt(txt_path)
+        raise FileNotFoundError(f"Missing sensor intrinsics file: {json_path} or {txt_path}")
+
     def frame_size(self) -> tuple[int, int]:
         return (self._height, self._width)
 
@@ -283,6 +411,9 @@ class FrameDir(FrameStream):
 
     def name(self) -> str:
         return self._name
+
+    def sensor_camera(self) -> SensorCamera | None:
+        return self._sensor_camera
 
     def __len__(self) -> int:
         return len(range(self.start, self.end, self.step))

@@ -102,6 +102,7 @@ class GraphBuffer:
             rgb=self.images[frame_idx].moveaxis(0, -1).float(),
             intrinsics=self.intrinsics,
             sensor_depth=frame_data.sensor_depth,
+            image_valid_mask=frame_data.image_valid_mask,
             camera_type=self.camera_type,
         )
         result = depth_model.estimate(depth_input)

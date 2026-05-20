@@ -2,7 +2,7 @@
 # https://github.com/cvg/GeoCalib
 # Licensed under the Apache-2.0 License. See THIRD_PARTY_LICENSES.md for details.
 
-"""Implementation of the pinhole, simple radial, and simple divisional camera models."""
+"""Implementation of the pinhole, radial, simple radial, simple divisional, and simple Mei camera models."""
 
 from abc import abstractmethod
 from typing import Dict, Optional, Tuple, Union
@@ -503,6 +503,10 @@ class Pinhole(BaseCamera):
     Use this model for undistorted images.
     """
 
+    @classmethod
+    def name(cls) -> str:
+        return "pinhole"
+
     def distort(self, p2d: torch.Tensor, return_scale: bool = False) -> Tuple[torch.Tensor]:
         """Distort normalized 2D coordinates."""
         if return_scale:
@@ -546,10 +550,19 @@ class SimpleRadial(BaseCamera):
     "An Exact Formula for Calculating Inverse Radial Lens Distortions" by Pierre Drap.
     """
 
+    @classmethod
+    def name(cls) -> str:
+        return "simple_radial"
+
     @property
     def dist(self) -> torch.Tensor:
         """Distortion parameters, with shape (..., 1)."""
         return self._data[..., 6:]
+
+    @classmethod
+    def num_dist_params(cls) -> int:
+        """Number of distortion parameters."""
+        return 1
 
     @property
     def k1(self) -> torch.Tensor:
@@ -601,7 +614,7 @@ class SimpleRadial(BaseCamera):
         b1 = -self.k1[..., None, None]
         r2 = torch.sum(p2d**2, -1, keepdim=True)
         if wrt == "dist":
-            return -r2 * p2d
+            return (-r2 * p2d)[..., None]
         elif wrt == "pts":
             radial = 1 + b1 * r2
             radial_diag = torch.diag_embed(radial.expand(radial.shape[:-1] + (2,)))
@@ -615,9 +628,122 @@ class SimpleRadial(BaseCamera):
         if wrt == "uv":  # (..., 2, 2)
             return torch.diag_embed((2 * self.k1[..., None, None]).expand(p2d.shape[:-1] + (2,)))
         elif wrt == "dist":
-            return 2 * p2d  # (..., 2)
+            return (2 * p2d)[..., None]
         else:
             return super().J_up_projection_offset(p2d, wrt)
+
+
+class Radial(BaseCamera):
+    """Implementation of the radial camera model.
+
+    Use this model for distorted images.
+
+    The distortion model is 1 + k1 * r^2 + k2 * r^4 where r^2 = x^2 + y^2.
+    The undistortion model is 1 - k1 * r^2 + (3 * k1^2 - k2) * r^4.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        return "radial"
+
+    @property
+    def dist(self) -> torch.Tensor:
+        """Distortion parameters, with shape (..., 2)."""
+        return self._data[..., 6:8]
+
+    @classmethod
+    def num_dist_params(cls) -> int:
+        """Number of distortion parameters."""
+        return 2
+
+    @property
+    def k1(self) -> torch.Tensor:
+        """First radial distortion parameter, with shape (...)."""
+        return self._data[..., 6]
+
+    @property
+    def k2(self) -> torch.Tensor:
+        """Second radial distortion parameter, with shape (...)."""
+        return self._data[..., 7]
+
+    def update_dist(self, delta: torch.Tensor, dist_range: Tuple[float, float] = (-0.7, 0.7)):
+        """Update the k1, k2 distortion parameters."""
+        delta_dist = self.new_ones(self.dist.shape) * delta
+        dist = (self.dist + delta_dist).clamp(*dist_range)
+        data = torch.cat([self.size, self.f, self.c, dist], -1)
+        return self.__class__(data)
+
+    @autocast
+    def check_valid(self, p2d: torch.Tensor) -> torch.Tensor:
+        """Check if the distorted points are valid."""
+        return p2d.new_ones(p2d.shape[:-1]).bool()
+
+    def distort(self, p2d: torch.Tensor, return_scale: bool = False) -> Tuple[torch.Tensor]:
+        """Distort normalized 2D coordinates and check for validity of the distortion model."""
+        r2 = torch.sum(p2d**2, -1, keepdim=True)
+        r4 = r2**2
+        radial = 1 + self.k1[..., None, None] * r2 + self.k2[..., None, None] * r4
+
+        if return_scale:
+            return radial, None
+
+        return p2d * radial, self.check_valid(p2d)
+
+    def J_distort(self, p2d: torch.Tensor, wrt: str = "pts"):
+        """Jacobian of the distortion function."""
+        if wrt == "scale2dist":
+            r2 = torch.sum(p2d**2, -1, keepdim=True)
+            r4 = r2**2
+            return torch.cat([r2, r4], -1)
+        elif wrt == "scale2pts":
+            r2 = torch.sum(p2d**2, -1, keepdim=True)
+            k1, k2 = self.k1[..., None, None], self.k2[..., None, None]
+            return (2 * k1 + 4 * k2 * r2) * p2d
+        else:
+            return super().J_distort(p2d, wrt)
+
+    @autocast
+    def undistort(self, p2d: torch.Tensor) -> Tuple[torch.Tensor]:
+        """Undistort normalized 2D coordinates and check for validity of the distortion model."""
+        r2 = torch.sum(p2d**2, -1, keepdim=True)
+        k1, k2 = self.k1[..., None, None], self.k2[..., None, None]
+        b1, b2 = -k1, 3 * k1**2 - k2
+        radial = 1 + b1 * r2 + b2 * r2**2
+        return p2d * radial, self.check_valid(p2d)
+
+    @autocast
+    def J_undistort(self, p2d: torch.Tensor, wrt: str = "pts") -> torch.Tensor:
+        """Jacobian of the undistortion function."""
+        r2 = torch.sum(p2d**2, -1, keepdim=True)
+        r4 = r2**2
+        k1, k2 = self.k1[..., None, None], self.k2[..., None, None]
+
+        if wrt == "dist":
+            j_k1 = (6 * r4 * k1 - r2) * p2d
+            j_k2 = -r4 * p2d
+            return torch.stack([j_k1, j_k2], -1)
+        elif wrt == "pts":
+            b1, b2 = -k1, 3 * k1**2 - k2
+            uv_uv_t = torch.einsum("...i,...j->...ij", p2d, p2d)
+            jac = (4 * r2 * b2 + 2 * b1)[..., None] * uv_uv_t
+            eye = torch.eye(2, device=p2d.device, dtype=p2d.dtype).expand(p2d.shape[:-1] + (2, 2))
+            return jac + (1 + b1 * r2 + b2 * r4)[..., None] * eye
+        else:
+            return super().J_undistort(p2d, wrt)
+
+    def J_up_projection_offset(self, p2d: torch.Tensor, wrt: str = "uv") -> torch.Tensor:
+        """Jacobian of the up-projection offset."""
+        r2 = torch.sum(p2d**2, -1, keepdim=True)
+        k1, k2 = self.k1[..., None, None], self.k2[..., None, None]
+
+        if wrt == "uv":
+            uv_uv_t = torch.einsum("...i,...j->...ij", p2d, p2d)
+            eye = torch.eye(2, device=p2d.device, dtype=p2d.dtype).expand(p2d.shape[:-1] + (2, 2))
+            return 8 * k2[..., None] * uv_uv_t + (2 * k1 + 4 * k2 * r2)[..., None] * eye
+        elif wrt == "dist":
+            return torch.stack([2 * p2d, 4 * r2 * p2d], -1)
+
+        return super().J_up_projection_offset(p2d, wrt)
 
 
 class SimpleDivisional(BaseCamera):
@@ -630,10 +756,19 @@ class SimpleDivisional(BaseCamera):
     The undistortion model is 1 / (1 + k1 * r^2).
     """
 
+    @classmethod
+    def name(cls) -> str:
+        return "simple_divisional"
+
     @property
     def dist(self) -> torch.Tensor:
         """Distortion parameters, with shape (..., 1)."""
         return self._data[..., 6:]
+
+    @classmethod
+    def num_dist_params(cls) -> int:
+        """Number of distortion parameters."""
+        return 1
 
     @property
     def k1(self) -> torch.Tensor:
@@ -700,7 +835,7 @@ class SimpleDivisional(BaseCamera):
         k1 = self.k1[..., None, None]
         if wrt == "dist":
             denom = (1 + k1 * r2) ** 2
-            return -r2 / denom.masked_fill(denom == 0, 1e6) * p2d
+            return (-r2 / denom.masked_fill(denom == 0, 1e6) * p2d)[..., None]
         elif wrt == "pts":
             t0 = 1 + k1 * r2
             t0 = t0.masked_fill(t0 == 0, 1e6)
@@ -734,7 +869,7 @@ class SimpleDivisional(BaseCamera):
             denom = denom.masked_fill(denom == 0, 1e6)
             J = J + (1 - t1) / denom
 
-            return J * p2d
+            return (J * p2d)[..., None]
         elif wrt == "uv":
             # ! unstable (gradient checker might fail), rewrite to use single division (by denom)
             ppT = torch.einsum("...i,...j->...ij", p2d, p2d)  # (..., 2, 2)
@@ -784,6 +919,15 @@ class SimpleMei(BaseCamera):
         - *might* cause problem for LM optimization.
         - needs special care for projecting to nearest pinhole (cannot just remove the dist param).
     """
+
+    @classmethod
+    def name(cls) -> str:
+        return "simple_mei"
+
+    @classmethod
+    def num_dist_params(cls) -> int:
+        """Number of distortion parameters."""
+        return 1
 
     @staticmethod
     def build_from_other(camera: BaseCamera, max_r: float = 1.0, resolution: int = 50) -> "SimpleMei":
@@ -892,7 +1036,7 @@ class SimpleMei(BaseCamera):
         if wrt == "dist":
             ds_sk = (-df_dk * k1 + f) / (f - k1) ** 2
             res = ds_sk * p2d
-            return res
+            return res[..., None]
         elif wrt == "pts":
             u, v = p2d.unbind(-1)
             u, v = u[..., None], v[..., None]
@@ -943,13 +1087,14 @@ class SimpleMei(BaseCamera):
         elif wrt == "dist":
             rhs = 2 * k1 / kRi3 - 1 / (kRi2 * R)
             res = rhs * p2d
-            return res
+            return res[..., None]
         else:
             return super().J_up_projection_offset(p2d, wrt)
 
 
 camera_models = {
     "pinhole": Pinhole,
+    "radial": Radial,
     "simple_radial": SimpleRadial,
     "simple_divisional": SimpleDivisional,
     "simple_mei": SimpleMei,

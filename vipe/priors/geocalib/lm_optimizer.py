@@ -51,7 +51,10 @@ def get_trivial_estimation(data: Dict[str, torch.Tensor], camera_model: BaseCame
 
     params = {"width": batch_w, "height": batch_h, "vfov": init_vfov}
     params |= {"scales": data["scales"]} if "scales" in data else {}
-    params |= {"k1": data["prior_k1"]} if "prior_k1" in data else {}
+    if "prior_dist" in data:
+        params |= {"dist": data["prior_dist"]}
+    elif "prior_k1" in data:
+        params |= {"k1": data["prior_k1"]}
     camera = camera_model.from_dict(params)
     camera = camera.float().to(ref.device)
 
@@ -216,19 +219,29 @@ class LMOptimizer(nn.Module):
             self.estimate_focal = False
             logger.debug("Using provided focal as prior.")
 
-        self.estimate_k1 = True
-        if "prior_k1" in data:
-            self.estimate_k1 = False
-            logger.debug("Using provided k1 as prior.")
+        self.estimate_dist = self.camera_has_distortion
+        if "prior_dist" in data or "prior_k1" in data:
+            self.estimate_dist = False
+            logger.debug("Using provided distortion as prior.")
 
         self.gravity_delta_dims = (0, 1) if self.estimate_gravity else (-1,)
         self.focal_delta_dims = (max(self.gravity_delta_dims) + 1,) if self.estimate_focal else (-1,)
-        self.k1_delta_dims = (max(self.focal_delta_dims) + 1,) if self.estimate_k1 else (-1,)
+        self.dist_delta_dims = ()
+        if self.estimate_dist:
+            self.dist_delta_dims = tuple(
+                range(
+                    self.focal_delta_dims[-1] + 1,
+                    self.focal_delta_dims[-1] + 1 + self.camera_model.num_dist_params(),
+                )
+            )
+        self.n_intrinsic_params = self.estimate_focal + (
+            self.camera_model.num_dist_params() if self.estimate_dist else 0
+        )
 
         logger.debug(f"Camera Model:       {self.camera_model}")
         logger.debug(f"Optimizing gravity: {self.estimate_gravity} ({self.gravity_delta_dims})")
         logger.debug(f"Optimizing focal:   {self.estimate_focal} ({self.focal_delta_dims})")
-        logger.debug(f"Optimizing k1:      {self.estimate_k1} ({self.k1_delta_dims})")
+        logger.debug(f"Optimizing dist:    {self.estimate_dist} ({self.dist_delta_dims})")
 
         logger.debug(f"Shared intrinsics:  {self.shared_intrinsics}")
 
@@ -324,8 +337,8 @@ class LMOptimizer(nn.Module):
             dims = (0, 1)
         if self.estimate_focal:
             dims += (2,)
-        if self.camera_has_distortion and self.estimate_k1:
-            dims += (3,)
+        if self.estimate_dist:
+            dims += tuple(range(3, 3 + self.camera_model.num_dist_params()))
         assert dims, "No parameters to optimize"
 
         J = J[..., dims]
@@ -393,12 +406,16 @@ class LMOptimizer(nn.Module):
         J_up = J_up.reshape(J_up.shape[0], -1, J_up.shape[-2], J_up.shape[-1])  # (B, N, 2, 3)
         J_lat = J_lat.reshape(J_lat.shape[0], -1, J_lat.shape[-2], J_lat.shape[-1])  # (B, N, 1, 3)
 
-        n_params = 2 * self.estimate_gravity + self.estimate_focal + (self.camera_has_distortion and self.estimate_k1)
+        n_params = (
+            2 * self.estimate_gravity
+            + self.estimate_focal
+            + (self.camera_model.num_dist_params() if self.estimate_dist else 0)
+        )
         Grad = J_up.new_zeros(J_up.shape[0], n_params)
         Hess = J_up.new_zeros(J_up.shape[0], n_params, n_params)
 
         if shared_intrinsics:
-            N_params = Grad.shape[0] * (n_params - 1) + 1
+            N_params = Grad.shape[0] * (n_params - self.n_intrinsic_params) + self.n_intrinsic_params
             Grad = Grad.new_zeros(1, N_params)
             Hess = Hess.new_zeros(1, N_params, N_params)
 
@@ -506,12 +523,8 @@ class LMOptimizer(nn.Module):
         delta_f = delta[..., self.focal_delta_dims] if self.estimate_focal else delta.new_zeros(delta.shape[:-1] + (1,))
         new_camera = camera.update_focal(delta_f, as_log=self.conf.use_log_focal)
 
-        delta_dist = (
-            delta[..., self.k1_delta_dims]
-            if self.camera_has_distortion and self.estimate_k1
-            else delta.new_zeros(delta.shape[:-1] + (1,))
-        )
-        if self.camera_has_distortion:
+        if self.estimate_dist:
+            delta_dist = delta[..., self.dist_delta_dims]
             new_camera = new_camera.update_dist(delta_dist)
 
         return new_camera, new_gravity

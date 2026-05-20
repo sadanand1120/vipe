@@ -23,9 +23,14 @@ def run(args: DictConfig) -> None:
         frame_end=args.streams.frame_end,
         frame_skip=args.streams.frame_skip,
         load_sensor_depth=args.pipeline.depth.use_gt_sens_depths is not None,
+        load_sensor_intrinsics=args.streams.use_gt_intrinsics,
     )
     logger.info(f"Processing {frame_stream.name()}")
-    pipeline.run(frame_stream)
+    pipeline.run(
+        frame_stream,
+        input_camera_model=args.streams.input_camera_model,
+        use_gt_intrinsics=args.streams.use_gt_intrinsics,
+    )
     logger.info(f"Finished processing {frame_stream.name()}")
 
 

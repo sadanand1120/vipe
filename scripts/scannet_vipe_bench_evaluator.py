@@ -157,9 +157,14 @@ def run_vipe(overrides: list[str]) -> None:
         frame_end=cfg.streams.frame_end,
         frame_skip=cfg.streams.frame_skip,
         load_sensor_depth=cfg.pipeline.depth.use_gt_sens_depths is not None,
+        load_sensor_intrinsics=cfg.streams.use_gt_intrinsics,
     )
     logger.info(f"Running ViPE on {stream.name()}")
-    pipeline.run(stream)
+    pipeline.run(
+        stream,
+        input_camera_model=cfg.streams.input_camera_model,
+        use_gt_intrinsics=cfg.streams.use_gt_intrinsics,
+    )
 
 
 def _subset_scene_data(scene_data, keep_indices: list[int]):
@@ -436,14 +441,16 @@ def print_scannet_summary(metrics) -> None:
     print("-" * (col1 + col2 + col3))
     print(f"{'Metric':<{col1}}{'TSDF':<{col2}}{'Backproject':<{col3}}")
     print("-" * (col1 + col2 + col3))
-    print(f"{'F-score':<{col1}}{_fmt(recon_u_tsdf.get('fscore')):<{col2}}{_fmt(recon_u_backproject.get('fscore')):<{col3}}")
     print(f"{'Overall':<{col1}}{_fmt(recon_u_tsdf.get('overall')):<{col2}}{_fmt(recon_u_backproject.get('overall')):<{col3}}")
+    print(f"{'PSNR':<{col1}}{_fmt(recon_u_tsdf.get('psnr')):<{col2}}{_fmt(recon_u_backproject.get('psnr')):<{col3}}")
+    print(f"{'SSIM':<{col1}}{_fmt(recon_u_tsdf.get('ssim')):<{col2}}{_fmt(recon_u_backproject.get('ssim')):<{col3}}")
     print("\nRECON_POSED (GT Pose)")
     print("-" * (col1 + col2 + col3))
     print(f"{'Metric':<{col1}}{'TSDF':<{col2}}{'Backproject':<{col3}}")
     print("-" * (col1 + col2 + col3))
-    print(f"{'F-score':<{col1}}{_fmt(recon_p_tsdf.get('fscore')):<{col2}}{_fmt(recon_p_backproject.get('fscore')):<{col3}}")
     print(f"{'Overall':<{col1}}{_fmt(recon_p_tsdf.get('overall')):<{col2}}{_fmt(recon_p_backproject.get('overall')):<{col3}}")
+    print(f"{'PSNR':<{col1}}{_fmt(recon_p_tsdf.get('psnr')):<{col2}}{_fmt(recon_p_backproject.get('psnr')):<{col3}}")
+    print(f"{'SSIM':<{col1}}{_fmt(recon_p_tsdf.get('ssim')):<{col2}}{_fmt(recon_p_backproject.get('ssim')):<{col3}}")
 
 
 def main() -> None:

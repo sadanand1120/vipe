@@ -170,17 +170,20 @@ def J_up_field(
     J_up2f = torch.einsum("...Nij,...Nj->...Ni", J_norm2proj, J_proj2f)[..., None]  # (..., N, 2, 1)
     J.append(J_up2f)
 
-    ######################
-    ##### K1 Jacobian ####
-    ######################
+    #######################
+    # Distortion Jacobian #
+    #######################
 
     if hasattr(camera, "dist"):
         J_duv = camera.J_distort(uv, wrt="scale2dist")
-        J_duv = torch.diag_embed(J_duv.expand(J_duv.shape[:-1] + (2,)))  # (..., N, 2, 2)
-        J_offset = torch.einsum("...i,...j->...ij", camera.J_up_projection_offset(uv, wrt="dist"), uv)
-        J_proj2k1 = torch.einsum("...Nij,...Nj->...Ni", J_duv + J_offset, projected_up2d)
-        J_k1 = torch.einsum("...Nij,...Nj->...Ni", J_norm2proj, J_proj2k1)[..., None]
-        J.append(J_k1)
+        J_first2dist = torch.einsum("...n,...k->...nk", projected_up2d, J_duv)
+
+        J_sec2dist = torch.einsum("...i,...j->...ij", uv, projected_up2d)
+        J_uvTdist = camera.J_up_projection_offset(uv, wrt="dist")
+        J_sec2dist = torch.einsum("...nj,...jk->...nk", J_sec2dist, J_uvTdist)
+
+        J_dist = torch.einsum("...ij,...jk->...ik", J_norm2proj, J_first2dist + J_sec2dist)
+        J.append(J_dist)
 
     n_params = sum(j.shape[-1] for j in J)
     return torch.cat(J, axis=-1).reshape(camera.shape[0], h, w, 2, n_params)
@@ -268,17 +271,15 @@ def J_latitude_field(
     J_f = torch.einsum("...Ni,...i->...N", J_norm2f, gravity.vec3d).unsqueeze(-1)  # (..., N, 1)
     J.append(J_f)
 
-    ######################
-    ##### K1 Jacobian ####
-    ######################
+    #######################
+    # Distortion Jacobian #
+    #######################
 
     if hasattr(camera, "dist"):
-        J_w_to_img2k1 = camera.J_image2world(xy, "dist")  # (..., N, 2)
-        # (..., N, 2)
-        J_norm2k1 = torch.einsum("...Nij,...Nj->...Ni", J_norm2w_to_img, J_w_to_img2k1)
-        # (..., N, 1)
-        J_k1 = torch.einsum("...Ni,...i->...N", J_norm2k1, gravity.vec3d).unsqueeze(-1)
-        J.append(J_k1)
+        J_w_to_img2dist = camera.J_image2world(xy, "dist")
+        J_norm2dist = torch.einsum("...Nij,...Njk->...Nik", J_norm2w_to_img, J_w_to_img2dist)
+        J_dist = torch.einsum("...Nij,...i->...Nj", J_norm2dist, gravity.vec3d)
+        J.append(J_dist)
 
     n_params = sum(j.shape[-1] for j in J)
     return torch.cat(J, axis=-1).reshape(camera.shape[0], h, w, 1, n_params)

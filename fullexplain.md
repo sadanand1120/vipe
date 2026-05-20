@@ -26,7 +26,7 @@ The implementation details below follow those five stages directly. Subsections 
 
 ```mermaid
 flowchart LR
-    S1[Stage 1: initialization and stream setup] -->|FrameDir plus one GeoCalib intrinsics tensor| S2[Stage 2: SLAM pass 1 frontend loop]
+    S1[Stage 1: initialization and stream setup] -->|pinhole-normalized frame stream plus one GeoCalib intrinsics tensor| S2[Stage 2: SLAM pass 1 frontend loop]
     S2 -->|keyframe buffer: poses, DROID features, disparities, depth anchors| S3[Stage 3: backend global BA over keyframes]
     S3 -->|refined keyframe poses/disparities in GraphBuffer| S4[Stage 4: SLAM pass 2 pose infill loop]
     S4 -->|SLAMOutput: full trajectory, recovered intrinsics, keyframe indices| S5[Stage 5: replay, final depth, artifact/PCD writing]
@@ -36,7 +36,7 @@ The execution grain is:
 
 | Stage | What it computes |
 | --- | --- |
-| Stage 1: initialization and stream setup | Creates one `FrameDir`, optionally enables per-frame ScanNet sensor-depth loading, and estimates one shared pinhole intrinsics vector from three sampled frames with GeoCalib. No full-sequence cache or stream wrapper is created. |
+| Stage 1: initialization and stream setup | Creates one `FrameDir`, optionally enables per-frame ScanNet sensor-depth and/or sensor-intrinsics loading, then hands downstream code a pinhole stream plus one pinhole intrinsics vector. Intrinsics come either from loaded RGB/color calibration or from GeoCalib. No full-sequence cache is created. |
 | Stage 2: SLAM pass 1 frontend loop | Loops over frames once, attaches the shared intrinsics, resizes each frame for SLAM, runs DROID motion-filter features on every frame, stores accepted keyframes with DROID feature/context tensors and the configured keyframe depth anchor, and runs incremental frontend BA as keyframes arrive. |
 | Stage 3: backend global BA | Runs once over the complete pass-1 keyframe set with `steps=backend_iters`. It builds one fresh non-incremental factor graph and optimizes all keyframes as a sequence-level solve. |
 | Stage 4: SLAM pass 2 pose infill loop | Loops over every frame again, appends frames in chunks, initializes non-keyframe poses from neighboring keyframes, optimizes those appended poses motion-only, and returns one pose per original frame plus the selected-frame indices of SLAM keyframes. |
@@ -56,7 +56,7 @@ Source files:
 | `vipe/pipeline.py` | `VipePipeline` |
 | `vipe/streams/base.py` | `FrameDir`, `FrameData`, `FrameStream` |
 
-Stage context: this is the sequence-once setup part of Stage 1. It constructs config-backed Python objects only. It does not read the whole image sequence, does not run GeoCalib yet, and does not run SLAM. The handoff is one `FrameDir` source plus one `VipePipeline`.
+Stage context: this is the sequence-once setup part of Stage 1. It constructs config-backed Python objects only. It does not read the whole image sequence, does not run GeoCalib yet, and does not run SLAM. If direct sensor intrinsics are enabled, `FrameDir` loads only the single calibration file during construction. The handoff is one raw `FrameDir` source plus one `VipePipeline`; camera-model normalization happens when `pipeline.run(...)` starts.
 
 #### Diagram
 
@@ -66,11 +66,13 @@ flowchart TD
     A --> C[Hydra CLI overrides]
     C --> D[configs/default.yaml]
     D --> E[DictConfig args]
-    E --> F[FrameDir args.streams.base_path/fps/start/end/skip]
+    E --> F[FrameDir args.streams base_path/fps/start/end/skip]
+    E --> K[streams.input_camera_model]
     E --> G[VipePipeline args.pipeline]
     F --> H[frame_stream]
     G --> I[pipeline]
-    H --> J[pipeline.run(frame_stream)]
+    K --> J[pipeline.run frame_stream plus input_camera_model]
+    H --> J
     I --> J
 ```
 
@@ -117,6 +119,7 @@ frame_stream = FrameDir(
     frame_end=args.streams.frame_end,
     frame_skip=args.streams.frame_skip,
     load_sensor_depth=args.pipeline.depth.use_gt_sens_depths is not None,
+    load_sensor_intrinsics=args.streams.use_gt_intrinsics,
 )
 ```
 
@@ -127,6 +130,24 @@ frame_stream = FrameDir(
 | `null` | RGB only. `FrameData.sensor_depth=None`. | Use DAV3 normally. |
 | `scale` | RGB plus sensor depth. | Run DAV3, then multiply DAV3 depth by one least-squares scalar to match sensor depth. |
 | `direct` | RGB plus sensor depth. | Skip the relevant DAV3 depth model and use sensor depth directly, with invalid sensor pixels masked out of BA priors. |
+
+`streams.use_gt_intrinsics` controls whether `FrameDir` also reads RGB/color camera calibration from the sibling `intrinsic/` directory:
+
+| Value | FrameDir behavior | Stage 1 camera behavior |
+| --- | --- | --- |
+| `false` | Does not load an external camera file. | Use the GeoCalib path controlled by `streams.input_camera_model`. |
+| `true` | Load `<scene>/intrinsic/intrinsic_color.json` if present, otherwise `<scene>/intrinsic/intrinsic_color.txt`. | Use the loaded camera as the source of truth. If it has OpenCV distortion metadata, undistort the stream once into a pinhole image plane. |
+
+The TXT path is ScanNet-style pinhole-only metadata. The JSON path can carry width, height, camera matrix, projection matrix, distortion model, and distortion coefficients. JSON currently supports OpenCV `plumb_bob` and `rational_polynomial` distortion, which covers ROS `sensor_msgs/CameraInfo` exports such as `data/rosbags/distilled_bag/intrinsic/intrinsic_color.json`.
+
+`streams.input_camera_model` controls how Stage 1 interprets the incoming RGB frames before downstream pinhole SLAM:
+
+| Value | Stage 1 behavior |
+| --- | --- |
+| `pinhole` | Current default. Estimate one shared pinhole FOV from three sampled frames and pass raw frames downstream. |
+| `radial`, `simple_radial`, `simple_divisional`, `simple_mei` | Use GeoCalib distorted weights to estimate that distorted input camera from three sampled frames, average the estimated camera parameters, wrap the source in a pinhole-normalizing stream, and pass undistorted pinhole frames downstream. |
+
+`radial` is the upstream GeoCalib two-parameter radial model with `k1,k2`. `simple_radial`, `simple_divisional`, and `simple_mei` use one distortion parameter.
 
 `configure_logging()` owns the `vipe` logger tree. It clears duplicate handlers on the top-level `vipe` logger, installs one tqdm-compatible INFO handler, and re-enables `vipe.*` child loggers so module logs from `vipe.slam.system`, `vipe.slam.components.buffer`, `vipe.pipeline`, and artifact saving all propagate consistently in both `run.py` and the ScanNet benchmark adapter.
 
@@ -151,7 +172,11 @@ Finally:
 
 ```python
 logger.info(f"Processing {frame_stream.name()}")
-pipeline.run(frame_stream)
+pipeline.run(
+    frame_stream,
+    input_camera_model=args.streams.input_camera_model,
+    use_gt_intrinsics=args.streams.use_gt_intrinsics,
+)
 logger.info(f"Finished processing {frame_stream.name()}")
 ```
 
@@ -321,48 +346,100 @@ Depth PNG values are treated as millimeters and converted to meters. Nonfinite a
 | `pipeline.depth.use_gt_sens_depths in {"scale", "direct"}` | `load_sensor_depth=True`; missing sibling depth PNG raises immediately. |
 | Image read fails | Raises `ValueError`. |
 
-### GeoCalib Intrinsics
+### Camera Initialization And Pinhole Normalization
 
 Source files:
 
 | File | Role |
 | --- | --- |
-| `vipe/pipeline.py` | `estimate_geocalib_intrinsics`, `VipePipeline.run` |
+| `vipe/pipeline.py` | External-camera initialization, GeoCalib initialization, distorted-camera estimation, pinhole-normalizing stream wrappers, `VipePipeline.run` |
+| `vipe/streams/base.py` | `FrameDir` calibration-file loading and `SensorCamera` metadata |
 | `vipe/priors/geocalib/*` | GeoCalib model and LM optimizer |
 
-Stage context: this completes Stage 1. GeoCalib samples three frames once, estimates one shared vertical FOV, and converts that FOV into one raw-resolution pinhole intrinsics tensor. The one-time handoff to Stage 2 is the original `FrameDir` plus this shared CUDA tensor.
+Stage context: this completes Stage 1. It produces the pinhole camera representation used by every later stage. If `streams.use_gt_intrinsics=true`, ViPE loads RGB/color intrinsics from disk and skips GeoCalib. If that loaded camera has OpenCV distortion metadata, it builds an OpenCV undistortion map and wraps the source in `OpenCVPinholeNormalizedFrameStream`. Otherwise GeoCalib samples three frames once. If `streams.input_camera_model=pinhole`, GeoCalib estimates one shared vertical FOV and converts that FOV into one raw-resolution pinhole intrinsics tensor. If the GeoCalib input model is distorted, it estimates the configured distorted camera, builds a pinhole undistortion map, and wraps the original source in `PinholeNormalizedFrameStream`. Any undistortion wrapper also produces `FrameData.image_valid_mask`, where false means the output pixel had no valid source RGB sample. The one-time handoff to Stage 2 is always pinhole: a frame stream that yields pinhole-normalized images plus one CUDA tensor `[fx, fy, cx, cy]`.
 
 #### Diagram
 
 ```mermaid
 flowchart TD
-    A[Raw FrameDir] --> B[estimate_geocalib_intrinsics]
-    B --> C[Compute sample indices 0,gap,2gap]
-    C --> D[Read only sampled frames from FrameDir]
-    D --> E[GeoCalib calibrate shared intrinsics]
+    A[Raw FrameDir] --> AA{use_gt_intrinsics=true?}
+    AA -->|yes| AB[Load SensorCamera from intrinsic_color.json or intrinsic_color.txt]
+    AB --> AC{loaded camera has distortion?}
+    AC -->|yes| AD[Build OpenCV undistortion grid]
+    AD --> AE[OpenCVPinholeNormalizedFrameStream]
+    AC -->|no| AF[Raw stream already pinhole]
+    AB --> AG[Use loaded output_K as fx,fy,cx,cy]
+    AA -->|no| B[Compute sample indices 0,gap,2gap]
+    B --> C[Read only sampled frames from FrameDir]
+    C --> D{streams.input_camera_model}
+    D -->|pinhole| E[GeoCalib pinhole shared intrinsics]
     E --> F[Convert vfov to fx,fy,cx,cy]
-    F --> G[Shared intrinsics tensor]
-    G --> H[SLAM receives FrameDir and intrinsics]
-    H --> I[SLAM attaches intrinsics and PINHOLE per frame]
+    D -->|distorted model| G[GeoCalib distorted per-sample camera estimates]
+    G --> H[Average camera parameters]
+    H --> I[Build pinhole undistortion grid]
+    I --> J[PinholeNormalizedFrameStream]
+    H --> K[Use camera.pinhole f,c as fx,fy,cx,cy]
+    F --> L[Pinhole intrinsics tensor]
+    K --> L
+    AG --> L
+    A --> M[Raw stream when already pinhole]
+    M --> N[SLAM receives pinhole stream and intrinsics]
+    AF --> N
+    AE --> N
+    J --> N
+    L --> N
+    N --> O[SLAM attaches intrinsics and PINHOLE per frame]
 ```
 
 #### Pipeline Construction
 
-`VipePipeline.run(frame_stream)` starts by creating the artifact path and computing intrinsics:
+`VipePipeline.run(frame_stream, input_camera_model, use_gt_intrinsics)` starts by normalizing the input camera and computing downstream pinhole intrinsics:
 
 ```python
+frame_stream, intrinsics = self._initialize(frame_stream, input_camera_model, use_gt_intrinsics)
 artifact_path = io.ArtifactPath(self.out_path, frame_stream.name())
-intrinsics = estimate_geocalib_intrinsics(frame_stream)
 slam_output = self._run_slam(frame_stream, intrinsics)
 ```
 
-`artifact_path` only records where outputs for this frame stream will be written. `estimate_geocalib_intrinsics` is the only computation in Stage 1 that runs a learned model. It returns a tensor; it does not wrap the stream or store every frame.
+`artifact_path` only records where outputs for this frame stream will be written. The camera initialization returns a pinhole intrinsics tensor and either the original stream or a lightweight wrapper; it does not store every frame. GeoCalib is only imported and executed when direct sensor intrinsics are not enabled.
 
-When SLAM later iterates `frame_stream`, `SLAMSystem.run` attaches the same tensor and `CameraType.PINHOLE` to each yielded `FrameData` before resizing it for SLAM.
+#### Direct Sensor Intrinsics
 
-#### GeoCalib Intrinsics Computation
+When `streams.use_gt_intrinsics=true`, `FrameDir` loads one color-camera file from the sibling `intrinsic/` directory. The JSON file is preferred because it can carry distortion metadata:
 
-`estimate_geocalib_intrinsics(frame_stream, gap_sec=1.0)` computes sample indices:
+```text
+<scene>/intrinsic/intrinsic_color.json
+<scene>/intrinsic/intrinsic_color.txt
+```
+
+For ScanNet TXT, the file is a `4x4` matrix. ViPE reads `K = matrix[:3, :3]` and uses:
+
+```python
+intrinsics = torch.as_tensor([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]).float().cuda()
+```
+
+TXT has no distortion coefficients, so the original `FrameDir` is already the downstream pinhole stream.
+
+For JSON, ViPE reads `camera_matrix` as the raw input camera matrix, `projection_matrix` as the output pinhole camera matrix when distortion is present, and `distortion_coefficients` plus `distortion_model`. Supported OpenCV distortion models are `plumb_bob` and `rational_polynomial`. If distortion coefficients are present and nonzero, Stage 1 builds a single map:
+
+```python
+mapx, mapy = cv2.initUndistortRectifyMap(
+    input_K,
+    distortion_coefficients,
+    np.eye(3, dtype=np.float32),
+    output_K,
+    (width, height),
+    cv2.CV_32FC1,
+)
+```
+
+That map is converted to a CUDA `grid_sample` grid. `OpenCVPinholeNormalizedFrameStream` then remaps RGB with bilinear sampling and remaps loaded `sensor_depth` with nearest-neighbor sampling. It also records which output pixels had source coordinates inside the original image as `image_valid_mask`; pixels outside the source image are zeroed in RGB/depth and marked invalid. The intrinsics handed to SLAM are from `output_K`.
+
+When SLAM later iterates `frame_stream`, the yielded frames are already pinhole-compatible. `SLAMSystem.run` attaches the same tensor and `CameraType.PINHOLE` to each yielded `FrameData` before resizing it for SLAM.
+
+#### GeoCalib Sampling
+
+Stage 1 computes sample indices:
 
 ```python
 gap_frame = int(gap_sec * frame_stream.fps())
@@ -386,7 +463,7 @@ gap_frame = min(int(1.0 * 2), (10 - 1)//2) = min(2, 4) = 2
 sample_frame_inds = [0, 2, 4]
 ```
 
-`estimate_geocalib_intrinsics` then:
+For the default pinhole path, Stage 1 then:
 
 1. Constructs `GeoCalib(weights="pinhole").cuda()`.
 2. Iterates the `FrameDir` until the last sample index and stores the needed samples:
@@ -449,6 +526,19 @@ intrinsics = torch.as_tensor([fx, fy, frame_width / 2, frame_height / 2]).float(
 
 Important: this code uses image height to compute both `fx` and `fy` from vertical FOV. `cx` and `cy` are image center coordinates.
 
+For distorted input camera models:
+
+1. Constructs `GeoCalib(weights="distorted").cuda()`.
+2. Runs one GeoCalib calibration per sampled frame because the local GeoCalib optimizer supports shared intrinsics only for pinhole.
+3. Averages the resulting camera parameter vectors.
+4. Builds a remap grid from output pinhole pixels to input distorted pixels:
+   ```text
+   output pinhole pixel -> pinhole bearing -> distorted camera projection -> input distorted pixel
+   ```
+5. Wraps the original source in `PinholeNormalizedFrameStream`.
+
+`PinholeNormalizedFrameStream` remaps RGB with bilinear sampling and remaps loaded `sensor_depth` with nearest-neighbor sampling. Like the OpenCV wrapper, it computes `image_valid_mask` from the undistortion grid and zeroes pixels that map outside the source image. It preserves the original frame count, FPS, selected-frame indices, and artifact name. Downstream SLAM, DAV3, backprojection, TSDF, and benchmark code still see only pinhole frames and `[fx, fy, cx, cy]`.
+
 #### Handoff To SLAM
 
 The original `FrameDir` preserves the stream metadata:
@@ -460,14 +550,14 @@ The original `FrameDir` preserves the stream metadata:
 | `name()` | original stream name, such as `color` |
 | `__len__()` | original selected frame count |
 
-Every yielded `FrameData` still has original-resolution RGB. Stage 2 adds:
+Every yielded `FrameData` still has original-resolution RGB. If the input was distorted, this RGB has been undistorted into the pinhole image plane first. Stage 2 adds:
 
 ```python
 frame_data.intrinsics = shared_intrinsics  # CUDA tensor [fx, fy, cx, cy]
 frame_data.camera_type = CameraType.PINHOLE
 ```
 
-SLAM then performs its own resizing in Stage 2. That separation matters: GeoCalib intrinsics are computed at the raw frame size; SLAM scales and crops both RGB and intrinsics afterward.
+SLAM then performs its own resizing in Stage 2. That separation matters: GeoCalib/pinhole-normalization is computed at the raw frame size; SLAM scales and crops both RGB and intrinsics afterward.
 
 ## Stage 2: SLAM Pass 1 Frontend Loop
 
@@ -627,6 +717,7 @@ frame_data = frame_data.crop(top=crop_top, bottom=crop_bottom, left=crop_left, r
 | `rgb` | bilinear interpolation |
 | `metric_depth` | bilinear interpolation if present |
 | `sensor_depth` | nearest-neighbor interpolation if present, so invalid zero pixels remain invalid |
+| `image_valid_mask` | nearest-neighbor interpolation if present |
 | `depth_confidence` | bilinear interpolation if present |
 | `intrinsics` | `fx,cx` scaled by `w1/w0`, `fy,cy` scaled by `h1/h0` |
 
@@ -634,7 +725,7 @@ frame_data = frame_data.crop(top=crop_top, bottom=crop_bottom, left=crop_left, r
 
 | Field | Crop rule |
 | --- | --- |
-| `rgb`, `metric_depth`, `sensor_depth`, `depth_confidence` | slice `[top:bottom, left:right]` |
+| `rgb`, `metric_depth`, `sensor_depth`, `image_valid_mask`, `depth_confidence` | slice `[top:bottom, left:right]` |
 | `intrinsics` | `cx -= left`, `cy -= top` |
 
 The resized dimensions must be divisible by 8 because DROID features and disparities live at `1/8` resolution.
@@ -667,7 +758,7 @@ camera_type = PINHOLE
 | `intrinsics` | `(4,)` | resized pinhole intrinsics |
 | `disps` | `(1024,48,64)` | optimized inverse depth/disparity |
 | `disps_sens` | `(1024,48,64)` | sampled inverse-depth anchor |
-| `disps_sens_weight` | `(1024,48,64)` | per-anchor BA weight, zero only for invalid direct sensor pixels |
+| `disps_sens_weight` | `(1024,48,64)` | per-anchor BA weight, zero for invalid DAV3/sensor/image-mask pixels |
 | `fmaps` | `(1024,128,48,64)` half | DROID feature maps |
 | `nets` | `(1024,128,48,64)` half | DROID GRU hidden state |
 | `inps` | `(1024,128,48,64)` half | DROID context input |
@@ -896,6 +987,7 @@ DepthEstimationInput(
     rgb=self.images[frame_idx].moveaxis(0, -1).float(),  # H,W,3
     intrinsics=self.intrinsics,
     sensor_depth=frame_data.sensor_depth,
+    image_valid_mask=frame_data.image_valid_mask,
     camera_type=self.camera_type,
 )
 ```
@@ -916,6 +1008,7 @@ Default branch, `null`:
    ```
 4. Zeroes sky depth from DA3 sky mask.
 5. Interpolates to the SLAM image size.
+6. Builds a depth-valid mask from positive finite DAV3 depth, intersected with `frame_data.image_valid_mask` when camera normalization created one.
 
 Scale branch, `scale`:
 
@@ -929,12 +1022,14 @@ Scale branch, `scale`:
    where:
    ```math
    \mathcal{V} = \{u \mid D_{\text{dav3}}(u) > 0,\; D_{\text{sens}}(u) > 0,\;
-   D_{\text{dav3}}(u), D_{\text{sens}}(u) \text{ finite}\}
+   D_{\text{dav3}}(u), D_{\text{sens}}(u) \text{ finite},\; M_{\text{img}}(u)=1\}
    ```
+   where `M_img` is the image-valid mask; if no undistortion wrapper is active, it is effectively all ones.
 4. Replaces:
    ```math
    D_{\text{keyframe}}(u) = s^\* D_{\text{dav3}}(u)
    ```
+5. Sets invalid image/depth pixels to zero and returns the same valid mask to BA.
 
 Direct branch, `direct`:
 
@@ -942,11 +1037,11 @@ Direct branch, `direct`:
 2. Uses the resized/cropped `frame_data.sensor_depth` tensor directly.
 3. Builds:
    ```python
-   valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0)
+   valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0) & image_valid_mask
    metric_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
    valid_mask = valid.float()
    ```
-4. Returns `valid_mask` with the depth result so invalid sensor pixels do not become zero-depth or zero-disparity targets in BA.
+4. Returns `valid_mask` with the depth result so invalid sensor pixels and undistort-invalid image pixels do not become zero-depth or zero-disparity targets in BA.
 
 Back in `GraphBuffer.update_disps_sens`, ViPE converts metric depth to inverse depth at the DROID grid sample positions:
 
@@ -960,6 +1055,8 @@ else:
     self.disps_sens_weight[frame_idx] = result.valid_mask[3::8, 3::8].float()
 ```
 
+With the current DAV3 depth model, `valid_mask` is returned in all three depth modes. The fallback only preserves the old all-ones behavior if a future depth model omits masks.
+
 For a `384 x 512` SLAM image, `3::8` gives `48` rows and `64` columns. It samples pixel centers offset by 3 at each 8-pixel block.
 
 The BA sensor-depth regularizer is:
@@ -968,7 +1065,7 @@ The BA sensor-depth regularizer is:
 E_{\text{sens}} = \alpha \sum_k w_k \left(d_k - d_{\text{sens},k}\right)^2
 ```
 
-where `w_k=1` in `null` and `scale` modes. In `direct` mode, `w_k=0` at invalid sensor pixels and `w_k=1` at valid sensor pixels. Therefore invalid sensor-depth zeros do not push optimized disparities toward zero.
+where `w_k=0` at invalid depth pixels and at pixels marked invalid by camera undistortion. In `direct` mode this also masks invalid sensor-depth pixels. Therefore invalid sensor-depth zeros, DA3 sky zeros, and undistort padding zeros do not push optimized disparities toward zero.
 
 Finally:
 
@@ -1738,7 +1835,7 @@ Source files:
 | `vipe/pipeline.py` | `DAV3DepthEstimator`, final Stage 5 call site |
 | `vipe/streams/base.py` | `FrameData.dav3_conditions` |
 
-Stage context: this starts Stage 5. `run.py` has already received `SLAMOutput` from Stage 4. The pipeline now prepares final dense depth by re-reading original frames, assigning final camera-to-world poses, assigning recovered raw-resolution SLAM intrinsics, setting the camera type to pinhole, and yielding frames with final dense depth. With the default depth mode this is DAV3 posed multi-frame inference. With sensor-depth modes it can additionally scale DAV3 depth to sensor depth or bypass DAV3 and use sensor depth directly.
+Stage context: this starts Stage 5. `run.py` has already received `SLAMOutput` from Stage 4. The pipeline now prepares final dense depth by re-reading original frames, assigning final camera-to-world poses, assigning recovered raw-resolution SLAM intrinsics, setting the camera type to pinhole, and yielding frames with final dense depth. With the default depth mode this is DAV3 posed multi-frame inference. With sensor-depth modes it can additionally scale DAV3 depth to sensor depth or bypass DAV3 and use sensor depth directly. If camera normalization created `image_valid_mask`, final depth is zeroed outside that mask before depth artifacts, backprojection, and TSDF fusion consume it.
 
 #### Re-Reading Original Frames
 
@@ -1770,6 +1867,7 @@ FrameData(
     intrinsics=slam_output.intrinsics,    # recovered raw-resolution [fx, fy, cx, cy]
     camera_type=CameraType.PINHOLE,
     sensor_depth=loaded_original_resolution_sensor_depth_if_enabled,
+    image_valid_mask=undistort_valid_mask_if_enabled,
 )
 ```
 
@@ -1952,13 +2050,15 @@ Stage 5 does not build sliding windows, does not probe keyframe context, and doe
 for frame_idx in range(len(frame_stream)):
     frame = _attach_slam_output(frame_stream, frame_idx, slam_output)
     sensor_depth = frame.sensor_depth.float()
-    valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0)
+    valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0) & image_valid_mask
     frame.metric_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
     frame.depth_confidence = valid.float()
     yield frame
 ```
 
 So the downstream artifact writer and PCD code still consume `FrameData.metric_depth`; only the source of that tensor changes.
+
+In default and `scale` modes, DAV3 still receives the pinhole-normalized RGB image, but its predicted depth is post-masked by `image_valid_mask`. In `scale` mode the least-squares scalar is also computed only over pixels where DAV3 depth, sensor depth, and `image_valid_mask` are all valid. This prevents DAV3 hallucinations on undistort padding pixels from entering saved depth, backproject PCD, TSDF, or BA depth priors.
 
 #### Overlap Blending
 
@@ -2164,6 +2264,8 @@ It computes:
 ```python
 depth = frame_data.metric_depth.detach().cpu().numpy()
 valid = np.isfinite(depth) & (depth > 0.0)
+if frame_data.image_valid_mask is not None:
+    valid &= frame_data.image_valid_mask.detach().cpu().numpy().astype(bool)
 ```
 
 If depth confidence exists:
@@ -2262,6 +2364,9 @@ For every final frame, `_integrate_tsdf_frame`:
    ```python
    depth[~np.isfinite(depth)] = 0.0
    depth[depth <= 0.0] = 0.0
+   if frame_data.image_valid_mask is not None:
+       image_valid_mask = frame_data.image_valid_mask.detach().cpu().numpy().astype(bool)
+       depth[~image_valid_mask] = 0.0
    ```
 3. Converts RGB to uint8.
 4. Creates Open3D camera intrinsics:
@@ -2304,9 +2409,11 @@ So `pcd/color_tsdf.ply` is not raw backprojected pixels. It is uniformly sampled
 | Branch | Current command value | Effect |
 | --- | --- | --- |
 | Frame input type | frame directory | Reads sorted images directly from `streams.base_path`. |
-| Camera type | `pinhole` | GeoCalib and DAV3 path assume pinhole. |
+| Input camera model | `streams.input_camera_model=pinhole` by default | If set to a supported distorted model, Stage 1 undistorts to a pinhole stream before downstream SLAM/DAV3/PCD. |
+| Downstream camera type | `pinhole` | SLAM, DAV3 conditioning, backprojection, TSDF, and benchmark artifacts all remain pinhole. |
 | SLAM pose source | estimated from the frame sequence | SLAM starts from internal identity and constant-velocity initialization, then optimizes poses with frontend/backend BA. |
 | Sensor-depth mode | `pipeline.depth.use_gt_sens_depths=null` by default | No sensor depth is loaded; keyframe and final depth use DAV3 normally. |
+| Sensor-intrinsics mode | `streams.use_gt_intrinsics=false` by default | GeoCalib estimates intrinsics. If set to `true`, ViPE loads `intrinsic_color.json` if present, otherwise `intrinsic_color.txt`, and uses that camera instead of GeoCalib. |
 | SLAM keyframe depth anchor | `pipeline.depth.keyframe_model`, default DAV3 `DA3METRIC-LARGE` | In default mode, DAV3 metric depth regularizes keyframe disparities. In `scale`/`direct`, loaded sensor depth scales or replaces this anchor. |
 | Final dense depth | `pipeline.depth.final_model`, default DAV3 `DA3-GIANT-1.1` | In default mode, final dense depth comes from DAV3 posed multi-frame inference. In `scale`/`direct`, loaded sensor depth scales or replaces this final depth. |
 | `save_artifacts` | `true` in your command | Pose, depth zip, intrinsics JSON, and configured PCD artifacts are written. |

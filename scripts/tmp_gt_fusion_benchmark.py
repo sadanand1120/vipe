@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-root", default=DEFAULT_INPUT_ROOT, type=Path, help="Processed ScanNet input root")
     parser.add_argument("--raw-root", default=DEFAULT_RAW_ROOT, type=Path, help="Raw ScanNet scans root")
     parser.add_argument("--da3-root", default=DEFAULT_DA3_ROOT, type=Path, help="Depth-Anything-3 repo root")
-    parser.add_argument("--sample-points", default=1_000_000, type=int, help="Points to sample per method")
+    parser.add_argument("--sample-points", default=10_000_000, type=int, help="Points to sample per method")
     parser.add_argument("--max-frames", default=-1, type=int, help="Use first N frames only (-1 for all)")
     parser.add_argument("--seed", default=42, type=int, help="Open3D random seed")
     return parser

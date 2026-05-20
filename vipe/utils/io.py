@@ -59,6 +59,14 @@ class ArtifactPath:
         return self.base_path / "intrinsics" / f"{self.artifact_name}.json"
 
 
+def _image_valid_numpy(frame_data: FrameData, shape: tuple[int, int]) -> np.ndarray | None:
+    if frame_data.image_valid_mask is None:
+        return None
+    image_valid = frame_data.image_valid_mask.detach().cpu().numpy().astype(bool)
+    assert image_valid.shape == shape
+    return image_valid
+
+
 def _backproject_vertices(
     frame_data: FrameData,
     max_points_per_frame: int,
@@ -75,6 +83,9 @@ def _backproject_vertices(
 
     depth = frame_data.metric_depth.detach().cpu().numpy()
     valid = np.isfinite(depth) & (depth > 0.0)
+    image_valid = _image_valid_numpy(frame_data, depth.shape)
+    if image_valid is not None:
+        valid &= image_valid
     confidence = None
     if frame_data.depth_confidence is not None:
         confidence = frame_data.depth_confidence.detach().cpu().numpy()
@@ -179,6 +190,9 @@ def _integrate_tsdf_frame(volume, frame_data: FrameData, depth_trunc: float) -> 
     depth = frame_data.metric_depth.detach().cpu().numpy().astype(np.float32)
     depth[~np.isfinite(depth)] = 0.0
     depth[depth <= 0.0] = 0.0
+    image_valid = _image_valid_numpy(frame_data, depth.shape)
+    if image_valid is not None:
+        depth[~image_valid] = 0.0
 
     color = (frame_data.rgb.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
     height, width = depth.shape
@@ -245,6 +259,9 @@ def _write_depth_frame(depth_zip: zipfile.ZipFile, frame_idx: int, frame_data: F
         raise ValueError(f"Frame {frame_idx} is missing metric depth")
 
     depth = frame_data.metric_depth.detach().cpu().numpy().astype(np.float16)
+    image_valid = _image_valid_numpy(frame_data, depth.shape)
+    if image_valid is not None:
+        depth[~image_valid] = np.float16(0.0)
     buffer = BytesIO()
     np.save(buffer, depth, allow_pickle=False)
     depth_zip.writestr(f"{frame_idx:06d}.npy", buffer.getvalue())
@@ -255,7 +272,7 @@ def save_artifacts(
     final_frames,
     n_frames: int,
     pcd_fusion_mode: str = "both",
-    max_pcd_points: int = 8_000_000,
+    max_pcd_points: int = 10_000_000,
     pcd_conf_threshold_coef: float = 0.75,
     pcd_sample_ratio: float = 0.015,
     pcd_tsdf_voxel_length: float = 0.02,

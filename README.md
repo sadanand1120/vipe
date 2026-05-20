@@ -35,7 +35,7 @@ Useful output knobs:
 - `pipeline.output.pcd_fusion_mode=both`: save both point-cloud exports. This is the default.
 - `pipeline.output.pcd_fusion_mode=backproject`: save `pcd/color_backproject.ply`.
 - `pipeline.output.pcd_fusion_mode=tsdf`: save `pcd/color_tsdf.ply`.
-- `pipeline.output.pcd_max_points=8000000`: cap saved point cloud points.
+- `pipeline.output.pcd_max_points=10000000`: cap saved point cloud points.
 - `pipeline.depth.keyframe_model=depth-anything/DA3METRIC-LARGE`: DAV3 metric model used to anchor SLAM keyframe depth.
 - `pipeline.depth.final_model=depth-anything/DA3-GIANT-1.1`: DAV3 posed model used for final per-frame dense depth.
 - `pipeline.depth.window_size=10`: final DAV3 sliding-window size.

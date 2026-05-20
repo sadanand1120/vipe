@@ -18,15 +18,16 @@ import logging
 from pathlib import Path
 from typing import Iterator
 
+import cv2
 import numpy as np
 import torch
 
 from omegaconf import DictConfig
+from torch.nn import functional as F
 
-from vipe.priors.geocalib.extractor import GeoCalib
 from vipe.slam.interface import SLAMOutput
 from vipe.slam.system import SLAMSystem
-from vipe.streams.base import FrameData, FrameStream
+from vipe.streams.base import FrameData, FrameStream, SensorCamera
 from vipe.utils import io
 from vipe.utils.cameras import CameraType
 from vipe.utils.depth import scale_depth_to_sensor
@@ -34,6 +35,7 @@ from vipe.utils.logging import pbar
 
 
 logger = logging.getLogger(__name__)
+SUPPORTED_INPUT_CAMERA_MODELS = {"pinhole", "radial", "simple_radial", "simple_divisional", "simple_mei"}
 
 
 def _validate_gt_sens_depth_mode(mode: str | None) -> None:
@@ -41,13 +43,21 @@ def _validate_gt_sens_depth_mode(mode: str | None) -> None:
         raise ValueError(f"Invalid pipeline.depth.use_gt_sens_depths: {mode}")
 
 
-def estimate_geocalib_intrinsics(frame_stream: FrameStream, gap_sec: float = 1.0) -> torch.Tensor:
+def _validate_input_camera_model(input_camera_model: str) -> None:
+    if input_camera_model not in SUPPORTED_INPUT_CAMERA_MODELS:
+        supported = ", ".join(sorted(SUPPORTED_INPUT_CAMERA_MODELS))
+        raise ValueError(f"Invalid streams.input_camera_model: {input_camera_model}. Supported: {supported}")
+
+
+def _geocalib_sample_indices(frame_stream: FrameStream, gap_sec: float = 1.0) -> list[int]:
     gap_frame = int(gap_sec * frame_stream.fps())
     gap_frame = min(gap_frame, (len(frame_stream) - 1) // 2)
-    sample_frame_inds = [0, gap_frame, gap_frame * 2]
+    return [0, gap_frame, gap_frame * 2]
+
+
+def _sample_geocalib_frames(frame_stream: FrameStream, sample_frame_inds: list[int]) -> torch.Tensor:
     sample_frame_set = set(sample_frame_inds)
 
-    model = GeoCalib(weights="pinhole").cuda()
     sample_by_idx = {}
     for frame_idx, frame in enumerate(frame_stream):
         if frame_idx in sample_frame_set:
@@ -55,13 +65,176 @@ def estimate_geocalib_intrinsics(frame_stream: FrameStream, gap_sec: float = 1.0
         if frame_idx >= sample_frame_inds[-1]:
             break
 
-    sample_frames = torch.stack([sample_by_idx[i] for i in sample_frame_inds])
-    res = model.calibrate(sample_frames, shared_intrinsics=True)
+    return torch.stack([sample_by_idx[i] for i in sample_frame_inds])
+
+
+def estimate_geocalib_intrinsics(frame_stream: FrameStream) -> torch.Tensor:
+    from vipe.priors.geocalib.extractor import GeoCalib
+
+    sample_frame_inds = _geocalib_sample_indices(frame_stream)
+    sample_frames = _sample_geocalib_frames(frame_stream, sample_frame_inds)
+
+    model = GeoCalib(weights="pinhole").cuda()
+    res = model.calibrate(sample_frames, camera_model="pinhole", shared_intrinsics=True)
     fov_y = res["camera"].vfov[0].item()
 
     frame_height, frame_width = frame_stream.frame_size()
     fx = fy = frame_height / (2 * np.tan(fov_y / 2))
     return torch.as_tensor([fx, fy, frame_width / 2, frame_height / 2]).float().cuda()
+
+
+def estimate_geocalib_distorted_camera(frame_stream: FrameStream, input_camera_model: str):
+    from vipe.priors.geocalib.extractor import GeoCalib
+
+    sample_frame_inds = _geocalib_sample_indices(frame_stream)
+    sample_frames = _sample_geocalib_frames(frame_stream, sample_frame_inds)
+
+    model = GeoCalib(weights="distorted").cuda()
+    cameras = [
+        model.calibrate(frame, camera_model=input_camera_model, shared_intrinsics=False)["camera"]
+        for frame in sample_frames
+    ]
+    camera_data = torch.stack([camera._data[0] for camera in cameras]).mean(dim=0, keepdim=True)
+    return cameras[0].__class__(camera_data)
+
+
+def camera_to_pinhole_intrinsics(camera) -> torch.Tensor:
+    pinhole_camera = camera.pinhole()
+    return torch.cat([pinhole_camera.f[0], pinhole_camera.c[0]]).float().cuda()
+
+
+class GridNormalizedFrameStream(FrameStream):
+    def __init__(self, frame_stream: FrameStream, grid: torch.Tensor) -> None:
+        super().__init__()
+        self.frame_stream = frame_stream
+        self.grid = grid
+        self.grid_valid_mask = self._grid_valid_mask(grid)
+
+    @staticmethod
+    def _grid_valid_mask(grid: torch.Tensor) -> torch.Tensor:
+        xy = grid[0]
+        return (
+            torch.isfinite(xy).all(dim=-1)
+            & (xy[..., 0] >= -1.0)
+            & (xy[..., 0] <= 1.0)
+            & (xy[..., 1] >= -1.0)
+            & (xy[..., 1] <= 1.0)
+        )
+
+    def _remap_image(self, image: torch.Tensor) -> torch.Tensor:
+        remapped = F.grid_sample(
+            image.permute(2, 0, 1)[None],
+            self.grid,
+            mode="bilinear",
+            align_corners=True,
+        )[0]
+        return remapped.permute(1, 2, 0).clamp(0.0, 1.0)
+
+    def _remap_map(self, image: torch.Tensor, mode: str) -> torch.Tensor:
+        return F.grid_sample(image[None, None], self.grid, mode=mode, align_corners=True)[0, 0]
+
+    def _remap_valid_mask(self, mask: torch.Tensor | None) -> torch.Tensor:
+        if mask is None:
+            return self.grid_valid_mask
+        return (self._remap_map(mask.float(), mode="nearest") > 0.5) & self.grid_valid_mask
+
+    def frame_size(self) -> tuple[int, int]:
+        return self.frame_stream.frame_size()
+
+    def name(self) -> str:
+        return self.frame_stream.name()
+
+    def fps(self) -> float:
+        return self.frame_stream.fps()
+
+    def __len__(self) -> int:
+        return len(self.frame_stream)
+
+    def __getitem__(self, index: int) -> FrameData:
+        frame = self.frame_stream[index]
+        image_valid_mask = self._remap_valid_mask(frame.image_valid_mask)
+        rgb = self._remap_image(frame.rgb)
+        rgb = torch.where(image_valid_mask[..., None], rgb, torch.zeros_like(rgb))
+
+        sensor_depth = None
+        if frame.sensor_depth is not None:
+            sensor_depth = self._remap_map(frame.sensor_depth, mode="nearest")
+            valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0) & image_valid_mask
+            sensor_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
+
+        metric_depth = None
+        if frame.metric_depth is not None:
+            metric_depth = self._remap_map(frame.metric_depth, mode="bilinear")
+            valid = torch.isfinite(metric_depth) & (metric_depth > 0.0) & image_valid_mask
+            metric_depth = torch.where(valid, metric_depth, torch.zeros_like(metric_depth))
+
+        depth_confidence = None
+        if frame.depth_confidence is not None:
+            depth_confidence = self._remap_map(frame.depth_confidence, mode="bilinear")
+            depth_confidence = torch.where(image_valid_mask, depth_confidence, torch.zeros_like(depth_confidence))
+
+        return FrameData(
+            raw_frame_idx=frame.raw_frame_idx,
+            rgb=rgb,
+            pose=frame.pose,
+            camera_type=frame.camera_type,
+            intrinsics=frame.intrinsics,
+            metric_depth=metric_depth,
+            sensor_depth=sensor_depth,
+            image_valid_mask=image_valid_mask,
+            depth_confidence=depth_confidence,
+            information=frame.information,
+        )
+
+    def __iter__(self) -> Iterator[FrameData]:
+        for frame_idx in range(len(self)):
+            yield self[frame_idx]
+
+
+class PinholeNormalizedFrameStream(GridNormalizedFrameStream):
+    def __init__(self, frame_stream: FrameStream, camera) -> None:
+        self.camera = camera
+        super().__init__(frame_stream, self._build_undistort_grid(camera))
+
+    @staticmethod
+    def _build_undistort_grid(camera) -> torch.Tensor:
+        width, height = camera.size[0].round().int().tolist()
+        device = camera.device
+        dtype = camera.dtype
+        x, y = torch.meshgrid(
+            torch.arange(0, width, device=device, dtype=dtype),
+            torch.arange(0, height, device=device, dtype=dtype),
+            indexing="xy",
+        )
+        coords = torch.stack((x, y), dim=-1).reshape(-1, 2)
+        p3d, _ = camera.pinhole().image2world(coords)
+        p2d, _ = camera.world2image(p3d)
+        mapx = p2d[..., 0].reshape(1, height, width)
+        mapy = p2d[..., 1].reshape(1, height, width)
+        grid = torch.stack((mapx, mapy), dim=-1)
+        scale = torch.tensor([width - 1, height - 1], device=device, dtype=dtype)
+        return 2.0 * grid / scale - 1.0
+
+
+class OpenCVPinholeNormalizedFrameStream(GridNormalizedFrameStream):
+    def __init__(self, frame_stream: FrameStream, camera: SensorCamera) -> None:
+        self.camera = camera
+        super().__init__(frame_stream, self._build_undistort_grid(camera))
+
+    @staticmethod
+    def _build_undistort_grid(camera: SensorCamera) -> torch.Tensor:
+        assert camera.distortion_coefficients is not None
+        mapx, mapy = cv2.initUndistortRectifyMap(
+            camera.input_k,
+            camera.distortion_coefficients,
+            np.eye(3, dtype=np.float32),
+            camera.output_k,
+            (camera.width, camera.height),
+            cv2.CV_32FC1,
+        )
+        grid = torch.as_tensor(np.stack((mapx, mapy), axis=-1), dtype=torch.float32).cuda()[None]
+        scale = torch.tensor([camera.width - 1, camera.height - 1], dtype=torch.float32).cuda()
+        return 2.0 * grid / scale - 1.0
 
 
 class DAV3DepthEstimator:
@@ -116,6 +289,16 @@ class DAV3DepthEstimator:
         frame.camera_type = CameraType.PINHOLE
         return frame
 
+    @staticmethod
+    def _image_valid_stack(frames: list[FrameData], depth: torch.Tensor) -> torch.Tensor:
+        masks = []
+        for frame in frames:
+            if frame.image_valid_mask is None:
+                masks.append(torch.ones(frame.size(), device=depth.device, dtype=torch.bool))
+            else:
+                masks.append(frame.image_valid_mask.to(device=depth.device, dtype=torch.bool))
+        return torch.stack(masks)
+
     def _estimate_direct(self, frame_stream: FrameStream, slam_output: SLAMOutput) -> Iterator[FrameData]:
         for frame_idx in pbar(range(len(frame_stream)), desc="Loading sensor depth"):
             frame = self._attach_slam_output(frame_stream, frame_idx, slam_output)
@@ -123,6 +306,8 @@ class DAV3DepthEstimator:
                 raise ValueError("Sensor depth is required when pipeline.depth.use_gt_sens_depths=direct")
             sensor_depth = frame.sensor_depth.float()
             valid = torch.isfinite(sensor_depth) & (sensor_depth > 0.0)
+            if frame.image_valid_mask is not None:
+                valid &= frame.image_valid_mask.to(valid.device)
             frame.metric_depth = torch.where(valid, sensor_depth, torch.zeros_like(sensor_depth))
             frame.depth_confidence = valid.float()
             yield frame
@@ -173,6 +358,8 @@ class DAV3DepthEstimator:
                 )
                 sw_depth = torch.from_numpy(dav3_inference_result.depth[: len(sw_images)]).float().cuda()
                 sw_depth = torch.nn.functional.interpolate(sw_depth[:, None], frame.size(), mode="bilinear")[:, 0]
+                sw_valid = torch.isfinite(sw_depth) & (sw_depth > 0.0)
+                sw_valid &= self._image_valid_stack(current_sliding_window, sw_depth)
                 sw_confidence = None
                 if dav3_inference_result.conf is not None:
                     sw_confidence = torch.from_numpy(dav3_inference_result.conf[: len(sw_images)]).float().cuda()
@@ -184,7 +371,11 @@ class DAV3DepthEstimator:
                     if any(frame.sensor_depth is None for frame in current_sliding_window):
                         raise ValueError("Sensor depth is required when pipeline.depth.use_gt_sens_depths=scale")
                     sw_sensor = torch.stack([frame.sensor_depth for frame in current_sliding_window]).to(sw_depth)
-                    sw_depth, _ = scale_depth_to_sensor(sw_depth, sw_sensor)
+                    sw_depth, _ = scale_depth_to_sensor(sw_depth, sw_sensor, sw_valid)
+
+                sw_depth = torch.where(sw_valid, sw_depth, torch.zeros_like(sw_depth))
+                if sw_confidence is not None:
+                    sw_confidence = torch.where(sw_valid, sw_confidence, torch.zeros_like(sw_confidence))
 
                 n_frames_to_yield = (
                     self.window_size - self.overlap_size if not is_last_frame else len(current_sliding_window)
@@ -221,8 +412,58 @@ class VipePipeline:
         self.out_path = Path(self.out_cfg.path)
         self.out_path.mkdir(exist_ok=True, parents=True)
 
-    def _initialize(self, frame_stream: FrameStream) -> torch.Tensor:
-        return estimate_geocalib_intrinsics(frame_stream)
+    def _initialize_sensor_intrinsics(self, frame_stream: FrameStream) -> tuple[FrameStream, torch.Tensor]:
+        camera = frame_stream.sensor_camera()
+        if camera is None:
+            raise ValueError("GT sensor intrinsics requested but stream did not provide sensor camera metadata")
+
+        intrinsics = camera.pinhole_intrinsics()
+        if camera.has_distortion:
+            logger.info(
+                "Normalizing loaded %s camera to pinhole from %s: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+                camera.distortion_model,
+                camera.source_path,
+                intrinsics[0].item(),
+                intrinsics[1].item(),
+                intrinsics[2].item(),
+                intrinsics[3].item(),
+            )
+            return OpenCVPinholeNormalizedFrameStream(frame_stream, camera), intrinsics
+
+        logger.info(
+            "Using loaded pinhole intrinsics from %s: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+            camera.source_path,
+            intrinsics[0].item(),
+            intrinsics[1].item(),
+            intrinsics[2].item(),
+            intrinsics[3].item(),
+        )
+        return frame_stream, intrinsics
+
+    def _initialize(
+        self,
+        frame_stream: FrameStream,
+        input_camera_model: str,
+        use_gt_intrinsics: bool,
+    ) -> tuple[FrameStream, torch.Tensor]:
+        if use_gt_intrinsics:
+            return self._initialize_sensor_intrinsics(frame_stream)
+
+        _validate_input_camera_model(input_camera_model)
+        if input_camera_model == "pinhole":
+            return frame_stream, estimate_geocalib_intrinsics(frame_stream)
+
+        camera = estimate_geocalib_distorted_camera(frame_stream, input_camera_model)
+        intrinsics = camera_to_pinhole_intrinsics(camera)
+        logger.info(
+            "Normalizing %s input camera to pinhole: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+            input_camera_model,
+            intrinsics[0].item(),
+            intrinsics[1].item(),
+            intrinsics[2].item(),
+            intrinsics[3].item(),
+        )
+        return PinholeNormalizedFrameStream(frame_stream, camera), intrinsics
 
     def _run_slam(self, frame_stream: FrameStream, intrinsics: torch.Tensor) -> SLAMOutput:
         slam_pipeline = SLAMSystem(
@@ -265,9 +506,14 @@ class VipePipeline:
             pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
         )
 
-    def run(self, frame_stream: FrameStream) -> SLAMOutput:
+    def run(
+        self,
+        frame_stream: FrameStream,
+        input_camera_model: str = "pinhole",
+        use_gt_intrinsics: bool = False,
+    ) -> SLAMOutput:
+        frame_stream, intrinsics = self._initialize(frame_stream, input_camera_model, use_gt_intrinsics)
         artifact_path = io.ArtifactPath(self.out_path, frame_stream.name())
-        intrinsics = self._initialize(frame_stream)
         slam_output = self._run_slam(frame_stream, intrinsics)
         self._save_outputs(artifact_path, frame_stream, slam_output)
 
