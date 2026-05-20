@@ -11,19 +11,19 @@ from typing import Any
 
 import numpy as np
 
+from vipe.bench.scannet import AttrDict, ScanNetEvaluator
 from vipe.utils.determinism import seed_everything
 from vipe.utils.misc import sort_image_sequence
 
 
 DEFAULT_INPUT_ROOT = Path("/robodata/smodak/repos/ovo/data/input/ScanNet")
 DEFAULT_RAW_ROOT = Path("/robodata/smodak/datasets/scannet_v2/scans")
-DEFAULT_DA3_ROOT = Path("/robodata/smodak/repos/Depth-Anything-3")
 WORKER_ENV = "_VIPE_SCANNET_BENCH_WORKER"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate ViPE ScanNet outputs with the Depth-Anything-3 benchmark stack."
+        description="Evaluate ViPE ScanNet outputs with the local ScanNet benchmark stack."
     )
     parser.add_argument(
         "--scenes",
@@ -33,10 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="scenes",
         help="ScanNet scene names, e.g. scene0000_00 scene0011_00",
     )
-    parser.add_argument("--work-dir", required=True, type=Path, help="DA3 benchmark workspace/output directory")
+    parser.add_argument("--work-dir", required=True, type=Path, help="Benchmark workspace/output directory")
     parser.add_argument("--input-root", default=DEFAULT_INPUT_ROOT, type=Path, help="Processed ScanNet input root")
     parser.add_argument("--raw-root", default=DEFAULT_RAW_ROOT, type=Path, help="Raw ScanNet scans root with GT meshes")
-    parser.add_argument("--da3-root", default=DEFAULT_DA3_ROOT, type=Path, help="Depth-Anything-3 repo root")
     parser.add_argument(
         "--modes",
         nargs="+",
@@ -152,22 +151,17 @@ def run_vipe(overrides: list[str]) -> None:
     stream = FrameDir(
         path=cfg.streams.base_path,
         fps=cfg.streams.fps,
-        frame_start=cfg.streams.frame_start,
-        frame_end=cfg.streams.frame_end,
-        frame_skip=cfg.streams.frame_skip,
     )
     logger.info(f"Running ViPE on {stream.name()}")
     pipeline.run(stream)
 
 
 def _subset_scene_data(scene_data, keep_indices: list[int]):
-    from addict import Dict
-
-    subset = Dict()
+    subset = AttrDict()
     subset.image_files = [scene_data.image_files[i] for i in keep_indices]
     subset.extrinsics = scene_data.extrinsics[keep_indices]
     subset.intrinsics = scene_data.intrinsics[keep_indices]
-    subset.aux = Dict()
+    subset.aux = AttrDict()
     for key, val in scene_data.aux.items():
         if isinstance(val, list) and len(val) == len(scene_data.image_files):
             subset.aux[key] = [val[i] for i in keep_indices]
@@ -192,10 +186,6 @@ def _benchmark_frame_request(
     frame_files = _image_files(frame_dir)
     frame_index_by_path = {str(path.resolve()): idx for idx, path in enumerate(frame_files)}
     full_index_by_image = {str(Path(path).resolve()): idx for idx, path in enumerate(full_scene_data.image_files)}
-    frame_start = int(_override_value(scene_overrides, "streams.frame_start") or 0)
-    frame_end_override = int(_override_value(scene_overrides, "streams.frame_end") or -1)
-    frame_end = len(frame_files) if frame_end_override == -1 else min(frame_end_override, len(frame_files))
-    frame_skip = int(_override_value(scene_overrides, "streams.frame_skip") or 1)
     frame_indices = []
     kept_scene_indices = []
     missing = []
@@ -206,15 +196,11 @@ def _benchmark_frame_request(
             missing.append(f"{image_file}: not found in ViPE frame dir")
             continue
         raw_frame_idx = frame_index_by_path[image_key]
-        if raw_frame_idx < frame_start or raw_frame_idx >= frame_end or (raw_frame_idx - frame_start) % frame_skip != 0:
-            missing.append(f"{image_file}: not included by ViPE frame_start/frame_end/frame_skip")
-            continue
-        frame_idx = (raw_frame_idx - frame_start) // frame_skip
         if image_key not in full_index_by_image:
             missing.append(f"{image_file}: not found in full ScanNet scene data")
             continue
 
-        frame_indices.append(frame_idx)
+        frame_indices.append(raw_frame_idx)
         kept_scene_indices.append(full_index_by_image[image_key])
 
     if missing:
@@ -278,23 +264,14 @@ def _write_vipe_manifest(
 
 
 def _load_evaluator(args: argparse.Namespace):
-    da3_src = args.da3_root / "src"
-    if da3_src.is_dir() and str(da3_src) not in sys.path:
-        sys.path.insert(0, str(da3_src))
-
-    os.environ["DA3_SCANNET_INPUT_ROOT"] = str(args.input_root.resolve())
-    os.environ["DA3_SCANNET_RAW_ROOT"] = str(args.raw_root.resolve())
-
-    from depth_anything_3.bench.evaluator import Evaluator
-
-    return Evaluator(
+    return ScanNetEvaluator(
         work_dir=str(args.work_dir),
-        datas=["scannet"],
         modes=args.modes,
         scenes=args.scenes,
         num_fusion_workers=args.num_fusion_workers,
         max_frames=args.max_frames,
-        ref_view_strategy="unused_by_vipe",
+        input_root=args.input_root,
+        raw_root=args.raw_root,
         gpu_id=args.gpu_id,
         total_gpus=args.total_gpus,
     )
@@ -305,7 +282,6 @@ def _append_common_cli_args(cmd: list[str], args: argparse.Namespace, vipe_overr
     cmd += ["--work-dir", str(args.work_dir)]
     cmd += ["--input-root", str(args.input_root)]
     cmd += ["--raw-root", str(args.raw_root)]
-    cmd += ["--da3-root", str(args.da3_root)]
     cmd += ["--modes", *args.modes]
     cmd += ["--max-frames", str(args.max_frames)]
     cmd += ["--num-fusion-workers", str(args.num_fusion_workers)]

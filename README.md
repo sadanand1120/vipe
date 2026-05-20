@@ -13,13 +13,6 @@ pip3 install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://do
 pip3 install --no-build-isolation -e .
 ```
 
-Depth-Anything-3 benchmark support is still needed only when using the ScanNet evaluator adapter:
-
-```bash
-pip3 install faiss-gpu pandas prettytable numba pypose
-pip3 install -e /robodata/smodak/repos/Depth-Anything-3
-```
-
 ## Input Layout
 
 `streams.base_path` must point to the RGB directory. The sibling `depth/` and `intrinsic/` directories are required:
@@ -72,4 +65,4 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   streams.fps=30
 ```
 
-The benchmark adapter runs ViPE, writes a lightweight DA3-side manifest pointing at native ViPE artifacts, and asks the DA3 evaluator to compute pose/reconstruction metrics for TSDF and direct-backproject reconstruction.
+The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose/reconstruction metrics for TSDF and direct-backproject reconstruction with the local ScanNet evaluator in `vipe/bench/scannet.py`.

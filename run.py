@@ -18,9 +18,6 @@ def run(args: DictConfig) -> None:
     frame_stream = FrameDir(
         path=args.streams.base_path,
         fps=args.streams.fps,
-        frame_start=args.streams.frame_start,
-        frame_end=args.streams.frame_end,
-        frame_skip=args.streams.frame_skip,
     )
     logger.info(f"Processing {frame_stream.name()}")
     pipeline.run(frame_stream)

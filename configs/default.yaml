@@ -1,9 +1,6 @@
 streams:
   base_path: ??       # Required input frame directory.
   fps: ??             # Required input frame rate.
-  frame_start: 0      # First frame index to read from the sorted frame list.
-  frame_end: -1       # Exclusive end index; -1 means read through the end.
-  frame_skip: 1       # Read every Nth frame; also divides effective stream FPS by N.
 
 seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels.
 

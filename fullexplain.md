@@ -83,13 +83,12 @@ pipeline = VipePipeline(
 frame_stream = FrameDir(
     path=args.streams.base_path,
     fps=args.streams.fps,
-    frame_start=args.streams.frame_start,
-    frame_end=args.streams.frame_end,
-    frame_skip=args.streams.frame_skip,
 )
 
 pipeline.run(frame_stream)
 ```
+
+`FrameDir` always reads the full sorted frame directory from the first frame through the last frame.
 
 The shell variables influence external libraries but do not change ViPE control flow:
 
@@ -859,13 +858,13 @@ So:
 pipeline.output.save_artifacts=true
 ```
 
-for each scene, then writes a DA3-side manifest pointing at the native ViPE artifacts:
+for each scene, then writes a local benchmark manifest pointing at the native ViPE artifacts:
 
 ```text
 exports/vipe_manifest.json
 ```
 
-The evaluator consumes pose, depth zip, intrinsics JSON, and GT metadata through that manifest. It evaluates reconstruction in both TSDF and direct-backproject modes on the evaluator side, while the standalone PCDs remain inspection/use artifacts written during `run.py`.
+The local ScanNet evaluator in `vipe/bench/scannet.py` consumes pose, depth zip, intrinsics JSON, and GT metadata through that manifest. It evaluates reconstruction in both TSDF and direct-backproject modes on the evaluator side, while the standalone PCDs remain inspection/use artifacts written during `run.py`.
 
 ## Object Glossary
 

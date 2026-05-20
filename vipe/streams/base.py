@@ -185,9 +185,6 @@ class FrameDir(FrameStream):
         self,
         path: str | Path,
         fps: float,
-        frame_start: int = 0,
-        frame_end: int = -1,
-        frame_skip: int = 1,
         name: str | None = None,
     ) -> None:
         path = Path(path)
@@ -212,16 +209,13 @@ class FrameDir(FrameStream):
             raise ValueError(f"Could not read first frame: {self.frame_files[0]}")
 
         self._height, self._width = first_frame.shape[:2]
-        self.start = frame_start
-        self.end = len(self.frame_files) if frame_end == -1 else min(frame_end, len(self.frame_files))
-        self.step = frame_skip
-        self._fps = fps / self.step
+        self._fps = fps
         self._sensor_camera = self._load_sensor_camera()
 
         depth_dir = path.parent / "depth"
         missing = [
             depth_dir / f"{frame_path.stem}.png"
-            for frame_path in self.frame_files[self.start : self.end : self.step]
+            for frame_path in self.frame_files
             if not (depth_dir / f"{frame_path.stem}.png").exists()
         ]
         if missing:
@@ -322,7 +316,7 @@ class FrameDir(FrameStream):
         return self._sensor_camera
 
     def __len__(self) -> int:
-        return len(range(self.start, self.end, self.step))
+        return len(self.frame_files)
 
     def __getitem__(self, index: int) -> FrameData:
         n_frames = len(self)
@@ -331,8 +325,8 @@ class FrameDir(FrameStream):
         if index < 0 or index >= n_frames:
             raise IndexError(index)
 
-        frame_idx = self.start + index * self.step
-        frame_path = self.frame_files[frame_idx]
+        frame_idx = index
+        frame_path = self.frame_files[index]
         frame = cv2.imread(str(frame_path))
         if frame is None:
             raise ValueError(f"Could not read frame: {frame_path}")
