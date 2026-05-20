@@ -147,7 +147,6 @@ def run_vipe(overrides: list[str]) -> None:
     logger = configure_logging()
     pipeline = VipePipeline(
         slam=cfg.pipeline.slam,
-        depth=cfg.pipeline.depth,
         output=cfg.pipeline.output,
     )
     stream = FrameDir(
@@ -156,15 +155,9 @@ def run_vipe(overrides: list[str]) -> None:
         frame_start=cfg.streams.frame_start,
         frame_end=cfg.streams.frame_end,
         frame_skip=cfg.streams.frame_skip,
-        load_sensor_depth=cfg.pipeline.depth.use_gt_sens_depths is not None,
-        load_sensor_intrinsics=cfg.streams.use_gt_intrinsics,
     )
     logger.info(f"Running ViPE on {stream.name()}")
-    pipeline.run(
-        stream,
-        input_camera_model=cfg.streams.input_camera_model,
-        use_gt_intrinsics=cfg.streams.use_gt_intrinsics,
-    )
+    pipeline.run(stream)
 
 
 def _subset_scene_data(scene_data, keep_indices: list[int]):

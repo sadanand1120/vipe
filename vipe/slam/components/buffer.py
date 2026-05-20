@@ -26,7 +26,6 @@ from einops import rearrange
 from omegaconf.dictconfig import DictConfig
 
 from vipe.ext.lietorch.groups import SE3
-from vipe.priors.depth.base import DepthEstimationInput, DepthEstimationModel
 from vipe.streams.base import FrameData
 from vipe.utils.cameras import CameraType
 
@@ -97,24 +96,20 @@ class GraphBuffer:
         self.fmaps[ix] = self.fmaps[ix + 1]
         self.n_frames -= 1
 
-    def update_disps_sens(self, depth_model: DepthEstimationModel, frame_idx: int, frame_data: FrameData):
-        depth_input = DepthEstimationInput(
-            rgb=self.images[frame_idx].moveaxis(0, -1).float(),
-            intrinsics=self.intrinsics,
-            sensor_depth=frame_data.sensor_depth,
-            image_valid_mask=frame_data.image_valid_mask,
-            camera_type=self.camera_type,
-        )
-        result = depth_model.estimate(depth_input)
-        metric_depth = result.metric_depth
-        assert metric_depth is not None
+    def update_disps_sens(self, frame_idx: int, frame_data: FrameData):
+        if frame_data.sensor_depth is None:
+            raise ValueError("External sensor depth is required for SLAM depth anchoring")
+
+        metric_depth = frame_data.sensor_depth.float()
+        valid = torch.isfinite(metric_depth) & (metric_depth > 0.0)
+        if frame_data.image_valid_mask is not None:
+            valid &= frame_data.image_valid_mask.to(valid.device)
+        metric_depth = torch.where(valid, metric_depth, torch.zeros_like(metric_depth))
+
         disp_sens = metric_depth[3::8, 3::8]
         disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
         self.disps_sens[frame_idx] = disp_sens
-        if result.valid_mask is None:
-            self.disps_sens_weight[frame_idx] = 1.0
-        else:
-            self.disps_sens_weight[frame_idx] = result.valid_mask[3::8, 3::8].float()
+        self.disps_sens_weight[frame_idx] = valid[3::8, 3::8].float()
 
     def bundle_adjustment(
         self,

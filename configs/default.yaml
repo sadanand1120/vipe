@@ -4,8 +4,6 @@ streams:
   frame_start: 0      # First frame index to read from the sorted frame list.
   frame_end: -1       # Exclusive end index; -1 means read through the end.
   frame_skip: 1       # Read every Nth frame; also divides effective stream FPS by N.
-  input_camera_model: pinhole # GeoCalib camera models currently supported here: pinhole, radial, simple_radial, simple_divisional, simple_mei.
-  use_gt_intrinsics: false # If true, load intrinsic/intrinsic_color.json if present, else intrinsic_color.txt, and skip GeoCalib.
 
 seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels.
 
@@ -33,24 +31,16 @@ pipeline:
     backend_ba_iters: 8                  # Inner BA solver iterations per backend graph update.
     backend_max_factors_per_keyframe: 16 # Backend factor budget multiplier: max factors = value * keyframes.
     backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
-    init_disp: 1.0                       # Initial disparity value before metric depth is injected.
+    init_disp: 1.0                       # Initial disparity value before external sensor-depth anchors are injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     ba:
-      dense_disp_alpha: 0.001            # Weight for sensor/DAV3 depth regularization in BA.
-
-  depth:
-    keyframe_model: depth-anything/DA3METRIC-LARGE # DAV3 metric model anchoring SLAM keyframe depth.
-    final_model: depth-anything/DA3-GIANT-1.1      # DAV3 posed model used for final per-frame dense depth.
-    window_size: 10                                # Number of frames per final DAV3 sliding window.
-    overlap_size: 3                                # Number of overlapped frames blended between windows.
-    use_gt_sens_depths: null                       # null=DAV3 depth; scale=scale DAV3 to GT sensor depth; direct=use GT sensor depth directly.
+      dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
 
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.
     save_artifacts: false                # Save pose, depth, intrinsics, and point-cloud artifacts.
     pcd_fusion_mode: both                # Point cloud mode: backproject, tsdf, or both.
     pcd_max_points: 10000000             # Max saved points per point-cloud output.
-    pcd_conf_threshold_coef: 0.75        # DAV3 confidence threshold = mean confidence times this factor.
     pcd_sample_ratio: 0.015              # Per-frame sampling ratio before max-point downsampling.
     pcd_tsdf_voxel_length: 0.02          # TSDF voxel size in meters.
     pcd_tsdf_sdf_trunc: 0.15             # TSDF signed-distance truncation distance in meters.

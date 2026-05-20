@@ -13,7 +13,6 @@ def run(args: DictConfig) -> None:
     logger = configure_logging()
     pipeline = VipePipeline(
         slam=args.pipeline.slam,
-        depth=args.pipeline.depth,
         output=args.pipeline.output,
     )
     frame_stream = FrameDir(
@@ -22,15 +21,9 @@ def run(args: DictConfig) -> None:
         frame_start=args.streams.frame_start,
         frame_end=args.streams.frame_end,
         frame_skip=args.streams.frame_skip,
-        load_sensor_depth=args.pipeline.depth.use_gt_sens_depths is not None,
-        load_sensor_intrinsics=args.streams.use_gt_intrinsics,
     )
     logger.info(f"Processing {frame_stream.name()}")
-    pipeline.run(
-        frame_stream,
-        input_camera_model=args.streams.input_camera_model,
-        use_gt_intrinsics=args.streams.use_gt_intrinsics,
-    )
+    pipeline.run(frame_stream)
     logger.info(f"Finished processing {frame_stream.name()}")
 
 

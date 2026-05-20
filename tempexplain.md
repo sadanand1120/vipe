@@ -8,7 +8,7 @@ There is one conceptual optimization problem:
 
 ```text
 keyframe poses + keyframe dense disparities
--> constrained by pairwise reprojection factors and configured depth-anchor factors
+-> constrained by pairwise reprojection factors and external sensor-depth anchor factors
 -> optimized by bundle adjustment
 ```
 
@@ -86,7 +86,7 @@ So in this code there are two solver-level factor families:
 | Solver term | Class | Optimizes against |
 | --- | --- | --- |
 | Pairwise reprojection / dense flow | `DenseDepthFlowTerm` | DROID-predicted target coordinates between frame pairs. |
-| Depth anchor | `DispSensRegularizationTerm` | `GraphBuffer.disps_sens`, the inverse-depth map from the configured keyframe source, plus `GraphBuffer.disps_sens_weight` for invalid direct sensor pixels. |
+| Depth anchor | `DispSensRegularizationTerm` | `GraphBuffer.disps_sens`, the inverse-depth map sampled from external sensor depth, plus `GraphBuffer.disps_sens_weight` for invalid sensor or undistort-invalid pixels. |
 
 ## GraphBuffer: Persistent Node/State Table
 
@@ -129,7 +129,7 @@ self.buffer = GraphBuffer(
 | `intrinsics` | `(4,)` float32 | Shared resized pinhole intrinsics. |
 | `disps` | `(buffer_size,H/8,W/8)` float32 | Optimized dense inverse depth/disparity. |
 | `disps_sens` | `(buffer_size,H/8,W/8)` float32 | Keyframe depth anchor converted to inverse depth. |
-| `disps_sens_weight` | `(buffer_size,H/8,W/8)` float32 | Depth-anchor BA weight. It is all ones for DAV3/default and sensor-scale modes, and zero at invalid pixels for direct sensor-depth mode. |
+| `disps_sens_weight` | `(buffer_size,H/8,W/8)` float32 | Depth-anchor BA weight. It is one at valid external sensor-depth samples and zero at invalid depth or undistort-invalid pixels. |
 | `fmaps` | `(buffer_size,128,H/8,W/8)` float16 | DROID feature maps used for correlations. |
 | `nets` | `(buffer_size,128,H/8,W/8)` float16 | DROID recurrent hidden state. |
 | `inps` | `(buffer_size,128,H/8,W/8)` float16 | DROID context input. |
@@ -143,7 +143,7 @@ disps -> optimized by BA
 
 Everything else supports feature matching, depth anchoring, or keyframe/infill bookkeeping.
 
-`GraphBuffer` remains an internal SLAM workspace. The final output handoff is `SLAMOutput`, which contains the full-frame camera-to-world trajectory, recovered original-resolution intrinsics, and the selected-frame indices of optimized SLAM keyframes. Stage 5 uses those indices only to re-read nearby keyframes as DAV3 context frames when the final depth mode runs DAV3 (`null` or `scale`).
+`GraphBuffer` remains an internal SLAM workspace. The final output handoff is `SLAMOutput`, which contains the full-frame camera-to-world trajectory, recovered original-resolution intrinsics, and the selected-frame indices of optimized SLAM keyframes. The current output stage uses the trajectory and intrinsics to replay external sensor depth into pose/depth/PCD artifacts.
 
 ### How Slots Get Filled
 
@@ -157,7 +157,7 @@ which calls:
 
 ```python
 kf_idx = self._store_buffer_frame(...)
-self.buffer.update_disps_sens(self.metric_depth, frame_idx=kf_idx, frame_data=frame_data)
+self.buffer.update_disps_sens(frame_idx=kf_idx, frame_data=frame_data)
 ```
 
 `_store_buffer_frame` writes:
@@ -173,24 +173,25 @@ buffer.n_frames += 1
 
 For the current standalone run, poses start from the buffer identity initialization and are then updated by frontend/backend BA plus constant-velocity pose initialization for newly allocated slots.
 
-Then `update_disps_sens` runs the configured keyframe depth-anchor source:
+Then `update_disps_sens` samples the external sensor depth into the low-resolution inverse-depth anchor:
 
 ```python
-result = depth_model.estimate(depth_input)
-metric_depth = result.metric_depth
+metric_depth = frame_data.sensor_depth.float()
+valid = isfinite(metric_depth) & (metric_depth > 0)
+if frame_data.image_valid_mask is not None:
+    valid &= frame_data.image_valid_mask
+metric_depth = where(valid, metric_depth, 0)
+
 disp_sens = metric_depth[3::8, 3::8]
 disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
 self.disps_sens[frame_idx] = disp_sens
-if result.valid_mask is None:
-    self.disps_sens_weight[frame_idx] = 1.0
-else:
-    self.disps_sens_weight[frame_idx] = result.valid_mask[3::8, 3::8].float()
+self.disps_sens_weight[frame_idx] = valid[3::8, 3::8].float()
 ```
 
 That means:
 
 ```text
-keyframe depth map at image resolution
+sensor depth map at image resolution
 -> sample every 8 pixels starting at offset 3
 -> convert depth to inverse depth
 -> store in disps_sens
@@ -229,9 +230,9 @@ active slots: 0, 1, 2
 
 `FactorGraph.rm_second_newest_keyframe` also updates edge indices to stay consistent.
 
-#### `update_disps_sens(depth_model, frame_idx, frame_data)`
+#### `update_disps_sens(frame_idx, frame_data)`
 
-Runs keyframe depth model and stores the depth prior as inverse depth.
+Reads the already-loaded external sensor depth and stores the depth prior as inverse depth.
 
 This does not optimize anything. It only writes `disps_sens` and `disps_sens_weight`.
 
@@ -778,7 +779,7 @@ Variables touched:
 dense_disp only
 ```
 
-This is the keyframe depth prior. It does not directly optimize pose, but by constraining disparity scale it indirectly anchors pose translation scale through the reprojection terms. In direct sensor-depth mode, invalid sensor pixels have zero regularization weight and therefore do not pull disparity toward zero.
+This is the keyframe depth prior. It does not directly optimize pose, but by constraining disparity scale it indirectly anchors pose translation scale through the reprojection terms. Invalid sensor pixels have zero regularization weight and therefore do not pull disparity toward zero.
 
 ## Toy Example: Three Keyframes
 
@@ -1015,7 +1016,7 @@ SLAMSystem.run pass 1
 -> keyframe accepted
 -> SLAMSystem._add_frontend_keyframe
 -> GraphBuffer slot filled
--> GraphBuffer.disps_sens filled by configured keyframe depth anchor
+-> GraphBuffer.disps_sens filled from external sensor depth
 -> SLAMFrontend.run
 -> frontend.graph.add_neighborhood_factors or add_proximity_factors
 -> frontend.graph.update

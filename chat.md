@@ -314,7 +314,7 @@ SLAMOutput.intrinsics  # one recovered original-resolution pinhole intrinsics ve
 SLAMOutput.keyframe_indices  # selected-frame indices of optimized SLAM keyframes
 ```
 
-Final DAV3 depth uses `keyframe_indices` only to re-read neighboring keyframes as context frames when the final depth mode runs DAV3. No `FactorGraph` or dense keyframe-map object is passed to the output stage.
+The current output stage uses `SLAMOutput.trajectory` and `SLAMOutput.intrinsics` to replay external sensor depth into final depth and point-cloud artifacts. No `FactorGraph` or dense keyframe-map object is passed to the output stage.
 
 ### One-line mental model
 

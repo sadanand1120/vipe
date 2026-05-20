@@ -70,7 +70,6 @@ def _image_valid_numpy(frame_data: FrameData, shape: tuple[int, int]) -> np.ndar
 def _backproject_vertices(
     frame_data: FrameData,
     max_points_per_frame: int,
-    conf_threshold_coef: float,
     sample_ratio: float,
 ) -> np.ndarray | None:
     if (
@@ -86,17 +85,12 @@ def _backproject_vertices(
     image_valid = _image_valid_numpy(frame_data, depth.shape)
     if image_valid is not None:
         valid &= image_valid
-    confidence = None
-    if frame_data.depth_confidence is not None:
-        confidence = frame_data.depth_confidence.detach().cpu().numpy()
-        assert confidence.shape == depth.shape
-        valid &= (confidence >= float(np.mean(confidence)) * conf_threshold_coef) & (confidence > 1e-5)
 
     valid_flat = np.flatnonzero(valid.ravel())
     if len(valid_flat) == 0:
         return None
 
-    if confidence is not None and sample_ratio < 1.0:
+    if sample_ratio < 1.0:
         sample_count = int(len(valid_flat) * sample_ratio)
     else:
         sample_count = len(valid_flat)
@@ -105,12 +99,8 @@ def _backproject_vertices(
         return None
 
     if sample_count < len(valid_flat):
-        if confidence is not None:
-            rng = np.random.default_rng(frame_data.raw_frame_idx)
-            valid_flat = rng.choice(valid_flat, sample_count, replace=False)
-        else:
-            stride = max(1, math.ceil(len(valid_flat) / sample_count))
-            valid_flat = valid_flat[::stride][:sample_count]
+        stride = max(1, math.ceil(len(valid_flat) / sample_count))
+        valid_flat = valid_flat[::stride][:sample_count]
 
     height, width = depth.shape
     ys, xs = np.divmod(valid_flat, width)
@@ -273,7 +263,6 @@ def save_artifacts(
     n_frames: int,
     pcd_fusion_mode: str = "both",
     max_pcd_points: int = 10_000_000,
-    pcd_conf_threshold_coef: float = 0.75,
     pcd_sample_ratio: float = 0.015,
     pcd_tsdf_voxel_length: float = 0.02,
     pcd_tsdf_sdf_trunc: float = 0.15,
@@ -320,7 +309,6 @@ def save_artifacts(
                     vertices = _backproject_vertices(
                         frame_data,
                         min(max_points_per_frame, remaining_points),
-                        pcd_conf_threshold_coef,
                         pcd_sample_ratio,
                     )
                     if vertices is not None:

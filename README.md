@@ -1,6 +1,6 @@
-# ViPE: DAV3 Frame-Directory Fork
+# ViPE: External-Depth Frame-Directory Fork
 
-This fork keeps the single-camera frame-directory path for running ViPE SLAM with Depth-Anything-3 dense depth.
+This fork keeps one supported runtime path: a single RGB frame directory with external RGB/color intrinsics and external sensor depth. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided depth as the dense depth source, and writes pose/depth/intrinsics plus configured point-cloud exports.
 
 ## Installation
 
@@ -13,12 +13,25 @@ pip3 install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://do
 pip3 install --no-build-isolation -e .
 ```
 
-Depth-Anything-3 / `da3_streaming` benchmark support:
+Depth-Anything-3 benchmark support is still needed only when using the ScanNet evaluator adapter:
 
 ```bash
 pip3 install faiss-gpu pandas prettytable numba pypose
 pip3 install -e /robodata/smodak/repos/Depth-Anything-3
 ```
+
+## Input Layout
+
+`streams.base_path` must point to the RGB directory. The sibling `depth/` and `intrinsic/` directories are required:
+
+```text
+<scene>/color/<frame_id>.jpg|png
+<scene>/depth/<frame_id>.png
+<scene>/intrinsic/intrinsic_color.json  # preferred when present
+<scene>/intrinsic/intrinsic_color.txt   # ScanNet-style pinhole fallback
+```
+
+Depth PNG values are interpreted as millimeters and converted to meters. Image names with pure numeric stems are sorted numerically; all other names are sorted lexicographically.
 
 ## Standalone Run
 
@@ -36,16 +49,13 @@ Useful output knobs:
 - `pipeline.output.pcd_fusion_mode=backproject`: save `pcd/color_backproject.ply`.
 - `pipeline.output.pcd_fusion_mode=tsdf`: save `pcd/color_tsdf.ply`.
 - `pipeline.output.pcd_max_points=10000000`: cap saved point cloud points.
-- `pipeline.depth.keyframe_model=depth-anything/DA3METRIC-LARGE`: DAV3 metric model used to anchor SLAM keyframe depth.
-- `pipeline.depth.final_model=depth-anything/DA3-GIANT-1.1`: DAV3 posed model used for final per-frame dense depth.
-- `pipeline.depth.window_size=10`: final DAV3 sliding-window size.
-- `pipeline.depth.overlap_size=3`: final DAV3 overlap blended between windows.
+- `pipeline.output.pcd_sample_ratio=0.015`: per-frame stride sampling before the global point cap.
 
 Saved artifacts:
 
 - `pose/color.npz`: camera-to-world pose per selected frame.
-- `depth/color.zip`: per-frame final dense depth as NumPy `.npy` entries.
-- `intrinsics/color.json`: one shared original-resolution pinhole intrinsics record.
+- `depth/color.zip`: per-frame sensor depth after any camera normalization, as float16 NumPy `.npy` entries.
+- `intrinsics/color.json`: one shared original-resolution downstream pinhole intrinsics record.
 - `pcd/color_backproject.ply`: direct backprojected point cloud, if enabled.
 - `pcd/color_tsdf.ply`: TSDF-fused sampled point cloud, if enabled.
 
@@ -54,7 +64,7 @@ Saved artifacts:
 ```bash
 python3 scripts/scannet_vipe_bench_evaluator.py \
   --scenes scene0000_00 scene0011_00 scene0378_00 \
-  --work-dir ./workspace/evaluation_scannet_vipe_dav3 \
+  --work-dir ./workspace/evaluation_scannet_vipe_external_depth \
   --input-root /robodata/smodak/repos/ovo/data/input/ScanNet \
   --raw-root /robodata/smodak/datasets/scannet_v2/scans \
   --max-frames -1 \
@@ -62,10 +72,4 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   streams.fps=30
 ```
 
-## Notes
-
-The repo is intentionally configured through `configs/default.yaml`; `run.py` and the ScanNet benchmark both compose that config and instantiate `VipePipeline` directly.
-
-Logging is centralized through `vipe.utils.logging.configure_logging()`. `run.py` and the ScanNet benchmark use the same ViPE logger setup, so SLAM/backend progress logs from `vipe.*` child modules are emitted consistently.
-
-The standalone artifact path is intentionally lean but complete for benchmarking: RGB videos are not written, while pose, depth, intrinsics, and configured point clouds are written. The ScanNet benchmark reads those artifacts through a lightweight DA3-side ViPE manifest and reports reconstruction metrics for both TSDF and direct backprojection.
+The benchmark adapter runs ViPE, writes a lightweight DA3-side manifest pointing at native ViPE artifacts, and asks the DA3 evaluator to compute pose/reconstruction metrics for TSDF and direct-backproject reconstruction.
