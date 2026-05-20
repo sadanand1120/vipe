@@ -50,7 +50,7 @@ Saved artifacts:
 - `depth/color.zip`: per-frame sensor depth after any camera normalization, as float16 NumPy `.npy` entries.
 - `intrinsics/color.json`: one shared original-resolution downstream pinhole intrinsics record.
 - `pcd/color_backproject.ply`: direct backprojected point cloud, if enabled.
-- `pcd/color_tsdf.ply`: TSDF-fused sampled point cloud, if enabled.
+- `pcd/color_tsdf.ply`: native TSDF-fused sampled point cloud, if enabled.
 
 ## ScanNet Benchmark
 
@@ -65,4 +65,4 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   streams.fps=30
 ```
 
-The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose/reconstruction metrics for TSDF and direct-backproject reconstruction with the local ScanNet evaluator in `vipe/bench/scannet.py`.
+The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose/reconstruction metrics for native TSDF and direct-backproject reconstruction with the local ScanNet evaluator in `vipe/bench/scannet.py`.

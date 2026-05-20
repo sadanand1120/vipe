@@ -22,6 +22,7 @@ void pybind_utils_ext(py::module &m);
 void pybind_slam_ext(py::module &m);
 void pybind_scatter_ext(py::module &m);
 void pybind_lietorch_ext(py::module &m);
+void pybind_tsdf_ext(py::module &m);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::module m_droid_net = m.def_submodule("droid_net_ext");
@@ -38,5 +39,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::module m_lietorch = m.def_submodule("lietorch_ext");
     pybind_lietorch_ext(m_lietorch);
+
+    py::module m_tsdf = m.def_submodule("tsdf_ext");
+    pybind_tsdf_ext(m_tsdf);
 
 }

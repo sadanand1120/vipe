@@ -732,7 +732,7 @@ flowchart TD
     I -->|backproject/both| J[append sampled backproject vertices]
     I -->|tsdf/both| K[integrate TSDF frame]
     J --> L[final backproject PLY]
-    K --> M[extract TSDF mesh and sample final PLY]
+    K --> M[extract native TSDF surface and write final PLY]
 ```
 
 `VipePipeline._final_frames` re-reads frames lazily:
@@ -764,7 +764,7 @@ This means final depth artifacts and PCDs are built from the provided sensor dep
 | Depth ZIP | `depth/<artifact_name>.zip` | One float16 NumPy `.npy` depth per selected frame. |
 | Intrinsics JSON | `intrinsics/<artifact_name>.json` | Shared downstream pinhole intrinsics at output depth/RGB resolution. |
 | Backproject PLY | `pcd/<artifact_name>_backproject.ply` | Sampled direct backprojection point cloud. |
-| TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Uniform samples from the extracted TSDF mesh. |
+| TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points sampled from the native TSDF zero-crossing surface. |
 
 `artifact_name` is the frame directory name, for example `color`.
 
@@ -814,33 +814,88 @@ Colors come from the final RGB frame. Vertices are streamed to a temporary binar
 
 ### TSDF PCD
 
-For TSDF mode, each final frame is integrated into an Open3D `ScalableTSDFVolume`:
+For TSDF mode, each final frame is integrated into the native `vipe_ext.tsdf_ext.TSDFVolume` through the small Python wrapper `vipe.utils.tsdf.TSDFVolume`:
 
 ```python
-volume = o3d.pipelines.integration.ScalableTSDFVolume(
+volume = TSDFVolume(
     voxel_length=pcd_tsdf_voxel_length,
     sdf_trunc=pcd_tsdf_sdf_trunc,
-    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
 )
 ```
 
-Per frame:
+The volume is a sparse hash map of fixed-size voxel blocks. A voxel stores:
+
+```text
+tsdf   : float32 signed distance, normalized to [-1, 1]
+weight : float32 number/effective number of RGB-D observations fused into that voxel
+rgb    : float32 running average color in 0..255 space
+```
+
+Per frame, the artifact writer prepares the exact arrays that the native extension receives:
 
 ```python
 depth = metric_depth.astype(np.float32)
 depth[invalid_or_masked] = 0
 color = rgb_uint8
-intrinsics = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+intrinsics = np.array([fx, fy, cx, cy], dtype=np.float32)
 w2c = frame.pose.inv().matrix()
-volume.integrate(rgbd, intrinsics, w2c)
+volume.integrate(depth, color, intrinsics, w2c, pcd_tsdf_depth_trunc)
 ```
 
-After all frames:
+Inside native integration, the first pass determines which voxel blocks are touched by the current depth image. It backprojects every `depth_sampling_stride=4` depth pixel with valid depth `d <= pcd_tsdf_depth_trunc`, transforms the point to world coordinates, and opens every voxel block intersecting that point's `pcd_tsdf_sdf_trunc` neighborhood.
+
+Then each touched voxel center `P_w = [X_w,Y_w,Z_w,1]^T` is projected into the current camera:
+
+```math
+P_c = T_{cw} P_w = [X_c,Y_c,Z_c,1]^T
+```
+
+```math
+u = \frac{f_x X_c}{Z_c} + c_x + 0.5,\qquad
+v = \frac{f_y Y_c}{Z_c} + c_y + 0.5.
+```
+
+If `(u,v)` is outside the image, `Z_c <= 0`, or the sampled depth is invalid, the voxel is not updated from this frame. Otherwise the signed distance is:
+
+```math
+s =
+(d(u,v) - Z_c)
+\sqrt{
+\left(\frac{u-c_x}{f_x}\right)^2
++
+\left(\frac{v-c_y}{f_y}\right)^2
++
+1
+}.
+```
+
+The square-root term converts optical-axis depth difference into approximate Euclidean ray distance. If `s <= -pcd_tsdf_sdf_trunc`, the voxel is behind the observed surface by more than the truncation band and is skipped. Otherwise:
+
+```math
+\operatorname{tsdf}_{new}
+=
+\min\left(1,\frac{s}{\text{sdf\_trunc}}\right).
+```
+
+The voxel stores a running weighted average:
+
+```math
+\operatorname{tsdf}
+\leftarrow
+\frac{w\operatorname{tsdf}+\operatorname{tsdf}_{new}}{w+1},
+\qquad
+C
+\leftarrow
+\frac{wC+C_{rgb}(u,v)}{w+1},
+\qquad
+w \leftarrow w+1.
+```
+
+After all frames, the extension extracts the zero-crossing surface directly as a point cloud. It scans neighboring voxel samples, finds TSDF sign-changing edges, linearly interpolates the zero crossing and color along each edge, deduplicates shared edges, and deterministically samples/repeats the resulting surface points to the requested `pcd_max_points` when the surface is non-empty:
 
 ```python
-mesh = volume.extract_triangle_mesh()
-pcd = mesh.sample_points_uniformly(number_of_points=pcd_max_points)
-o3d.io.write_point_cloud(...)
+points, colors = volume.extract_point_cloud(pcd_max_points)
+write_binary_ply(...)
 ```
 
 So:
@@ -848,7 +903,7 @@ So:
 | Mode | Online update | Final extraction |
 | --- | --- | --- |
 | Backproject | Append sampled per-frame points. | Write one accumulated PLY. |
-| TSDF | Integrate each depth map into the voxel volume. | Extract mesh, then sample `pcd_max_points` points. |
+| TSDF | Integrate each depth map into the native sparse voxel volume. | Extract native zero-crossing surface points, then write a sampled colored PLY. |
 
 ### Benchmark Adapter
 

@@ -42,3 +42,4 @@ utils_ext = _C.utils_ext
 slam_ext = _C.slam_ext
 scatter_ext = _C.scatter_ext
 lietorch_ext = _C.lietorch_ext
+tsdf_ext = _C.tsdf_ext

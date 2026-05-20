@@ -28,6 +28,7 @@ import numpy as np
 
 from vipe.streams.base import FrameData
 from vipe.utils.logging import pbar
+from vipe.utils.tsdf import TSDFVolume, write_binary_ply
 
 
 logger = logging.getLogger(__name__)
@@ -162,20 +163,12 @@ def _write_backproject_pcd(out_path: ArtifactPath, body_file, vertex_count: int)
 
 
 def _make_tsdf_volume(voxel_length: float, sdf_trunc: float):
-    import open3d as o3d
-
-    return o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=voxel_length,
-        sdf_trunc=sdf_trunc,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-    )
+    return TSDFVolume(voxel_length=voxel_length, sdf_trunc=sdf_trunc)
 
 
 def _integrate_tsdf_frame(volume, frame_data: FrameData, depth_trunc: float) -> None:
     if frame_data.metric_depth is None or frame_data.pose is None or frame_data.intrinsics is None:
         return
-
-    import open3d as o3d
 
     depth = frame_data.metric_depth.detach().cpu().numpy().astype(np.float32)
     depth[~np.isfinite(depth)] = 0.0
@@ -185,40 +178,18 @@ def _integrate_tsdf_frame(volume, frame_data: FrameData, depth_trunc: float) -> 
         depth[~image_valid] = 0.0
 
     color = (frame_data.rgb.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-    height, width = depth.shape
     fx, fy, cx, cy = frame_data.intrinsics[:4].detach().cpu().numpy().astype(np.float32)
-    intrinsics = o3d.camera.PinholeCameraIntrinsic(
-        width,
-        height,
-        float(fx),
-        float(fy),
-        float(cx),
-        float(cy),
-    )
-    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        o3d.geometry.Image(np.ascontiguousarray(color)),
-        o3d.geometry.Image(np.ascontiguousarray(depth)),
-        depth_scale=1.0,
-        depth_trunc=depth_trunc,
-        convert_rgb_to_intensity=False,
-    )
-    w2c = frame_data.pose.inv().matrix().detach().cpu().numpy().astype(np.float64)
-    volume.integrate(rgbd, intrinsics, w2c)
+    intrinsics = np.array([fx, fy, cx, cy], dtype=np.float32)
+    w2c = frame_data.pose.inv().matrix().detach().cpu().numpy().astype(np.float32)
+    volume.integrate(depth, color, intrinsics, w2c, depth_trunc)
 
 
 def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
-    import open3d as o3d
-
-    mesh = volume.extract_triangle_mesh()
-    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+    points, colors = volume.extract_point_cloud(max_points)
+    if len(points) == 0:
         return
 
-    out_path.tsdf_pcd_path.parent.mkdir(exist_ok=True, parents=True)
-    pcd = mesh.sample_points_uniformly(number_of_points=max_points)
-    if pcd.has_colors():
-        colors = np.asarray(pcd.colors)
-        pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
-    o3d.io.write_point_cloud(str(out_path.tsdf_pcd_path), pcd, write_ascii=False)
+    write_binary_ply(out_path.tsdf_pcd_path, points, colors)
 
 
 def _write_intrinsics_json(out_path: ArtifactPath, intrinsics: np.ndarray, frame_size: tuple[int, int]) -> None:

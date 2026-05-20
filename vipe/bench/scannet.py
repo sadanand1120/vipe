@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from tqdm import tqdm
 
+from vipe.utils.tsdf import TSDFVolume
 from vipe.utils.misc import sort_image_sequence
 
 
@@ -446,28 +447,22 @@ def create_tsdf_volume(
     voxel_length: float = 4.0 / 512.0,
     sdf_trunc: float = 0.04,
     color_type: str = "RGB8",
-) -> o3d.pipelines.integration.ScalableTSDFVolume:
-    color_enum = (
-        o3d.pipelines.integration.TSDFVolumeColorType.RGB8
-        if color_type == "RGB8"
-        else o3d.pipelines.integration.TSDFVolumeColorType.Gray32
-    )
-    return o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=voxel_length,
-        sdf_trunc=sdf_trunc,
-        color_type=color_enum,
-    )
+) -> TSDFVolume:
+    if color_type != "RGB8":
+        raise ValueError("Native TSDF fusion currently supports RGB8 color")
+    return TSDFVolume(voxel_length=voxel_length, sdf_trunc=sdf_trunc)
 
 
 def fuse_depth_to_tsdf(
-    volume: o3d.pipelines.integration.ScalableTSDFVolume,
+    volume: TSDFVolume,
     depths: np.ndarray,
     images: np.ndarray,
     intrinsics: np.ndarray,
     extrinsics: np.ndarray,
+    num_points: int,
     max_depth: float = 10.0,
     progress_desc: str | None = None,
-) -> o3d.geometry.TriangleMesh:
+) -> o3d.geometry.PointCloud:
     iterator = range(len(depths))
     if progress_desc is not None:
         iterator = tqdm(iterator, desc=progress_desc, leave=False)
@@ -477,17 +472,15 @@ def fuse_depth_to_tsdf(
         image = images[i]
         ixt = intrinsics[i]
         ext = extrinsics[i]
-        height, width = depth.shape[:2]
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            o3d.geometry.Image(image.astype(np.uint8)),
-            o3d.geometry.Image(depth.astype(np.float32)),
-            depth_trunc=max_depth,
-            convert_rgb_to_intensity=False,
-            depth_scale=1.0,
+        volume.integrate(
+            depth.astype(np.float32, copy=False),
+            image.astype(np.uint8, copy=False),
+            ixt.astype(np.float32, copy=False),
+            ext.astype(np.float32, copy=False),
+            max_depth,
         )
-        ixt_o3d = o3d.camera.PinholeCameraIntrinsic(width, height, ixt[0, 0], ixt[1, 1], ixt[0, 2], ixt[1, 2])
-        volume.integrate(rgbd, ixt_o3d, ext)
-    return volume.extract_triangle_mesh()
+    points, colors = volume.extract_point_cloud(num_points)
+    return _point_cloud_from_arrays(points, colors.astype(np.float32) / 255.0)
 
 
 def sample_points_from_mesh(
@@ -899,16 +892,16 @@ class ScanNetDataset:
 
         if method == "tsdf":
             volume = create_tsdf_volume(voxel_length=self.voxel_length, sdf_trunc=self.sdf_trunc)
-            mesh = fuse_depth_to_tsdf(
+            pcd = fuse_depth_to_tsdf(
                 volume,
                 depths,
                 images,
                 intrinsics,
                 extrinsics,
+                self.sampling_number,
                 max_depth=self.max_depth,
                 progress_desc=f"{scene} {mode} tsdf frames",
             )
-            pcd = sample_points_from_mesh(mesh, self.sampling_number)
         elif method == "backproject":
             pcd = self._backproject_point_cloud(
                 depths,
