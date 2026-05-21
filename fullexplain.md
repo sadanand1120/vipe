@@ -1,6 +1,6 @@
 # Full Computation Walkthrough For The Current ViPE Run
 
-This document describes the current reduced ViPE runtime. The supported path is:
+This document describes the supported ViPE runtime path:
 
 ```text
 one RGB frame directory
@@ -24,8 +24,7 @@ python run.py \
   streams.base_path=/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/color \
   streams.fps=30 \
   pipeline.output.path=/robodata/smodak/repos/vipe/outputs/scene00 \
-  pipeline.output.save_artifacts=true \
-  pipeline.output.pcd_fusion_mode=both
+  pipeline.output.save_artifacts=true
 ```
 
 The required input layout is:
@@ -57,7 +56,7 @@ flowchart LR
 | Stage 2 | Once over all frames | Keyframe-only `GraphBuffer`, incrementally optimized by frontend BA. |
 | Stage 3 | Once over all keyframes | Same `GraphBuffer`, refined by a fresh global backend `FactorGraph`. |
 | Stage 4 | Once over all frames | One pose for every selected RGB frame. |
-| Stage 5 | Once over all frames | Native artifacts: pose, depth zip, intrinsics JSON, backproject PCD, TSDF PCD. |
+| Stage 5 | Once over all frames | Native artifacts: pose, depth zip, intrinsics JSON, TSDF PCD. |
 
 ## Stage 1: Frame Stream, Camera, And Depth Inputs
 
@@ -713,7 +712,7 @@ SLAMOutput(
 )
 ```
 
-`keyframe_indices` are useful diagnostics but are not used to compute final dense depth in the current external-depth path.
+`keyframe_indices` are useful diagnostics. Final dense depth comes from replayed external sensor depth.
 
 ## Stage 5: Replay Sensor Depth And Save Outputs
 
@@ -728,11 +727,8 @@ flowchart TD
     E --> F[write depth zip entry]
     E --> G[append pose]
     E --> H[write intrinsics once]
-    E --> I{pcd_fusion_mode}
-    I -->|backproject/both| J[append sampled backproject vertices]
-    I -->|tsdf/both| K[integrate TSDF frame]
-    J --> L[final backproject PLY]
-    K --> M[extract native TSDF surface and write final PLY]
+    E --> I[integrate TSDF frame]
+    I --> J[extract native TSDF surface and write final PLY]
 ```
 
 `VipePipeline._final_frames` re-reads frames lazily:
@@ -763,63 +759,20 @@ This means final depth artifacts and PCDs are built from the provided sensor dep
 | Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: selected frame indices. |
 | Depth ZIP | `depth/<artifact_name>.zip` | One float16 NumPy `.npy` depth per selected frame. |
 | Intrinsics JSON | `intrinsics/<artifact_name>.json` | Shared downstream pinhole intrinsics at output depth/RGB resolution. |
-| Backproject PLY | `pcd/<artifact_name>_backproject.ply` | Sampled direct backprojection point cloud. |
 | TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points sampled from the native TSDF zero-crossing surface. |
 
 `artifact_name` is the frame directory name, for example `color`.
 
-### Backproject PCD
-
-For each final frame, valid pixels are:
-
-```python
-valid = np.isfinite(depth) & (depth > 0)
-if image_valid_mask is not None:
-    valid &= image_valid_mask
-```
-
-Then a per-frame point budget is computed:
-
-```python
-max_points_per_frame = ceil(pcd_max_points / n_frames)
-sample_count = int(num_valid_pixels * pcd_sample_ratio)
-sample_count = min(sample_count, max_points_per_frame)
-```
-
-If there are too many valid pixels, stride sampling is used:
-
-```python
-stride = ceil(num_valid_pixels / sample_count)
-valid_flat = valid_flat[::stride][:sample_count]
-```
-
-Each selected pixel `(x,y)` with depth `z` is backprojected:
-
-```math
-X_c = \frac{(x-c_x)z}{f_x}, \quad
-Y_c = \frac{(y-c_y)z}{f_y}, \quad
-Z_c = z.
-```
-
-Then transformed to world coordinates:
-
-```math
-\begin{bmatrix}X_w\\Y_w\\Z_w\\1\end{bmatrix}
-=
-T_{wc}
-\begin{bmatrix}X_c\\Y_c\\Z_c\\1\end{bmatrix}.
-```
-
-Colors come from the final RGB frame. Vertices are streamed to a temporary binary body file, then the final PLY header is written once the total vertex count is known.
-
 ### TSDF PCD
 
-For TSDF mode, each final frame is integrated into the native `vipe_ext.tsdf_ext.TSDFVolume` through the small Python wrapper `vipe.utils.tsdf.TSDFVolume`:
+For TSDF output, each final frame is integrated into the native `vipe_ext.tsdf_ext.TSDFVolume` through the small Python wrapper `vipe.utils.tsdf.TSDFVolume`:
 
 ```python
 volume = TSDFVolume(
-    voxel_length=pcd_tsdf_voxel_length,
-    sdf_trunc=pcd_tsdf_sdf_trunc,
+    voxel_edge_m=pcd_tsdf_voxel_edge_m,
+    sdf_trunc_m=pcd_tsdf_sdf_trunc_m,
+    num_voxels_per_block_edge=pcd_tsdf_num_voxels_per_block_edge,
+    depth_sampling_stride=pcd_tsdf_depth_sampling_stride,
 )
 ```
 
@@ -839,10 +792,10 @@ depth[invalid_or_masked] = 0
 color = rgb_uint8
 intrinsics = np.array([fx, fy, cx, cy], dtype=np.float32)
 w2c = frame.pose.inv().matrix()
-volume.integrate(depth, color, intrinsics, w2c, pcd_tsdf_depth_trunc)
+volume.integrate(depth, color, intrinsics, w2c, pcd_tsdf_depth_trunc_m)
 ```
 
-Inside native integration, the first pass determines which voxel blocks are touched by the current depth image. It backprojects every `depth_sampling_stride=4` depth pixel with valid depth `d <= pcd_tsdf_depth_trunc`, transforms the point to world coordinates, and opens every voxel block intersecting that point's `pcd_tsdf_sdf_trunc` neighborhood.
+Inside native integration, the first pass determines which voxel blocks are touched by the current depth image. It lifts every `pcd_tsdf_depth_sampling_stride` depth pixel with valid depth `d <= pcd_tsdf_depth_trunc_m` into world coordinates, and opens every voxel block intersecting that point's `pcd_tsdf_sdf_trunc_m` neighborhood.
 
 Then each touched voxel center `P_w = [X_w,Y_w,Z_w,1]^T` is projected into the current camera:
 
@@ -869,7 +822,7 @@ s =
 }.
 ```
 
-The square-root term converts optical-axis depth difference into approximate Euclidean ray distance. If `s <= -pcd_tsdf_sdf_trunc`, the voxel is behind the observed surface by more than the truncation band and is skipped. Otherwise:
+The square-root term converts optical-axis depth difference into approximate Euclidean ray distance. If `s <= -pcd_tsdf_sdf_trunc_m`, the voxel is behind the observed surface by more than the truncation band and is skipped. Otherwise:
 
 ```math
 \operatorname{tsdf}_{new}
@@ -891,19 +844,14 @@ C
 w \leftarrow w+1.
 ```
 
-After all frames, the extension extracts the zero-crossing surface directly as a point cloud. It scans neighboring voxel samples, finds TSDF sign-changing edges, linearly interpolates the zero crossing and color along each edge, deduplicates shared edges, and deterministically samples/repeats the resulting surface points to the requested `pcd_max_points` when the surface is non-empty:
+After all frames, the extension extracts the zero-crossing surface directly as a point cloud. It scans neighboring voxel samples, keeps cubes whose eight corners are observed and contain both negative and nonnegative TSDF values, decomposes each cube into tetrahedra, linearly interpolates zero-crossing vertices and colors, builds surface triangles, and deterministically samples the resulting triangles by area:
 
 ```python
 points, colors = volume.extract_point_cloud(pcd_max_points)
 write_binary_ply(...)
 ```
 
-So:
-
-| Mode | Online update | Final extraction |
-| --- | --- | --- |
-| Backproject | Append sampled per-frame points. | Write one accumulated PLY. |
-| TSDF | Integrate each depth map into the native sparse voxel volume. | Extract native zero-crossing surface points, then write a sampled colored PLY. |
+So the saved reconstruction artifact is the sampled colored point cloud extracted from the final native sparse TSDF volume.
 
 ### Benchmark Adapter
 
@@ -919,7 +867,13 @@ for each scene, then writes a local benchmark manifest pointing at the native Vi
 exports/vipe_manifest.json
 ```
 
-The local ScanNet evaluator in `vipe/bench/scannet.py` consumes pose, depth zip, intrinsics JSON, and GT metadata through that manifest. It evaluates reconstruction in both TSDF and direct-backproject modes on the evaluator side, while the standalone PCDs remain inspection/use artifacts written during `run.py`.
+The local ScanNet evaluator in `vipe/bench/scannet.py` consumes pose and GT metadata through that manifest for pose metrics. For reconstruction, there is one mode named `recon`: the evaluator uses the TSDF point cloud written by ViPE:
+
+```text
+pcd/<artifact_name>_tsdf.ply
+```
+
+For reconstruction metrics, the evaluator computes a RANSAC Umeyama Sim3 from ViPE camera centers to the matched ScanNet GT camera centers, applies that transform to the TSDF PLY, caches the aligned PLY under the benchmark `eval_cache`, then computes geometry and render metrics in the ScanNet GT coordinate frame.
 
 ## Object Glossary
 

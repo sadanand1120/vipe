@@ -9,15 +9,15 @@ from vipe.ext import tsdf_ext
 class TSDFVolume:
     def __init__(
         self,
-        voxel_length: float,
-        sdf_trunc: float,
-        volume_unit_resolution: int = 16,
+        voxel_edge_m: float,
+        sdf_trunc_m: float,
+        num_voxels_per_block_edge: int = 16,
         depth_sampling_stride: int = 4,
     ) -> None:
         self.volume = tsdf_ext.TSDFVolume(
-            float(voxel_length),
-            float(sdf_trunc),
-            int(volume_unit_resolution),
+            float(voxel_edge_m),
+            float(sdf_trunc_m),
+            int(num_voxels_per_block_edge),
             int(depth_sampling_stride),
         )
 

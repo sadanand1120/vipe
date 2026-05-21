@@ -44,41 +44,6 @@ struct BlockKeyHash {
     }
 };
 
-struct EdgeKey {
-    int x;
-    int y;
-    int z;
-    int axis;
-
-    bool operator==(const EdgeKey &other) const {
-        return x == other.x && y == other.y && z == other.z && axis == other.axis;
-    }
-};
-
-struct EdgeKeyHash {
-    size_t operator()(const EdgeKey &key) const {
-        uint64_t h = 1469598103934665603ull;
-        auto mix = [&h](int v) {
-            h ^= static_cast<uint32_t>(v);
-            h *= 1099511628211ull;
-        };
-        mix(key.x);
-        mix(key.y);
-        mix(key.z);
-        mix(key.axis);
-        return static_cast<size_t>(h);
-    }
-};
-
-struct SurfacePoint {
-    float x;
-    float y;
-    float z;
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-};
-
 struct SurfaceVertex {
     float x;
     float y;
@@ -123,8 +88,8 @@ static int floor_mod(int a, int b) {
     return a - floor_div(a, b) * b;
 }
 
-static int block_index_from_world(float x, float volume_unit_length) {
-    return static_cast<int>(std::floor(x / volume_unit_length));
+static int block_index_from_world(float coord_m, float block_edge_m) {
+    return static_cast<int>(std::floor(coord_m / block_edge_m));
 }
 
 static Matrix4f tensor_to_matrix4(torch::Tensor tensor) {
@@ -189,17 +154,18 @@ static Matrix4f invert_rigid_w2c(const Matrix4f &w2c) {
 
 class TSDFVolume {
    public:
-    TSDFVolume(double voxel_length, double sdf_trunc, int volume_unit_resolution, int depth_sampling_stride)
-        : voxel_length_(static_cast<float>(voxel_length)),
-          sdf_trunc_(static_cast<float>(sdf_trunc)),
-          volume_unit_resolution_(volume_unit_resolution),
+    TSDFVolume(double voxel_edge_m, double sdf_trunc_m, int num_voxels_per_block_edge, int depth_sampling_stride)
+        : voxel_edge_m_(static_cast<float>(voxel_edge_m)),
+          sdf_trunc_m_(static_cast<float>(sdf_trunc_m)),
+          num_voxels_per_block_edge_(num_voxels_per_block_edge),
           depth_sampling_stride_(depth_sampling_stride) {
-        TORCH_CHECK(voxel_length_ > 0.0f, "voxel_length must be positive");
-        TORCH_CHECK(sdf_trunc_ > 0.0f, "sdf_trunc must be positive");
-        TORCH_CHECK(volume_unit_resolution_ > 0, "volume_unit_resolution must be positive");
+        TORCH_CHECK(voxel_edge_m_ > 0.0f, "voxel_edge_m must be positive");
+        TORCH_CHECK(sdf_trunc_m_ > 0.0f, "sdf_trunc_m must be positive");
+        TORCH_CHECK(num_voxels_per_block_edge_ > 0, "num_voxels_per_block_edge must be positive");
         TORCH_CHECK(depth_sampling_stride_ > 0, "depth_sampling_stride must be positive");
-        voxels_per_block_ = volume_unit_resolution_ * volume_unit_resolution_ * volume_unit_resolution_;
-        volume_unit_length_ = voxel_length_ * static_cast<float>(volume_unit_resolution_);
+        num_voxels_per_block_ =
+                num_voxels_per_block_edge_ * num_voxels_per_block_edge_ * num_voxels_per_block_edge_;
+        block_edge_m_ = voxel_edge_m_ * static_cast<float>(num_voxels_per_block_edge_);
     }
 
     void integrate(torch::Tensor depth,
@@ -240,12 +206,12 @@ class TSDFVolume {
                 const float wx = c2w(0, 0) * x + c2w(0, 1) * y + c2w(0, 2) * z + c2w(0, 3);
                 const float wy = c2w(1, 0) * x + c2w(1, 1) * y + c2w(1, 2) * z + c2w(1, 3);
                 const float wz = c2w(2, 0) * x + c2w(2, 1) * y + c2w(2, 2) * z + c2w(2, 3);
-                const int min_x = block_index_from_world(wx - sdf_trunc_, volume_unit_length_);
-                const int min_y = block_index_from_world(wy - sdf_trunc_, volume_unit_length_);
-                const int min_z = block_index_from_world(wz - sdf_trunc_, volume_unit_length_);
-                const int max_x = block_index_from_world(wx + sdf_trunc_, volume_unit_length_);
-                const int max_y = block_index_from_world(wy + sdf_trunc_, volume_unit_length_);
-                const int max_z = block_index_from_world(wz + sdf_trunc_, volume_unit_length_);
+                const int min_x = block_index_from_world(wx - sdf_trunc_m_, block_edge_m_);
+                const int min_y = block_index_from_world(wy - sdf_trunc_m_, block_edge_m_);
+                const int min_z = block_index_from_world(wz - sdf_trunc_m_, block_edge_m_);
+                const int max_x = block_index_from_world(wx + sdf_trunc_m_, block_edge_m_);
+                const int max_y = block_index_from_world(wy + sdf_trunc_m_, block_edge_m_);
+                const int max_z = block_index_from_world(wz + sdf_trunc_m_, block_edge_m_);
                 for (int bx = min_x; bx <= max_x; ++bx) {
                     for (int by = min_y; by <= max_y; ++by) {
                         for (int bz = min_z; bz <= max_z; ++bz) {
@@ -263,33 +229,33 @@ class TSDFVolume {
             return a.z < b.z;
         });
 
-        std::vector<std::vector<Voxel> *> blocks;
-        blocks.reserve(keys.size());
+        std::vector<std::vector<Voxel> *> touched_block_ptrs;
+        touched_block_ptrs.reserve(keys.size());
         for (const auto &key : keys) {
-            auto it = blocks_.find(key);
-            if (it == blocks_.end()) {
-                it = blocks_.emplace(key, std::vector<Voxel>(voxels_per_block_)).first;
+            auto it = all_blocks_.find(key);
+            if (it == all_blocks_.end()) {
+                it = all_blocks_.emplace(key, std::vector<Voxel>(num_voxels_per_block_)).first;
             }
-            blocks.push_back(&it->second);
+            touched_block_ptrs.push_back(&it->second);
         }
 
         const float safe_width = static_cast<float>(width) - 0.0001f;
         const float safe_height = static_cast<float>(height) - 0.0001f;
-        const float sdf_trunc_inv = 1.0f / sdf_trunc_;
+        const float sdf_trunc_m_inv = 1.0f / sdf_trunc_m_;
 
         at::parallel_for(0, static_cast<int64_t>(keys.size()), 1, [&](int64_t begin, int64_t end) {
             for (int64_t bi = begin; bi < end; ++bi) {
                 const BlockKey key = keys[bi];
-                auto &block = *blocks[bi];
-                for (int lx = 0; lx < volume_unit_resolution_; ++lx) {
-                    const int gx = key.x * volume_unit_resolution_ + lx;
-                    for (int ly = 0; ly < volume_unit_resolution_; ++ly) {
-                        const int gy = key.y * volume_unit_resolution_ + ly;
-                        for (int lz = 0; lz < volume_unit_resolution_; ++lz) {
-                            const int gz = key.z * volume_unit_resolution_ + lz;
-                            const float wx = (static_cast<float>(gx) + 0.5f) * voxel_length_;
-                            const float wy = (static_cast<float>(gy) + 0.5f) * voxel_length_;
-                            const float wz = (static_cast<float>(gz) + 0.5f) * voxel_length_;
+                auto &block = *touched_block_ptrs[bi];
+                for (int lx = 0; lx < num_voxels_per_block_edge_; ++lx) {
+                    const int gx = key.x * num_voxels_per_block_edge_ + lx;
+                    for (int ly = 0; ly < num_voxels_per_block_edge_; ++ly) {
+                        const int gy = key.y * num_voxels_per_block_edge_ + ly;
+                        for (int lz = 0; lz < num_voxels_per_block_edge_; ++lz) {
+                            const int gz = key.z * num_voxels_per_block_edge_ + lz;
+                            const float wx = (static_cast<float>(gx) + 0.5f) * voxel_edge_m_;
+                            const float wy = (static_cast<float>(gy) + 0.5f) * voxel_edge_m_;
+                            const float wz = (static_cast<float>(gz) + 0.5f) * voxel_edge_m_;
                             const float cx = w2c(0, 0) * wx + w2c(0, 1) * wy + w2c(0, 2) * wz + w2c(0, 3);
                             const float cy = w2c(1, 0) * wx + w2c(1, 1) * wy + w2c(1, 2) * wz + w2c(1, 3);
                             const float cz = w2c(2, 0) * wx + w2c(2, 1) * wy + w2c(2, 2) * wz + w2c(2, 3);
@@ -297,6 +263,7 @@ class TSDFVolume {
                                 continue;
                             }
 
+                            // Add 0.5 so the following int cast samples the nearest pixel instead of flooring down/left.
                             const float u_f = cx * intr.fx / cz + intr.cx + 0.5f;
                             const float v_f = cy * intr.fy / cz + intr.cy + 0.5f;
                             if (!(u_f >= 0.0001f && u_f < safe_width && v_f >= 0.0001f && v_f < safe_height)) {
@@ -314,14 +281,14 @@ class TSDFVolume {
                             const float dv = (static_cast<float>(v) - intr.cy) / intr.fy;
                             const float distance_multiplier = std::sqrt(du * du + dv * dv + 1.0f);
                             const float sdf = (d - cz) * distance_multiplier;
-                            if (sdf <= -sdf_trunc_) {
+                            if (sdf <= -sdf_trunc_m_) {
                                 continue;
                             }
 
                             const int idx = index_of(lx, ly, lz);
                             Voxel &voxel = block[idx];
                             const float weight_new = voxel.weight + 1.0f;
-                            const float tsdf = std::min(1.0f, sdf * sdf_trunc_inv);
+                            const float tsdf = std::min(1.0f, sdf * sdf_trunc_m_inv);
                             voxel.tsdf = (voxel.tsdf * voxel.weight + tsdf) / weight_new;
 
                             const uint8_t *rgb = color_ptr + (v * width + u) * 3;
@@ -345,10 +312,12 @@ class TSDFVolume {
                 {0, 5, 1, 6}, {0, 1, 2, 6}, {0, 2, 3, 6},
                 {0, 3, 7, 6}, {0, 7, 4, 6}, {0, 4, 5, 6},
         };
+        static constexpr double kBarycentricSampleStep1 = 0.7548776662466927;
+        static constexpr double kBarycentricSampleStep2 = 0.5698402909980532;
 
         std::vector<BlockKey> keys;
-        keys.reserve(blocks_.size());
-        for (const auto &item : blocks_) keys.push_back(item.first);
+        keys.reserve(all_blocks_.size());
+        for (const auto &item : all_blocks_) keys.push_back(item.first);
         std::sort(keys.begin(), keys.end(), [](const BlockKey &a, const BlockKey &b) {
             if (a.x != b.x) return a.x < b.x;
             if (a.y != b.y) return a.y < b.y;
@@ -357,13 +326,13 @@ class TSDFVolume {
 
         std::vector<SurfaceTriangle> triangles;
         for (const auto &key : keys) {
-            const auto &block = blocks_.at(key);
-            for (int lx = 0; lx < volume_unit_resolution_; ++lx) {
-                const int gx = key.x * volume_unit_resolution_ + lx;
-                for (int ly = 0; ly < volume_unit_resolution_; ++ly) {
-                    const int gy = key.y * volume_unit_resolution_ + ly;
-                    for (int lz = 0; lz < volume_unit_resolution_; ++lz) {
-                        const int gz = key.z * volume_unit_resolution_ + lz;
+            const auto &block = all_blocks_.at(key);
+            for (int lx = 0; lx < num_voxels_per_block_edge_; ++lx) {
+                const int gx = key.x * num_voxels_per_block_edge_ + lx;
+                for (int ly = 0; ly < num_voxels_per_block_edge_; ++ly) {
+                    const int gy = key.y * num_voxels_per_block_edge_ + ly;
+                    for (int lz = 0; lz < num_voxels_per_block_edge_; ++lz) {
+                        const int gz = key.z * num_voxels_per_block_edge_ + lz;
                         std::array<const Voxel *, 8> voxels{};
                         bool all_valid = true;
                         bool has_negative = false;
@@ -384,9 +353,9 @@ class TSDFVolume {
                         std::array<SurfaceVertex, 8> vertices;
                         for (int i = 0; i < 8; ++i) {
                             vertices[i] = {
-                                    (static_cast<float>(gx + shifts[i][0]) + 0.5f) * voxel_length_,
-                                    (static_cast<float>(gy + shifts[i][1]) + 0.5f) * voxel_length_,
-                                    (static_cast<float>(gz + shifts[i][2]) + 0.5f) * voxel_length_,
+                                    (static_cast<float>(gx + shifts[i][0]) + 0.5f) * voxel_edge_m_,
+                                    (static_cast<float>(gy + shifts[i][1]) + 0.5f) * voxel_edge_m_,
+                                    (static_cast<float>(gz + shifts[i][2]) + 0.5f) * voxel_edge_m_,
                                     voxels[i]->r,
                                     voxels[i]->g,
                                     voxels[i]->b,
@@ -425,8 +394,8 @@ class TSDFVolume {
                     ++tri_idx;
                     cumulative += triangles[tri_idx].area;
                 }
-                const double r1 = frac((static_cast<double>(i) + 1.0) * 0.7548776662466927);
-                const double r2 = frac((static_cast<double>(i) + 1.0) * 0.5698402909980532);
+                const double r1 = frac((static_cast<double>(i) + 1.0) * kBarycentricSampleStep1);
+                const double r2 = frac((static_cast<double>(i) + 1.0) * kBarycentricSampleStep2);
                 const float sr1 = static_cast<float>(std::sqrt(r1));
                 const float w0 = 1.0f - sr1;
                 const float w1 = sr1 * (1.0f - static_cast<float>(r2));
@@ -439,20 +408,20 @@ class TSDFVolume {
 
    private:
     int index_of(int x, int y, int z) const {
-        return x * volume_unit_resolution_ * volume_unit_resolution_ + y * volume_unit_resolution_ + z;
+        return x * num_voxels_per_block_edge_ * num_voxels_per_block_edge_ + y * num_voxels_per_block_edge_ + z;
     }
 
     const Voxel *voxel_at(int gx, int gy, int gz) const {
-        const int bx = floor_div(gx, volume_unit_resolution_);
-        const int by = floor_div(gy, volume_unit_resolution_);
-        const int bz = floor_div(gz, volume_unit_resolution_);
-        const auto it = blocks_.find({bx, by, bz});
-        if (it == blocks_.end()) {
+        const int bx = floor_div(gx, num_voxels_per_block_edge_);
+        const int by = floor_div(gy, num_voxels_per_block_edge_);
+        const int bz = floor_div(gz, num_voxels_per_block_edge_);
+        const auto it = all_blocks_.find({bx, by, bz});
+        if (it == all_blocks_.end()) {
             return nullptr;
         }
-        const int lx = floor_mod(gx, volume_unit_resolution_);
-        const int ly = floor_mod(gy, volume_unit_resolution_);
-        const int lz = floor_mod(gz, volume_unit_resolution_);
+        const int lx = floor_mod(gx, num_voxels_per_block_edge_);
+        const int ly = floor_mod(gy, num_voxels_per_block_edge_);
+        const int lz = floor_mod(gz, num_voxels_per_block_edge_);
         return &it->second[index_of(lx, ly, lz)];
     }
 
@@ -568,21 +537,21 @@ class TSDFVolume {
         return value - std::floor(value);
     }
 
-    float voxel_length_;
-    float sdf_trunc_;
-    float volume_unit_length_;
-    int volume_unit_resolution_;
+    float voxel_edge_m_;
+    float sdf_trunc_m_;
+    float block_edge_m_;
+    int num_voxels_per_block_edge_;
     int depth_sampling_stride_;
-    int voxels_per_block_;
-    std::unordered_map<BlockKey, std::vector<Voxel>, BlockKeyHash> blocks_;
+    int num_voxels_per_block_;
+    std::unordered_map<BlockKey, std::vector<Voxel>, BlockKeyHash> all_blocks_;
 };
 
 }  // namespace tsdf_ext
 
 void pybind_tsdf_ext(py::module &m) {
     py::class_<tsdf_ext::TSDFVolume>(m, "TSDFVolume")
-            .def(py::init<double, double, int, int>(), py::arg("voxel_length"), py::arg("sdf_trunc"),
-                 py::arg("volume_unit_resolution") = 16, py::arg("depth_sampling_stride") = 4)
+            .def(py::init<double, double, int, int>(), py::arg("voxel_edge_m"), py::arg("sdf_trunc_m"),
+                 py::arg("num_voxels_per_block_edge") = 16, py::arg("depth_sampling_stride") = 4)
             .def("integrate", &tsdf_ext::TSDFVolume::integrate, py::arg("depth"), py::arg("color"),
                  py::arg("intrinsics"), py::arg("extrinsic"), py::arg("depth_trunc"),
                  py::call_guard<py::gil_scoped_release>())

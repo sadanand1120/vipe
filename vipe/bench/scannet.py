@@ -16,14 +16,10 @@ from __future__ import annotations
 
 import gc
 import json
-import math
 import os
 import random
 import time
-import zipfile
 
-from io import BytesIO
-from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +31,6 @@ import torch.nn.functional as F
 
 from tqdm import tqdm
 
-from vipe.utils.tsdf import TSDFVolume
 from vipe.utils.misc import sort_image_sequence
 
 
@@ -63,17 +58,6 @@ def _load_scene_list(input_root: Path) -> list[str]:
     return sorted(scenes, key=_scene_sort_key)
 
 
-def _to44(ext: np.ndarray) -> np.ndarray:
-    if ext.shape[-2:] == (4, 4):
-        return ext
-    if ext.shape[-2:] != (3, 4):
-        raise ValueError(f"Expected extrinsics with shape (...,3,4) or (...,4,4), got {ext.shape}")
-    out = np.zeros((*ext.shape[:-2], 4, 4), dtype=ext.dtype)
-    out[..., :3, :4] = ext
-    out[..., 3, 3] = 1.0
-    return out
-
-
 def as_homogeneous(ext: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     if ext.shape[-2:] == (4, 4):
         return ext
@@ -88,116 +72,79 @@ def as_homogeneous(ext: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     return np.concatenate([ext, bottom], axis=-2)
 
 
-def affine_inverse_np(matrix: np.ndarray) -> np.ndarray:
-    matrix = _to44(matrix)
-    rotation = matrix[..., :3, :3]
-    translation = matrix[..., :3, 3:]
-    bottom = matrix[..., 3:, :]
-    rotation_t = np.swapaxes(rotation, -1, -2)
-    return np.concatenate(
-        [
-            np.concatenate([rotation_t, -rotation_t @ translation], axis=-1),
-            bottom,
-        ],
-        axis=-2,
-    )
+def _camera_centers_from_extrinsics(extrinsics: np.ndarray) -> np.ndarray:
+    extrinsics = as_homogeneous(extrinsics).astype(np.float64, copy=False)
+    rotation = extrinsics[:, :3, :3]
+    translation = extrinsics[:, :3, 3]
+    return -(np.swapaxes(rotation, 1, 2) @ translation[..., None])[..., 0]
 
 
-def _umeyama_sim3(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    if len(source) < 3:
-        return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64), 1.0
+def _umeyama_sim3(src_xyz: np.ndarray, dst_xyz: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    if src_xyz.shape != dst_xyz.shape or len(src_xyz) < 2:
+        raise ValueError("Need at least two matched camera centers for Sim3 alignment")
 
-    source = source.astype(np.float64, copy=False)
-    target = target.astype(np.float64, copy=False)
-    mean_source = source.mean(axis=0)
-    mean_target = target.mean(axis=0)
-    source_centered = source - mean_source
-    target_centered = target - mean_target
-    covariance = (target_centered.T @ source_centered) / float(len(source))
+    src_mean = src_xyz.mean(axis=0)
+    dst_mean = dst_xyz.mean(axis=0)
+    src_centered = src_xyz - src_mean
+    dst_centered = dst_xyz - dst_mean
+    covariance = (dst_centered.T @ src_centered) / len(src_xyz)
+    u, singular_vals, vh = np.linalg.svd(covariance)
 
-    u, singular_values, vh = np.linalg.svd(covariance)
-    sign = np.ones(3, dtype=np.float64)
-    if np.linalg.det(u @ vh) < 0:
-        sign[-1] = -1.0
-    rotation = u @ np.diag(sign) @ vh
-    source_variance = float(np.mean(np.sum(source_centered * source_centered, axis=1)))
-    scale = float(np.sum(singular_values * sign) / source_variance) if source_variance > 0.0 else 1.0
-    translation = mean_target - scale * (rotation @ mean_source)
-    return rotation, translation, scale
+    sign = np.eye(3, dtype=np.float64)
+    if np.linalg.det(u) * np.linalg.det(vh) < 0:
+        sign[-1, -1] = -1.0
 
-
-def _apply_sim3_to_poses(
-    poses: np.ndarray,
-    rotation: np.ndarray,
-    translation: np.ndarray,
-    scale: float,
-) -> np.ndarray:
-    out = poses.copy()
-    out[:, :3, :3] = rotation @ poses[:, :3, :3]
-    out[:, :3, 3] = (scale * (rotation @ poses[:, :3, 3].T)).T + translation
-    return out
+    rotation = u @ sign @ vh
+    src_var = np.mean(np.sum(src_centered * src_centered, axis=1))
+    if src_var <= 0.0:
+        raise ValueError("Degenerate camera centers for Sim3 alignment")
+    scale = np.sum(singular_vals * np.diag(sign)) / src_var
+    translation = dst_mean - scale * (rotation @ src_mean)
+    return float(scale), rotation, translation
 
 
-def _ransac_align_sim3(
-    ref_poses: np.ndarray,
-    est_poses: np.ndarray,
+def _apply_sim3(points: np.ndarray, scale: float, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    return scale * (points @ rotation.T) + translation
+
+
+def _ransac_umeyama_sim3(
+    src_xyz: np.ndarray,
+    dst_xyz: np.ndarray,
     max_iters: int = 10,
-    random_state: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, float]:
+    random_state: int = 42,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    if len(src_xyz) < 3:
+        return _umeyama_sim3(src_xyz, dst_xyz)
+
     rng = np.random.default_rng(random_state)
-    n_poses = len(ref_poses)
-    if n_poses < 3:
-        return _umeyama_sim3(est_poses[:, :3, 3], ref_poses[:, :3, 3])
+    all_indices = np.arange(len(src_xyz))
+    sample_count = max(3, (len(src_xyz) + 1) // 2)
+    scale0, rotation0, translation0 = _umeyama_sim3(src_xyz, dst_xyz)
+    aligned0 = _apply_sim3(src_xyz, scale0, rotation0, translation0)
+    nearest = [np.linalg.norm(dst_xyz - point[None, :], axis=1).min() for point in aligned0]
+    inlier_thresh = float(np.median(nearest))
 
-    ref_centers = ref_poses[:, :3, 3]
-    est_centers = est_poses[:, :3, 3]
-    rotation0, translation0, scale0 = _umeyama_sim3(est_centers, ref_centers)
-    est0 = _apply_sim3_to_poses(est_poses, rotation0, translation0, scale0)
-    nearest = [np.linalg.norm(ref_centers - center[None], axis=1).min() for center in est0[:, :3, 3]]
-    inlier_thresh = float(np.median(nearest)) if nearest else 0.0
-
-    best_model = (rotation0, translation0, scale0)
-    best_score = (-1, math.inf)
+    best_model = (scale0, rotation0, translation0)
     best_inliers = None
-    sub_n = max(3, (n_poses + 1) // 2)
-    all_indices = np.arange(n_poses)
+    best_score = (-1, float("inf"))
     for _ in range(max_iters):
-        sample = rng.choice(all_indices, size=sub_n, replace=False)
-        rotation, translation, scale = _umeyama_sim3(est_centers[sample], ref_centers[sample])
-        aligned = _apply_sim3_to_poses(est_poses, rotation, translation, scale)
-        errors = np.linalg.norm(aligned[:, :3, 3] - ref_centers, axis=1)
+        sample = rng.choice(all_indices, size=sample_count, replace=False)
+        try:
+            scale, rotation, translation = _umeyama_sim3(src_xyz[sample], dst_xyz[sample])
+        except ValueError:
+            continue
+        errors = np.linalg.norm(_apply_sim3(src_xyz, scale, rotation, translation) - dst_xyz, axis=1)
         inliers = errors <= inlier_thresh
         inlier_count = int(inliers.sum())
-        mean_error = float(errors[inliers].mean()) if inlier_count else math.inf
+        mean_error = float(errors[inliers].mean()) if inlier_count > 0 else float("inf")
         if (inlier_count > best_score[0]) or (inlier_count == best_score[0] and mean_error < best_score[1]):
-            best_model = (rotation, translation, scale)
-            best_score = (inlier_count, mean_error)
+            best_model = (scale, rotation, translation)
             best_inliers = inliers
+            best_score = (inlier_count, mean_error)
 
     if best_inliers is not None and int(best_inliers.sum()) >= 3:
-        return _umeyama_sim3(est_centers[best_inliers], ref_centers[best_inliers])
+        return _umeyama_sim3(src_xyz[best_inliers], dst_xyz[best_inliers])
     return best_model
-
-
-def align_poses_umeyama(
-    ref_extrinsics: np.ndarray,
-    est_extrinsics: np.ndarray,
-    return_aligned: bool = False,
-    ransac: bool = False,
-    random_state: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, float] | tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-    ref_poses = affine_inverse_np(ref_extrinsics)
-    est_poses = affine_inverse_np(est_extrinsics)
-    if ransac:
-        rotation, translation, scale = _ransac_align_sim3(ref_poses, est_poses, random_state=random_state)
-    else:
-        rotation, translation, scale = _umeyama_sim3(est_poses[:, :3, 3], ref_poses[:, :3, 3])
-
-    if not return_aligned:
-        return rotation, translation, scale
-
-    aligned_poses = _apply_sim3_to_poses(est_poses, rotation, translation, scale)
-    return rotation, translation, scale, affine_inverse_np(aligned_poses).astype(np.float32)
 
 
 def _sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
@@ -443,46 +390,6 @@ def evaluate_3d_reconstruction(
     }
 
 
-def create_tsdf_volume(
-    voxel_length: float = 4.0 / 512.0,
-    sdf_trunc: float = 0.04,
-    color_type: str = "RGB8",
-) -> TSDFVolume:
-    if color_type != "RGB8":
-        raise ValueError("Native TSDF fusion currently supports RGB8 color")
-    return TSDFVolume(voxel_length=voxel_length, sdf_trunc=sdf_trunc)
-
-
-def fuse_depth_to_tsdf(
-    volume: TSDFVolume,
-    depths: np.ndarray,
-    images: np.ndarray,
-    intrinsics: np.ndarray,
-    extrinsics: np.ndarray,
-    num_points: int,
-    max_depth: float = 10.0,
-    progress_desc: str | None = None,
-) -> o3d.geometry.PointCloud:
-    iterator = range(len(depths))
-    if progress_desc is not None:
-        iterator = tqdm(iterator, desc=progress_desc, leave=False)
-
-    for i in iterator:
-        depth = depths[i]
-        image = images[i]
-        ixt = intrinsics[i]
-        ext = extrinsics[i]
-        volume.integrate(
-            depth.astype(np.float32, copy=False),
-            image.astype(np.uint8, copy=False),
-            ixt.astype(np.float32, copy=False),
-            ext.astype(np.float32, copy=False),
-            max_depth,
-        )
-    points, colors = volume.extract_point_cloud(num_points)
-    return _point_cloud_from_arrays(points, colors.astype(np.float32) / 255.0)
-
-
 def sample_points_from_mesh(
     mesh: o3d.geometry.TriangleMesh,
     num_points: int = 10_000_000,
@@ -491,59 +398,6 @@ def sample_points_from_mesh(
     if pcd.has_colors():
         pcd.colors = o3d.utility.Vector3dVector(np.clip(np.asarray(pcd.colors), 0.0, 1.0))
     return pcd
-
-
-def parallel_execution(
-    *args,
-    action,
-    num_processes: int = 32,
-    print_progress: bool = False,
-    sequential: bool = False,
-    desc: str | None = None,
-):
-    args = list(args)
-
-    def get_length() -> int:
-        for arg in args:
-            if isinstance(arg, list):
-                return len(arg)
-        raise ValueError("parallel_execution needs at least one distributed list argument")
-
-    def get_action_args(length: int, idx: int):
-        return [arg[idx] if isinstance(arg, list) and len(arg) == length else arg for arg in args]
-
-    length = get_length()
-    if sequential:
-        return [action(*get_action_args(length, i)) for i in tqdm(range(length), desc=desc, disable=not print_progress)]
-
-    pool = ThreadPool(processes=num_processes)
-    asyncs = [pool.apply_async(action, get_action_args(length, i)) for i in range(length)]
-    results = []
-    if print_progress:
-        progress = tqdm(total=len(asyncs), desc=desc)
-        pending = list(enumerate(asyncs))
-        ordered_results = [None] * len(asyncs)
-        while pending:
-            next_pending = []
-            completed = 0
-            for idx, async_result in pending:
-                if async_result.ready():
-                    ordered_results[idx] = async_result.get()
-                    completed += 1
-                else:
-                    next_pending.append((idx, async_result))
-            if completed:
-                progress.update(completed)
-            else:
-                time.sleep(0.2)
-            pending = next_pending
-        progress.close()
-        results = ordered_results
-    else:
-        results = [async_result.get() for async_result in asyncs]
-    pool.close()
-    pool.join()
-    return results
 
 
 def _image_psnr(pred: np.ndarray, target: np.ndarray) -> float:
@@ -733,10 +587,6 @@ def _render_voxel_cloud_cuda(
 
 
 class ScanNetDataset:
-    max_depth = 5.0
-    sampling_number = 10_000_000
-    voxel_length = 0.02
-    sdf_trunc = 0.15
     render_voxel_size = 0.001
     render_num_images = 800
     render_chunk_size = 1_000_000
@@ -823,12 +673,6 @@ class ScanNetDataset:
         pose_npz = np.load(manifest["pose_path"])
         return {int(idx): pose.astype(np.float32) for idx, pose in zip(pose_npz["inds"], pose_npz["data"])}
 
-    def _load_vipe_intrinsics(self, manifest: dict) -> np.ndarray:
-        with open(manifest["intrinsics_path"], "r", encoding="utf-8") as f:
-            intr_data = json.load(f)
-        fx, fy, cx, cy = np.asarray(intr_data["params"][:4], dtype=np.float32)
-        return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
-
     def load_pred_extrinsics(self, result_path: str) -> np.ndarray:
         manifest = self._load_vipe_manifest(result_path)
         pose_map = self._load_vipe_pose_map(manifest)
@@ -836,229 +680,87 @@ class ScanNetDataset:
             [np.linalg.inv(pose_map[int(frame_idx)]).astype(np.float32) for frame_idx in manifest["frame_indices"]]
         )
 
-    def _load_prediction_data(self, result_path: str, progress_desc: str) -> AttrDict:
+    def _tsdf_pcd_path(self, result_path: str) -> str:
         manifest = self._load_vipe_manifest(result_path)
-        pose_map = self._load_vipe_pose_map(manifest)
-        intrinsics = self._load_vipe_intrinsics(manifest)
-        depths = []
-        extrinsics = []
-        intrinsics_out = []
-        with zipfile.ZipFile(manifest["depth_path"], "r") as depth_zip:
-            for frame_idx in tqdm(manifest["frame_indices"], desc=progress_desc, leave=False):
-                frame_idx = int(frame_idx)
-                raw = depth_zip.read(f"{frame_idx:06d}.npy")
-                depths.append(np.load(BytesIO(raw), allow_pickle=False).astype(np.float16, copy=False))
-                extrinsics.append(np.linalg.inv(pose_map[frame_idx]).astype(np.float32))
-                intrinsics_out.append(intrinsics.copy())
-        return AttrDict(
-            depth=np.stack(depths).astype(np.float16, copy=False),
-            extrinsics=np.stack(extrinsics).astype(np.float32, copy=False),
-            intrinsics=np.stack(intrinsics_out).astype(np.float32, copy=False),
-        )
+        path = manifest["tsdf_pcd_path"]
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing ViPE TSDF PLY: {path}")
+        return path
 
-    def fuse3d(self, scene: str, result_path: str, fuse_path: str, mode: str) -> None:
-        self.fuse3d_method(scene, result_path, fuse_path, mode, method="tsdf")
+    def _aligned_tsdf_pcd_path(self, result_path: str) -> Path:
+        return Path(result_path).parents[2] / "eval_cache" / "pcd_tsdf_aligned.ply"
 
-    def fuse3d_method(self, scene: str, result_path: str, fuse_path: str, mode: str, method: str) -> None:
-        tqdm.write(f"[ScanNet] fuse start | {mode} | {method} | {scene}")
-        full_gt_data = self.get_data(scene)
+    def _tsdf_alignment_is_current(self, aligned_path: Path, source_path: str, result_path: str, manifest: dict) -> bool:
+        if not aligned_path.exists():
+            return False
+        input_paths = [source_path, result_path, manifest["pose_path"]]
+        gt_meta_path = Path(result_path).with_name("gt_meta.npz")
+        if gt_meta_path.exists():
+            input_paths.append(str(gt_meta_path))
+        newest_input = max(Path(path).stat().st_mtime_ns for path in input_paths)
+        return aligned_path.stat().st_mtime_ns >= newest_input
+
+    def _align_tsdf_pcd(self, scene: str, result_path: str) -> str:
+        manifest = self._load_vipe_manifest(result_path)
+        source_path = self._tsdf_pcd_path(result_path)
+        aligned_path = self._aligned_tsdf_pcd_path(result_path)
+        if self._tsdf_alignment_is_current(aligned_path, source_path, result_path, manifest):
+            tqdm.write(f"[ScanNet] aligned TSDF cache hit | {scene} | {aligned_path}")
+            return str(aligned_path)
+
         gt_meta = self._load_gt_meta(result_path)
-        if gt_meta is not None:
-            gt_data = gt_meta
-            full_image_index = {f: i for i, f in enumerate(full_gt_data.image_files)}
-            image_indices = [full_image_index[f] for f in gt_data.image_files if f in full_image_index]
-        else:
-            gt_data = full_gt_data
-            image_indices = list(range(len(full_gt_data.image_files)))
-
-        pred_data = self._load_prediction_data(result_path, f"{scene} {mode} load ViPE depths")
-        images = []
-        orig_sizes = []
-        for img_idx in tqdm(image_indices, desc=f"{scene} {mode} load RGB", leave=False):
-            img = cv2.imread(full_gt_data.image_files[img_idx], cv2.IMREAD_COLOR)
-            if img is None:
-                raise FileNotFoundError(full_gt_data.image_files[img_idx])
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            images.append(img)
-            orig_sizes.append((img.shape[0], img.shape[1]))
-        images = np.stack(images, axis=0)
-
-        if mode == "recon_unposed":
-            depths, intrinsics, extrinsics = self._prep_unposed(pred_data, gt_data, full_gt_data, image_indices, orig_sizes)
-        elif mode == "recon_posed":
-            depths, intrinsics, extrinsics = self._prep_posed(pred_data, gt_data, full_gt_data, image_indices, orig_sizes)
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-
-        if method == "tsdf":
-            volume = create_tsdf_volume(voxel_length=self.voxel_length, sdf_trunc=self.sdf_trunc)
-            pcd = fuse_depth_to_tsdf(
-                volume,
-                depths,
-                images,
-                intrinsics,
-                extrinsics,
-                self.sampling_number,
-                max_depth=self.max_depth,
-                progress_desc=f"{scene} {mode} tsdf frames",
+        if gt_meta is None:
+            gt_meta = self.get_data(scene)
+        frame_indices = [int(idx) for idx in manifest["frame_indices"]]
+        if len(gt_meta.extrinsics) != len(frame_indices):
+            raise ValueError(
+                f"GT metadata length ({len(gt_meta.extrinsics)}) does not match manifest frame count ({len(frame_indices)})"
             )
-        elif method == "backproject":
-            pcd = self._backproject_point_cloud(
-                depths,
-                images,
-                intrinsics,
-                extrinsics,
-                self.sampling_number,
-                progress_desc=f"{scene} {mode} backproject frames",
-            )
-        else:
-            raise ValueError(f"Invalid reconstruction method: {method}")
 
-        os.makedirs(os.path.dirname(fuse_path), exist_ok=True)
-        o3d.io.write_point_cloud(fuse_path, pcd)
-        tqdm.write(f"[ScanNet] fuse done  | {mode} | {method} | {scene}")
+        pose_map = self._load_vipe_pose_map(manifest)
+        pred_extrinsics = np.stack([np.linalg.inv(pose_map[idx]).astype(np.float64) for idx in frame_indices])
+        gt_centers = _camera_centers_from_extrinsics(gt_meta.extrinsics)
+        pred_centers = _camera_centers_from_extrinsics(pred_extrinsics)
+        scale, rotation, translation = _ransac_umeyama_sim3(pred_centers, gt_centers)
 
-    def _backproject_point_cloud(
-        self,
-        depths: np.ndarray,
-        images: np.ndarray,
-        intrinsics: np.ndarray,
-        extrinsics: np.ndarray,
-        num_points: int,
-        progress_desc: str,
-    ) -> o3d.geometry.PointCloud:
-        valid_counts = [int((np.isfinite(depth) & (depth > 0.0) & (depth <= self.max_depth)).sum()) for depth in depths]
-        total_valid = sum(valid_counts)
-        sample_total = min(num_points, total_valid)
-        if sample_total == 0:
-            return o3d.geometry.PointCloud()
+        start = time.perf_counter()
+        tqdm.write(f"[ScanNet] align TSDF start | {scene} | scale={scale:.6f} | {source_path}")
+        pcd = o3d.io.read_point_cloud(source_path)
+        points = np.asarray(pcd.points)
+        if len(points) > 0:
+            pcd.points = o3d.utility.Vector3dVector(_apply_sim3(points, scale, rotation, translation))
+        if pcd.has_normals():
+            pcd.normals = o3d.utility.Vector3dVector(np.asarray(pcd.normals) @ rotation.T)
 
-        raw_quotas = np.asarray(valid_counts, dtype=np.float64) * (sample_total / total_valid)
-        quotas = np.floor(raw_quotas).astype(np.int64)
-        remainder = sample_total - int(quotas.sum())
-        if remainder > 0:
-            for idx in np.argsort(-(raw_quotas - quotas))[:remainder]:
-                quotas[idx] += 1
-
-        rng = np.random.default_rng(seed=42)
-        sampled_points = []
-        sampled_colors = []
-        for i in tqdm(range(len(depths)), desc=progress_desc, leave=False):
-            quota = int(quotas[i])
-            if quota == 0:
-                continue
-            depth = depths[i]
-            valid_flat = np.flatnonzero((np.isfinite(depth) & (depth > 0.0) & (depth <= self.max_depth)).ravel())
-            if quota < len(valid_flat):
-                valid_flat = rng.choice(valid_flat, size=quota, replace=False)
-            height, width = depth.shape
-            ys, xs = np.divmod(valid_flat, width)
-            zs = depth.ravel()[valid_flat].astype(np.float32)
-            ixt = intrinsics[i]
-            fx, fy, cx, cy = ixt[0, 0], ixt[1, 1], ixt[0, 2], ixt[1, 2]
-            points_cam = np.empty((len(valid_flat), 4), dtype=np.float32)
-            points_cam[:, 0] = (xs.astype(np.float32) - cx) * zs / fx
-            points_cam[:, 1] = (ys.astype(np.float32) - cy) * zs / fy
-            points_cam[:, 2] = zs
-            points_cam[:, 3] = 1.0
-            c2w = np.linalg.inv(extrinsics[i]).astype(np.float32)
-            sampled_points.append((c2w @ points_cam.T).T[:, :3])
-            sampled_colors.append(images[i].reshape(-1, 3)[valid_flat].astype(np.float32) / 255.0)
-
-        return _point_cloud_from_arrays(np.concatenate(sampled_points, axis=0), np.concatenate(sampled_colors, axis=0))
-
-    def _prep_unposed(
-        self,
-        pred_data: AttrDict,
-        gt_data: AttrDict,
-        full_gt_data: AttrDict,
-        image_indices: list[int],
-        orig_sizes: list[tuple[int, int]],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        _, _, scale, extrinsics = align_poses_umeyama(
-            gt_data.extrinsics.copy(),
-            pred_data.extrinsics.copy(),
-            return_aligned=True,
-            ransac=True,
-            random_state=42,
+        aligned_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = aligned_path.with_name(f"{aligned_path.stem}.tmp{aligned_path.suffix}")
+        o3d.io.write_point_cloud(str(tmp_path), pcd)
+        os.replace(tmp_path, aligned_path)
+        tqdm.write(
+            f"[ScanNet] align TSDF done  | {scene} | "
+            f"points={len(pcd.points):,} | {time.perf_counter() - start:.2f}s"
         )
-        model_h, model_w = pred_data.depth.shape[1], pred_data.depth.shape[2]
-        depths_out = []
-        intrinsics_out = []
-        for i in range(len(pred_data.depth)):
-            orig_h, orig_w = orig_sizes[i]
-            img_idx = image_indices[i]
-            depth = cv2.resize(pred_data.depth[i], (orig_w, orig_h), interpolation=cv2.INTER_NEAREST).astype(np.float32)
-            depth = self._mask_invalid_depth(depth, self._load_gt_mask(full_gt_data.aux.gt_depth_files[img_idx], (orig_h, orig_w)))
-            depth *= scale
-            ixt = pred_data.intrinsics[i].copy()
-            ixt[0, :] *= orig_w / model_w
-            ixt[1, :] *= orig_h / model_h
-            depths_out.append(depth)
-            intrinsics_out.append(ixt)
-        return np.stack(depths_out), np.stack(intrinsics_out), extrinsics
+        return str(aligned_path)
 
-    def _prep_posed(
-        self,
-        pred_data: AttrDict,
-        gt_data: AttrDict,
-        full_gt_data: AttrDict,
-        image_indices: list[int],
-        orig_sizes: list[tuple[int, int]],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        _, _, scale = align_poses_umeyama(
-            gt_data.extrinsics.copy(),
-            pred_data.extrinsics.copy(),
-            return_aligned=False,
-            ransac=True,
-            random_state=42,
-        )
-        depths_out = []
-        intrinsics_out = []
-        extrinsics_out = []
-        for i in range(len(pred_data.depth)):
-            orig_h, orig_w = orig_sizes[i]
-            img_idx = image_indices[i]
-            depth = cv2.resize(pred_data.depth[i], (orig_w, orig_h), interpolation=cv2.INTER_NEAREST).astype(np.float32)
-            depth = self._mask_invalid_depth(depth, self._load_gt_mask(full_gt_data.aux.gt_depth_files[img_idx], (orig_h, orig_w)))
-            depth *= scale
-            depths_out.append(depth)
-            intrinsics_out.append(full_gt_data.intrinsics[img_idx].copy())
-            extrinsics_out.append(full_gt_data.extrinsics[img_idx].copy())
-        return np.stack(depths_out), np.stack(intrinsics_out), np.stack(extrinsics_out)
+    def _artifact_sample_count(self, result_path: str) -> int:
+        manifest = self._load_vipe_manifest(result_path)
+        return int(manifest["output"]["pcd_max_points"])
 
-    def _load_gt_mask(self, gt_depth_path: str, target_hw: tuple[int, int] | None = None) -> np.ndarray | None:
-        if not os.path.exists(gt_depth_path):
-            return None
-        gt_depth = cv2.imread(gt_depth_path, cv2.IMREAD_UNCHANGED)
-        if gt_depth is None:
-            return None
-        valid_mask = gt_depth > 0
-        if target_hw is not None:
-            target_h, target_w = target_hw
-            valid_mask = cv2.resize(valid_mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST).astype(bool)
-        return valid_mask
-
-    def _mask_invalid_depth(self, depth: np.ndarray, gt_zero_mask: np.ndarray | None = None) -> np.ndarray:
-        depth = depth.copy()
-        if gt_zero_mask is not None:
-            pred_invalid = np.isnan(depth) | np.isinf(depth)
-            depth *= np.logical_and(gt_zero_mask, np.logical_not(pred_invalid)).astype(np.float32)
-        else:
-            depth[np.isnan(depth) | np.isinf(depth) | (depth <= 0)] = 0.0
-        return depth
-
-    def eval3d(self, scene: str, fuse_path: str) -> dict[str, float]:
+    def eval3d(self, scene: str, result_path: str) -> dict[str, float]:
         start_eval = time.perf_counter()
         full_gt_data = self.get_data(scene)
-        tqdm.write(f"[ScanNet] eval3d start | {scene} | {fuse_path}")
-        gt_cache_path = Path(fuse_path).parents[3] / "eval_cache" / f"gt_sample_{self.sampling_number}.npz"
+        pcd_path = self._align_tsdf_pcd(scene, result_path)
+        method_name = "pcd_tsdf"
+        eval_cache_dir = Path(result_path).parents[2] / "eval_cache"
+        tqdm.write(f"[ScanNet] eval3d start | {scene} | {pcd_path}")
+        sample_count = self._artifact_sample_count(result_path)
+        gt_cache_path = eval_cache_dir / f"gt_sample_{sample_count}.npz"
         start_gt = time.perf_counter()
         gt_pcd = _load_cached_point_cloud(gt_cache_path)
         if gt_pcd is None:
-            tqdm.write(f"[ScanNet] sample GT start | {scene} | points={self.sampling_number:,}")
+            tqdm.write(f"[ScanNet] sample GT start | {scene} | points={sample_count:,}")
             gt_mesh = o3d.io.read_triangle_mesh(full_gt_data.aux.gt_mesh_path)
-            gt_pcd = sample_points_from_mesh(gt_mesh, self.sampling_number)
+            gt_pcd = sample_points_from_mesh(gt_mesh, sample_count)
             _write_cached_point_cloud(gt_cache_path, gt_pcd)
             tqdm.write(f"[ScanNet] sample GT done  | {scene} | {time.perf_counter() - start_gt:.2f}s")
         else:
@@ -1068,7 +770,7 @@ class ScanNetDataset:
             )
 
         start_read = time.perf_counter()
-        pred_pcd = o3d.io.read_point_cloud(fuse_path)
+        pred_pcd = o3d.io.read_point_cloud(pcd_path)
         tqdm.write(f"[ScanNet] read pred done | {scene} | points={len(pred_pcd.points):,} | {time.perf_counter() - start_read:.2f}s")
         pred_eval_pcd = pred_pcd
 
@@ -1094,16 +796,15 @@ class ScanNetDataset:
         result = evaluate_3d_reconstruction_l2(
             pred_eval_pcd,
             gt_pcd,
-            progress_desc=f"{scene} {Path(fuse_path).stem} L2 NN",
+            progress_desc=f"{scene} {method_name} L2 NN",
         )
         tqdm.write(f"[ScanNet] geometry metric done | {scene} | {result} | {time.perf_counter() - start_geom:.2f}s")
         del gt_pcd, pred_eval_pcd, points
         gc.collect()
 
-        export_manifest = Path(fuse_path).parents[1] / "vipe_manifest.json"
-        render_data = self._load_gt_meta(str(export_manifest)) or full_gt_data
-        result.update(self._compute_render_metrics(scene, Path(fuse_path).stem, pred_pcd, render_data, fuse_path))
-        tqdm.write(f"[ScanNet] eval3d done | {scene} | {Path(fuse_path).stem} | {time.perf_counter() - start_eval:.2f}s")
+        render_data = self._load_gt_meta(result_path) or full_gt_data
+        result.update(self._compute_render_metrics(scene, method_name, pred_pcd, render_data, pcd_path, eval_cache_dir))
+        tqdm.write(f"[ScanNet] eval3d done | {scene} | {method_name} | {time.perf_counter() - start_eval:.2f}s")
         return result
 
     def _compute_render_metrics(
@@ -1112,17 +813,18 @@ class ScanNetDataset:
         method_name: str,
         pcd: o3d.geometry.PointCloud,
         scene_data: AttrDict,
-        fuse_path: str,
+        source_path: str,
+        cache_dir: Path,
     ) -> dict[str, float]:
         start_total = time.perf_counter()
         label = f"{scene} {method_name}"
         tqdm.write(f"[ScanNet] render metric voxelize start | {label} | voxel={self.render_voxel_size}m")
-        cache_name = f"{Path(fuse_path).stem}_render_vox_{str(self.render_voxel_size).replace('.', 'p')}.npz"
-        render_cache_path = Path(fuse_path).with_name(cache_name)
-        cached = _load_cached_render_arrays(render_cache_path, fuse_path, self.render_voxel_size)
+        cache_name = f"{method_name}_render_vox_{str(self.render_voxel_size).replace('.', 'p')}.npz"
+        render_cache_path = cache_dir / cache_name
+        cached = _load_cached_render_arrays(render_cache_path, source_path, self.render_voxel_size)
         if cached is None:
             points, colors = _voxelized_render_arrays(pcd, self.render_voxel_size)
-            _write_cached_render_arrays(render_cache_path, fuse_path, self.render_voxel_size, points, colors)
+            _write_cached_render_arrays(render_cache_path, source_path, self.render_voxel_size, points, colors)
             tqdm.write(
                 f"[ScanNet] render metric voxelize done  | {label} | "
                 f"voxels={len(points):,} | {time.perf_counter() - start_total:.2f}s"
@@ -1184,7 +886,7 @@ class ScanNetDataset:
 
 
 class ScanNetEvaluator:
-    VALID_MODES = {"pose", "recon_unposed", "recon_posed"}
+    VALID_MODES = {"pose", "recon"}
 
     def __init__(
         self,
@@ -1193,7 +895,6 @@ class ScanNetEvaluator:
         raw_root: str | Path,
         modes: list[str],
         scenes: list[str] | None = None,
-        num_fusion_workers: int = 4,
         max_frames: int = 100,
         gpu_id: int = 0,
         total_gpus: int = 1,
@@ -1204,7 +905,6 @@ class ScanNetEvaluator:
         if unknown:
             raise ValueError(f"Unknown modes: {sorted(unknown)}")
         self.scenes_filter = scenes
-        self.num_fusion_workers = num_fusion_workers
         self.max_frames = max_frames
         self.gpu_id = gpu_id
         self.total_gpus = total_gpus
@@ -1224,17 +924,11 @@ class ScanNetEvaluator:
             print(f"{'=' * 60}")
             for data, result in self._eval_pose():
                 summary[f"{data}_pose"] = result
-        if "recon_unposed" in self.modes:
+        if "recon" in self.modes:
             print(f"\n{'=' * 60}")
-            print("Evaluating RECON_UNPOSED for ScanNet")
+            print("Evaluating RECON for ScanNet")
             print(f"{'=' * 60}")
-            for key, result in self._eval_reconstruction("recon_unposed"):
-                summary[key] = result
-        if "recon_posed" in self.modes:
-            print(f"\n{'=' * 60}")
-            print("Evaluating RECON_POSED for ScanNet")
-            print(f"{'=' * 60}")
-            for key, result in self._eval_reconstruction("recon_posed"):
+            for key, result in self._eval_reconstruction():
                 summary[key] = result
         return summary
 
@@ -1243,7 +937,7 @@ class ScanNetEvaluator:
         dataset = self.datasets.scannet
         dataset_results = AttrDict()
         for scene in tqdm(self._get_scenes(dataset), desc="scannet scenes", leave=False):
-            export_dir = self._export_dir("scannet", scene, posed=False)
+            export_dir = self._export_dir("scannet", scene)
             result_path = dataset.result_path(export_dir)
             if not dataset.result_exists(result_path):
                 tqdm.write(f"[ERROR] Result file not found: {result_path}")
@@ -1268,52 +962,23 @@ class ScanNetEvaluator:
         self._dump_json(os.path.join(self._metric_dir, "scannet_pose.json"), dataset_results)
         yield "scannet", dataset_results
 
-    def _eval_reconstruction(self, mode: str):
+    def _eval_reconstruction(self):
         os.makedirs(self._metric_dir, exist_ok=True)
         dataset = self.datasets.scannet
         scenes = self._get_scenes(dataset)
-        for method in ["tsdf", "backproject"]:
-            dataset_results = AttrDict()
-            tqdm.write(f"[INFO] Starting {mode} {method} fusion for dataset=scannet with {len(scenes)} scene(s)")
-            scene_list = []
-            result_paths = []
-            fuse_paths = []
-            for scene in scenes:
-                export_dir = self._export_dir("scannet", scene, posed=(mode == "recon_posed"))
-                scene_list.append(scene)
-                result_paths.append(dataset.result_path(export_dir))
-                fuse_paths.append(os.path.join(export_dir, "exports", "fuse", f"pcd_{method}.ply"))
+        dataset_results = AttrDict()
+        tqdm.write(f"[INFO] Starting recon eval for dataset=scannet with {len(scenes)} scene(s)")
+        for scene in scenes:
+            export_dir = self._export_dir("scannet", scene)
+            result_path = dataset.result_path(export_dir)
+            result = dataset.eval3d(scene, result_path)
+            dataset_results[scene] = self._to_float_dict(result)
+            tqdm.write(f"  recon | scannet | {scene}: {result}")
 
-            pending = [
-                (scene, result_path, fuse_path)
-                for scene, result_path, fuse_path in zip(scene_list, result_paths, fuse_paths)
-                if not os.path.exists(fuse_path)
-            ]
-            skipped = len(scene_list) - len(pending)
-            if skipped:
-                tqdm.write(f"[INFO] Reusing {skipped} existing {mode} {method} fused PLY(s)")
-            if pending:
-                pending_scenes, pending_results, pending_fuses = map(list, zip(*pending))
-                action = lambda s, rp, fp: dataset.fuse3d_method(s, rp, fp, mode, method=method)
-                parallel_execution(
-                    pending_scenes,
-                    pending_results,
-                    pending_fuses,
-                    action=action,
-                    num_processes=self.num_fusion_workers,
-                    print_progress=True,
-                    desc=f"scannet {method} fusion",
-                )
-
-            for scene, fuse_path in zip(scene_list, fuse_paths):
-                result = dataset.eval3d(scene, fuse_path)
-                dataset_results[scene] = self._to_float_dict(result)
-                tqdm.write(f"  {mode} | {method} | scannet | {scene}: {result}")
-
-            dataset_results["mean"] = self._mean_of_dicts(dataset_results.values())
-            key = f"scannet_{mode}_{method}"
-            self._dump_json(os.path.join(self._metric_dir, f"{key}.json"), dataset_results)
-            yield key, dataset_results
+        dataset_results["mean"] = self._mean_of_dicts(dataset_results.values())
+        key = "scannet_recon"
+        self._dump_json(os.path.join(self._metric_dir, f"{key}.json"), dataset_results)
+        yield key, dataset_results
 
     def _save_gt_meta(self, export_dir: str, scene_data: AttrDict) -> None:
         meta_path = os.path.join(export_dir, "exports", "gt_meta.npz")
@@ -1368,9 +1033,8 @@ class ScanNetEvaluator:
     def _metric_dir(self) -> str:
         return os.path.join(self.work_dir, "metric_results")
 
-    def _export_dir(self, data: str, scene: str, posed: bool) -> str:
-        suffix = "posed" if posed else "unposed"
-        export_dir = os.path.join(self.work_dir, "model_results", data, scene, suffix)
+    def _export_dir(self, data: str, scene: str) -> str:
+        export_dir = os.path.join(self.work_dir, "model_results", data, scene, "recon")
         os.makedirs(export_dir, exist_ok=True)
         return export_dir
 

@@ -1,6 +1,6 @@
 # GraphBuffer, FactorGraph, Frontend Graph, Backend Graph
 
-This explains the concrete objects in the current reduced ViPE SLAM path.
+This explains the concrete objects in the supported ViPE SLAM path.
 
 ## The Short Version
 
@@ -143,7 +143,7 @@ disps -> optimized by BA
 
 Everything else supports feature matching, depth anchoring, or keyframe/infill bookkeeping.
 
-`GraphBuffer` remains an internal SLAM workspace. The final output handoff is `SLAMOutput`, which contains the full-frame camera-to-world trajectory, recovered original-resolution intrinsics, and the selected-frame indices of optimized SLAM keyframes. The current output stage uses the trajectory and intrinsics to replay external sensor depth into pose/depth/PCD artifacts.
+`GraphBuffer` remains an internal SLAM workspace. The final output handoff is `SLAMOutput`, which contains the full-frame camera-to-world trajectory, recovered original-resolution intrinsics, and the selected-frame indices of optimized SLAM keyframes. The output stage uses the trajectory and intrinsics to replay external sensor depth into pose/depth/TSDF PCD artifacts. ScanNet reconstruction eval Sim3-aligns that TSDF PCD to matched GT camera centers before measuring reconstruction quality.
 
 ### How Slots Get Filled
 
@@ -223,7 +223,7 @@ remove_second_newest(2)
 After:
 
 ```text
-slot 2 now contains old slot 3
+slot 2 now contains the contents from slot 3
 n_frames = 3
 active slots: 0, 1, 2
 ```
@@ -262,7 +262,7 @@ This is used by `FactorGraph` to know what the current geometry predicts.
 
 Computes a geometry-based distance between two frames using current poses and disparities.
 
-This is not the final metric. It is used to decide which frame pairs should get edges and whether a keyframe is redundant.
+This is a graph-construction distance used to decide which frame pairs should get edges and whether a keyframe is redundant.
 
 #### `bundle_adjustment(...)`
 
@@ -390,7 +390,7 @@ Steps:
 
 1. Convert inputs to tensors.
 2. Remove repeats already present in the active edge set.
-3. If frontend graph would exceed `max_factors` and `remove=True`, remove old factors.
+3. If frontend graph would exceed `max_factors` and `remove=True`, remove aged factors.
 4. If `incremental=True`, precompute/append correlation blocks:
    ```python
    fmap1 = buffer.fmaps[ii]

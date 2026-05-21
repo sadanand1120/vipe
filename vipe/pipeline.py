@@ -189,12 +189,12 @@ class VipePipeline:
             artifact_path,
             self._final_frames(frame_stream, slam_output),
             n_frames=len(frame_stream),
-            pcd_fusion_mode=self.out_cfg.pcd_fusion_mode,
             max_pcd_points=self.out_cfg.pcd_max_points,
-            pcd_sample_ratio=self.out_cfg.pcd_sample_ratio,
-            pcd_tsdf_voxel_length=self.out_cfg.pcd_tsdf_voxel_length,
-            pcd_tsdf_sdf_trunc=self.out_cfg.pcd_tsdf_sdf_trunc,
-            pcd_tsdf_depth_trunc=self.out_cfg.pcd_tsdf_depth_trunc,
+            pcd_tsdf_voxel_edge_m=self.out_cfg.pcd_tsdf_voxel_edge_m,
+            pcd_tsdf_sdf_trunc_m=self.out_cfg.pcd_tsdf_sdf_trunc_m,
+            pcd_tsdf_depth_trunc_m=self.out_cfg.pcd_tsdf_depth_trunc_m,
+            pcd_tsdf_num_voxels_per_block_edge=self.out_cfg.pcd_tsdf_num_voxels_per_block_edge,
+            pcd_tsdf_depth_sampling_stride=self.out_cfg.pcd_tsdf_depth_sampling_stride,
         )
 
     def run(self, frame_stream: FrameStream) -> SLAMOutput:

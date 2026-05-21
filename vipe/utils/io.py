@@ -15,9 +15,6 @@
 
 import json
 import logging
-import math
-import shutil
-import tempfile
 import zipfile
 
 from dataclasses import dataclass
@@ -48,10 +45,6 @@ class ArtifactPath:
         return self.base_path / "depth" / f"{self.artifact_name}.zip"
 
     @property
-    def backproject_pcd_path(self) -> Path:
-        return self.base_path / "pcd" / f"{self.artifact_name}_backproject.ply"
-
-    @property
     def tsdf_pcd_path(self) -> Path:
         return self.base_path / "pcd" / f"{self.artifact_name}_tsdf.ply"
 
@@ -68,102 +61,18 @@ def _image_valid_numpy(frame_data: FrameData, shape: tuple[int, int]) -> np.ndar
     return image_valid
 
 
-def _backproject_vertices(
-    frame_data: FrameData,
-    max_points_per_frame: int,
-    sample_ratio: float,
-) -> np.ndarray | None:
-    if (
-        frame_data.metric_depth is None
-        or frame_data.pose is None
-        or frame_data.intrinsics is None
-        or max_points_per_frame <= 0
-    ):
-        return None
-
-    depth = frame_data.metric_depth.detach().cpu().numpy()
-    valid = np.isfinite(depth) & (depth > 0.0)
-    image_valid = _image_valid_numpy(frame_data, depth.shape)
-    if image_valid is not None:
-        valid &= image_valid
-
-    valid_flat = np.flatnonzero(valid.ravel())
-    if len(valid_flat) == 0:
-        return None
-
-    if sample_ratio < 1.0:
-        sample_count = int(len(valid_flat) * sample_ratio)
-    else:
-        sample_count = len(valid_flat)
-    sample_count = min(sample_count, max_points_per_frame)
-    if sample_count <= 0:
-        return None
-
-    if sample_count < len(valid_flat):
-        stride = max(1, math.ceil(len(valid_flat) / sample_count))
-        valid_flat = valid_flat[::stride][:sample_count]
-
-    height, width = depth.shape
-    ys, xs = np.divmod(valid_flat, width)
-    zs = depth.ravel()[valid_flat].astype(np.float32)
-    fx, fy, cx, cy = frame_data.intrinsics[:4].detach().cpu().numpy().astype(np.float32)
-
-    points_cam = np.empty((len(valid_flat), 4), dtype=np.float32)
-    points_cam[:, 0] = (xs.astype(np.float32) - cx) * zs / fx
-    points_cam[:, 1] = (ys.astype(np.float32) - cy) * zs / fy
-    points_cam[:, 2] = zs
-    points_cam[:, 3] = 1.0
-
-    pose_c2w = frame_data.pose.matrix().detach().cpu().numpy().astype(np.float32)
-    points_world = (pose_c2w @ points_cam.T).T[:, :3]
-    colors = (frame_data.rgb.detach().cpu().numpy().reshape(-1, 3)[valid_flat] * 255.0).clip(0, 255).astype(np.uint8)
-
-    vertex_dtype = np.dtype(
-        [
-            ("x", "<f4"),
-            ("y", "<f4"),
-            ("z", "<f4"),
-            ("red", "u1"),
-            ("green", "u1"),
-            ("blue", "u1"),
-        ]
+def _make_tsdf_volume(
+    voxel_edge_m: float,
+    sdf_trunc_m: float,
+    num_voxels_per_block_edge: int,
+    depth_sampling_stride: int,
+):
+    return TSDFVolume(
+        voxel_edge_m=voxel_edge_m,
+        sdf_trunc_m=sdf_trunc_m,
+        num_voxels_per_block_edge=num_voxels_per_block_edge,
+        depth_sampling_stride=depth_sampling_stride,
     )
-    vertices = np.empty(len(points_world), dtype=vertex_dtype)
-    vertices["x"] = points_world[:, 0]
-    vertices["y"] = points_world[:, 1]
-    vertices["z"] = points_world[:, 2]
-    vertices["red"] = colors[:, 0]
-    vertices["green"] = colors[:, 1]
-    vertices["blue"] = colors[:, 2]
-    return vertices
-
-
-def _write_backproject_pcd(out_path: ArtifactPath, body_file, vertex_count: int) -> None:
-    if vertex_count == 0:
-        return
-
-    out_path.backproject_pcd_path.parent.mkdir(exist_ok=True, parents=True)
-    body_file.seek(0)
-    with out_path.backproject_pcd_path.open("wb") as ply_file:
-        ply_file.write(
-            (
-                "ply\n"
-                "format binary_little_endian 1.0\n"
-                f"element vertex {vertex_count}\n"
-                "property float x\n"
-                "property float y\n"
-                "property float z\n"
-                "property uchar red\n"
-                "property uchar green\n"
-                "property uchar blue\n"
-                "end_header\n"
-            ).encode("ascii")
-        )
-        shutil.copyfileobj(body_file, ply_file)
-
-
-def _make_tsdf_volume(voxel_length: float, sdf_trunc: float):
-    return TSDFVolume(voxel_length=voxel_length, sdf_trunc=sdf_trunc)
 
 
 def _integrate_tsdf_frame(volume, frame_data: FrameData, depth_trunc: float) -> None:
@@ -232,12 +141,12 @@ def save_artifacts(
     out_path: ArtifactPath,
     final_frames,
     n_frames: int,
-    pcd_fusion_mode: str = "both",
     max_pcd_points: int = 10_000_000,
-    pcd_sample_ratio: float = 0.015,
-    pcd_tsdf_voxel_length: float = 0.02,
-    pcd_tsdf_sdf_trunc: float = 0.15,
-    pcd_tsdf_depth_trunc: float = 5.0,
+    pcd_tsdf_voxel_edge_m: float = 0.02,
+    pcd_tsdf_sdf_trunc_m: float = 0.15,
+    pcd_tsdf_depth_trunc_m: float = 5.0,
+    pcd_tsdf_num_voxels_per_block_edge: int = 16,
+    pcd_tsdf_depth_sampling_stride: int = 4,
 ) -> None:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
@@ -246,51 +155,31 @@ def save_artifacts(
     pose_list = []
     intrinsics = None
     intrinsics_frame_size = None
-    if pcd_fusion_mode not in {"backproject", "tsdf", "both"}:
-        raise ValueError(f"Invalid pcd_fusion_mode: {pcd_fusion_mode}")
+    tsdf_volume = _make_tsdf_volume(
+        pcd_tsdf_voxel_edge_m,
+        pcd_tsdf_sdf_trunc_m,
+        pcd_tsdf_num_voxels_per_block_edge,
+        pcd_tsdf_depth_sampling_stride,
+    )
 
-    write_backproject = pcd_fusion_mode in {"backproject", "both"}
-    write_tsdf = pcd_fusion_mode in {"tsdf", "both"}
-    pcd_body_file = tempfile.TemporaryFile() if write_backproject else None
-    pcd_vertex_count = 0
-    max_points_per_frame = math.ceil(max_pcd_points / max(n_frames, 1))
-    tsdf_volume = _make_tsdf_volume(pcd_tsdf_voxel_length, pcd_tsdf_sdf_trunc) if write_tsdf else None
+    out_path.depth_path.parent.mkdir(exist_ok=True, parents=True)
+    with zipfile.ZipFile(out_path.depth_path, "w", compression=zipfile.ZIP_STORED) as depth_zip:
+        for frame_idx, frame_data in pbar(
+            enumerate(final_frames),
+            total=n_frames,
+            desc="Saving artifacts",
+        ):
+            assert isinstance(frame_data, FrameData)
+            _write_depth_frame(depth_zip, frame_idx, frame_data)
 
-    try:
-        out_path.depth_path.parent.mkdir(exist_ok=True, parents=True)
-        with zipfile.ZipFile(out_path.depth_path, "w", compression=zipfile.ZIP_STORED) as depth_zip:
-            for frame_idx, frame_data in pbar(
-                enumerate(final_frames),
-                total=n_frames,
-                desc="Saving artifacts",
-            ):
-                assert isinstance(frame_data, FrameData)
-                _write_depth_frame(depth_zip, frame_idx, frame_data)
+            if frame_data.pose is not None:
+                pose_list.append((frame_idx, frame_data.pose.matrix().cpu().numpy()))
 
-                if frame_data.pose is not None:
-                    pose_list.append((frame_idx, frame_data.pose.matrix().cpu().numpy()))
+            if intrinsics is None and frame_data.intrinsics is not None:
+                intrinsics = frame_data.intrinsics.cpu().numpy()
+                intrinsics_frame_size = frame_data.size()
 
-                if intrinsics is None and frame_data.intrinsics is not None:
-                    intrinsics = frame_data.intrinsics.cpu().numpy()
-                    intrinsics_frame_size = frame_data.size()
-
-                remaining_points = max_pcd_points - pcd_vertex_count
-                if write_backproject and remaining_points > 0:
-                    assert pcd_body_file is not None
-                    vertices = _backproject_vertices(
-                        frame_data,
-                        min(max_points_per_frame, remaining_points),
-                        pcd_sample_ratio,
-                    )
-                    if vertices is not None:
-                        vertices.tofile(pcd_body_file)
-                        pcd_vertex_count += len(vertices)
-                if write_tsdf:
-                    _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc)
-    except Exception:
-        if pcd_body_file is not None:
-            pcd_body_file.close()
-        raise
+            _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc_m)
 
     if len(pose_list) > 0:
         pose_data = np.stack([pose for _, pose in pose_list], axis=0)
@@ -302,12 +191,4 @@ def save_artifacts(
         assert intrinsics_frame_size is not None
         _write_intrinsics_json(out_path, intrinsics, intrinsics_frame_size)
 
-    try:
-        if write_backproject:
-            assert pcd_body_file is not None
-            _write_backproject_pcd(out_path, pcd_body_file, pcd_vertex_count)
-        if write_tsdf:
-            _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)
-    finally:
-        if pcd_body_file is not None:
-            pcd_body_file.close()
+    _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)

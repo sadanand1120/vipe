@@ -314,7 +314,9 @@ SLAMOutput.intrinsics  # one recovered original-resolution pinhole intrinsics ve
 SLAMOutput.keyframe_indices  # selected-frame indices of optimized SLAM keyframes
 ```
 
-The current output stage uses `SLAMOutput.trajectory` and `SLAMOutput.intrinsics` to replay external sensor depth into final depth and point-cloud artifacts. No `FactorGraph` or dense keyframe-map object is passed to the output stage.
+The output stage uses `SLAMOutput.trajectory` and `SLAMOutput.intrinsics` to replay external sensor depth into final pose, depth, intrinsics, and TSDF PCD artifacts.
+
+ScanNet reconstruction eval Sim3-aligns the saved TSDF PCD to matched GT camera centers before computing geometry and render metrics.
 
 ### One-line mental model
 

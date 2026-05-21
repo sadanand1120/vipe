@@ -39,12 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["pose", "recon_unposed", "recon_posed"],
-        choices=["pose", "recon_unposed", "recon_posed"],
+        default=["pose", "recon"],
+        choices=["pose", "recon"],
         help="Benchmark modes to run",
     )
     parser.add_argument("--max-frames", type=int, default=-1, help="Maximum frames to evaluate (-1 for all)")
-    parser.add_argument("--num-fusion-workers", type=int, default=4, help="TSDF fusion workers")
     parser.add_argument("--seed", type=int, default=42, help="Seed for Python/NumPy/Torch/Open3D RNGs")
     parser.add_argument("--fps", type=float, default=30.0, help="Default streams.fps if not provided as an override")
     parser.add_argument("--vipe-output-dir", type=Path, default=None, help="ViPE output dir override")
@@ -132,17 +131,21 @@ def _prepare_vipe_overrides(args: argparse.Namespace, vipe_overrides: list[str],
     return overrides, frame_dir, vipe_output_dir
 
 
-def run_vipe(overrides: list[str]) -> None:
+def _compose_vipe_cfg(overrides: list[str]):
     import hydra
 
     from vipe import get_config_path
+
+    with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
+        return hydra.compose("default", overrides=overrides)
+
+
+def run_vipe(overrides: list[str]) -> None:
     from vipe.pipeline import VipePipeline
     from vipe.streams.base import FrameDir
     from vipe.utils.logging import configure_logging
 
-    with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
-        cfg = hydra.compose("default", overrides=overrides)
-
+    cfg = _compose_vipe_cfg(overrides)
     logger = configure_logging()
     pipeline = VipePipeline(
         slam=cfg.pipeline.slam,
@@ -221,16 +224,22 @@ def _write_vipe_manifest(
     kept_scene_indices: list[int],
     vipe_output_dir: Path,
     artifact_name: str,
+    scene_overrides: list[str],
 ) -> None:
     print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={len(frame_indices)}", flush=True)
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     depth_path = vipe_output_dir / "depth" / f"{artifact_name}.zip"
     intrinsics_path = vipe_output_dir / "intrinsics" / f"{artifact_name}.json"
-    missing_artifacts = [path for path in [pose_path, depth_path, intrinsics_path] if not path.exists()]
+    tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
+    required_artifacts = [pose_path, depth_path, intrinsics_path]
+    if "recon" in args.modes:
+        required_artifacts.append(tsdf_pcd_path)
+    missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
 
+    cfg = _compose_vipe_cfg(scene_overrides)
     manifest = {
         "format": "vipe_artifacts_v1",
         "scene": scene,
@@ -239,26 +248,28 @@ def _write_vipe_manifest(
         "pose_path": str(pose_path.resolve()),
         "depth_path": str(depth_path.resolve()),
         "intrinsics_path": str(intrinsics_path.resolve()),
+        "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
+        "output": {
+            "pcd_max_points": int(cfg.pipeline.output.pcd_max_points),
+            "pcd_tsdf_voxel_edge_m": float(cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
+            "pcd_tsdf_sdf_trunc_m": float(cfg.pipeline.output.pcd_tsdf_sdf_trunc_m),
+            "pcd_tsdf_depth_trunc_m": float(cfg.pipeline.output.pcd_tsdf_depth_trunc_m),
+            "pcd_tsdf_num_voxels_per_block_edge": int(cfg.pipeline.output.pcd_tsdf_num_voxels_per_block_edge),
+            "pcd_tsdf_depth_sampling_stride": int(cfg.pipeline.output.pcd_tsdf_depth_sampling_stride),
+        },
         "frame_indices": [int(idx) for idx in frame_indices],
     }
 
     exported_scene_data = _subset_scene_data(full_scene_data, kept_scene_indices)
-    need_unposed = {"pose", "recon_unposed"} & set(args.modes)
-    need_posed = {"recon_posed"} & set(args.modes)
-    for posed in [False, True]:
-        if posed and not need_posed:
-            continue
-        if not posed and not need_unposed:
-            continue
-        export_dir = Path(evaluator._export_dir("scannet", scene, posed=posed))
-        exports_dir = export_dir / "exports"
-        exports_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = Path(evaluator._export_dir("scannet", scene))
+    exports_dir = export_dir / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
 
-        manifest_path = exports_dir / "vipe_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        print(f"[INFO] Wrote ViPE manifest | {scene} | posed={posed} | {manifest_path}", flush=True)
-        print(f"[INFO] Writing GT metadata | {scene} | posed={posed}", flush=True)
-        evaluator._save_gt_meta(str(export_dir), exported_scene_data)
+    manifest_path = exports_dir / "vipe_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"[INFO] Wrote ViPE manifest | {scene} | {manifest_path}", flush=True)
+    print(f"[INFO] Writing GT metadata | {scene}", flush=True)
+    evaluator._save_gt_meta(str(export_dir), exported_scene_data)
 
     print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
@@ -268,7 +279,6 @@ def _load_evaluator(args: argparse.Namespace):
         work_dir=str(args.work_dir),
         modes=args.modes,
         scenes=args.scenes,
-        num_fusion_workers=args.num_fusion_workers,
         max_frames=args.max_frames,
         input_root=args.input_root,
         raw_root=args.raw_root,
@@ -284,7 +294,6 @@ def _append_common_cli_args(cmd: list[str], args: argparse.Namespace, vipe_overr
     cmd += ["--raw-root", str(args.raw_root)]
     cmd += ["--modes", *args.modes]
     cmd += ["--max-frames", str(args.max_frames)]
-    cmd += ["--num-fusion-workers", str(args.num_fusion_workers)]
     cmd += ["--seed", str(args.seed)]
     cmd += ["--fps", str(args.fps)]
     if args.vipe_output_dir is not None:
@@ -368,6 +377,7 @@ def prepare_vipe_benchmark_exports(
             kept_scene_indices,
             vipe_output_dir,
             _artifact_name(frame_dir),
+            scene_overrides,
         )
 
 
@@ -386,17 +396,13 @@ def _get_nested(d, *keys):
 
 def print_scannet_summary(metrics) -> None:
     pose_mean = _get_nested(metrics, "scannet_pose", "mean") or {}
-    recon_u_tsdf = _get_nested(metrics, "scannet_recon_unposed_tsdf", "mean") or {}
-    recon_u_backproject = _get_nested(metrics, "scannet_recon_unposed_backproject", "mean") or {}
-    recon_p_tsdf = _get_nested(metrics, "scannet_recon_posed_tsdf", "mean") or {}
-    recon_p_backproject = _get_nested(metrics, "scannet_recon_posed_backproject", "mean") or {}
+    recon = _get_nested(metrics, "scannet_recon", "mean") or {}
 
     auc3 = next((pose_mean[key] for key in ["Auc_3", "auc03", "auc_3", "auc3", "Auc3"] if key in pose_mean), None)
     auc30 = next((pose_mean[key] for key in ["Auc_30", "auc30", "auc_30", "Auc30"] if key in pose_mean), None)
 
     col1 = 15
     col2 = 14
-    col3 = 14
     print("\n" + "=" * 44)
     print("SCANNET VIPE BENCHMARK SUMMARY")
     print("=" * 44)
@@ -406,20 +412,13 @@ def print_scannet_summary(metrics) -> None:
     print("-" * (col1 + col2))
     print(f"{'Auc3':<{col1}}{_fmt(auc3):<{col2}}")
     print(f"{'Auc30':<{col1}}{_fmt(auc30):<{col2}}")
-    print("\nRECON_UNPOSED (ViPE Pose)")
-    print("-" * (col1 + col2 + col3))
-    print(f"{'Metric':<{col1}}{'TSDF':<{col2}}{'Backproject':<{col3}}")
-    print("-" * (col1 + col2 + col3))
-    print(f"{'Overall':<{col1}}{_fmt(recon_u_tsdf.get('overall')):<{col2}}{_fmt(recon_u_backproject.get('overall')):<{col3}}")
-    print(f"{'PSNR':<{col1}}{_fmt(recon_u_tsdf.get('psnr')):<{col2}}{_fmt(recon_u_backproject.get('psnr')):<{col3}}")
-    print(f"{'SSIM':<{col1}}{_fmt(recon_u_tsdf.get('ssim')):<{col2}}{_fmt(recon_u_backproject.get('ssim')):<{col3}}")
-    print("\nRECON_POSED (GT Pose)")
-    print("-" * (col1 + col2 + col3))
-    print(f"{'Metric':<{col1}}{'TSDF':<{col2}}{'Backproject':<{col3}}")
-    print("-" * (col1 + col2 + col3))
-    print(f"{'Overall':<{col1}}{_fmt(recon_p_tsdf.get('overall')):<{col2}}{_fmt(recon_p_backproject.get('overall')):<{col3}}")
-    print(f"{'PSNR':<{col1}}{_fmt(recon_p_tsdf.get('psnr')):<{col2}}{_fmt(recon_p_backproject.get('psnr')):<{col3}}")
-    print(f"{'SSIM':<{col1}}{_fmt(recon_p_tsdf.get('ssim')):<{col2}}{_fmt(recon_p_backproject.get('ssim')):<{col3}}")
+    print("\nRECONSTRUCTION")
+    print("-" * (col1 + col2))
+    print(f"{'Metric':<{col1}}{'ScanNet':<{col2}}")
+    print("-" * (col1 + col2))
+    print(f"{'Overall':<{col1}}{_fmt(recon.get('overall')):<{col2}}")
+    print(f"{'PSNR':<{col1}}{_fmt(recon.get('psnr')):<{col2}}")
+    print(f"{'SSIM':<{col1}}{_fmt(recon.get('ssim')):<{col2}}")
 
 
 def main() -> None:

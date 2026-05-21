@@ -1,6 +1,6 @@
 # ViPE: External-Depth Frame-Directory Fork
 
-This fork keeps one supported runtime path: a single RGB frame directory with external RGB/color intrinsics and external sensor depth. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided depth as the dense depth source, and writes pose/depth/intrinsics plus configured point-cloud exports.
+This fork keeps one supported runtime path: a single RGB frame directory with external RGB/color intrinsics and external sensor depth. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided depth as the dense depth source, and writes pose/depth/intrinsics plus a native TSDF point-cloud export.
 
 ## Installation
 
@@ -38,19 +38,16 @@ python run.py \
 
 Useful output knobs:
 
-- `pipeline.output.pcd_fusion_mode=both`: save both point-cloud exports. This is the default.
-- `pipeline.output.pcd_fusion_mode=backproject`: save `pcd/color_backproject.ply`.
-- `pipeline.output.pcd_fusion_mode=tsdf`: save `pcd/color_tsdf.ply`.
-- `pipeline.output.pcd_max_points=10000000`: cap saved point cloud points.
-- `pipeline.output.pcd_sample_ratio=0.015`: per-frame stride sampling before the global point cap.
+- `pipeline.output.pcd_max_points=10000000`: cap saved TSDF point cloud points.
+- `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=16`: TSDF voxel block edge size.
+- `pipeline.output.pcd_tsdf_depth_sampling_stride=4`: sample every Nth depth pixel when opening TSDF voxel blocks.
 
 Saved artifacts:
 
 - `pose/color.npz`: camera-to-world pose per selected frame.
 - `depth/color.zip`: per-frame sensor depth after any camera normalization, as float16 NumPy `.npy` entries.
 - `intrinsics/color.json`: one shared original-resolution downstream pinhole intrinsics record.
-- `pcd/color_backproject.ply`: direct backprojected point cloud, if enabled.
-- `pcd/color_tsdf.ply`: native TSDF-fused sampled point cloud, if enabled.
+- `pcd/color_tsdf.ply`: native TSDF-fused sampled point cloud.
 
 ## ScanNet Benchmark
 
@@ -61,8 +58,7 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   --input-root /robodata/smodak/repos/ovo/data/input/ScanNet \
   --raw-root /robodata/smodak/datasets/scannet_v2/scans \
   --max-frames -1 \
-  --num-fusion-workers 16 \
   streams.fps=30
 ```
 
-The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose/reconstruction metrics for native TSDF and direct-backproject reconstruction with the local ScanNet evaluator in `vipe/bench/scannet.py`.
+The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval Sim3-aligns the saved TSDF PLY to the ScanNet GT camera centers before computing geometry and render metrics.

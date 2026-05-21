@@ -36,12 +36,12 @@ pipeline:
   output:
     path: vipe_results/                  # Output directory for all saved artifacts.
     save_artifacts: false                # Save pose, depth, intrinsics, and point-cloud artifacts.
-    pcd_fusion_mode: both                # Point cloud mode: backproject, tsdf, or both.
-    pcd_max_points: 10000000             # Max saved points per point-cloud output.
-    pcd_sample_ratio: 0.015              # Per-frame sampling ratio before max-point downsampling.
-    pcd_tsdf_voxel_length: 0.02          # TSDF voxel size in meters.
-    pcd_tsdf_sdf_trunc: 0.15             # TSDF signed-distance truncation distance in meters.
-    pcd_tsdf_depth_trunc: 5.0            # Ignore TSDF depth samples beyond this distance in meters.
+    pcd_max_points: 10000000             # Max saved TSDF PCD points.
+    pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
+    pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.
+    pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
+    pcd_tsdf_num_voxels_per_block_edge: 16 # Number of voxels along each sparse TSDF block edge.
+    pcd_tsdf_depth_sampling_stride: 4     # Sample every Nth depth pixel when opening TSDF voxel blocks.
 
 hydra:
   output_subdir: null  # Do not create .hydra metadata directories.
