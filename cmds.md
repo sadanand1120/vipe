@@ -1,0 +1,5 @@
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='4' && python3 run.py streams.base_path=data/rosbags/distilled_bag/color streams.fps=14.0 --output-dir outputs/distilledbag pipeline.output.save_artifacts=true && python3 run.py streams.base_path=data/rosbags/distilled_bag2/color streams.fps=2.5 --output-dir outputs/distilledbag2 pipeline.output.save_artifacts=true && python3 run.py streams.base_path=data/rosbags/distilled_bag3/color streams.fps=2.5 --output-dir outputs/distilledbag3 pipeline.output.save_artifacts=true
+
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='4,6,7' && python3 scripts/scannet_vipe_bench_evaluator.py --scenes scene0000_00 scene0011_00 scene0378_00 --work-dir ./workspace/evaluation_scannet_default --input-root /robodata/smodak/repos/ovo/data/input/ScanNet --raw-root /robodata/smodak/datasets/scannet_v2/scans streams.fps=30
+
+python3 scripts/export_distilled_bag_scannet.py data/rosbags/distilled_bag --overwrite
