@@ -824,6 +824,8 @@ class ScanNetEvaluator:
         self.config = _to_attr_dict(eval_config)
         self.scenes_filter = scenes
         self.datasets = AttrDict(scannet=ScanNetDataset(Path(input_root), Path(raw_root), self.config))
+        self._metric_eval_seconds_by_scene: dict[str, float] = {}
+        self._metric_eval_frames_by_scene: dict[str, int] = {}
         os.makedirs(self.work_dir, exist_ok=True)
 
     def _get_scenes(self, dataset: ScanNetDataset) -> list[str]:
@@ -832,6 +834,8 @@ class ScanNetEvaluator:
         return list(dataset.SCENES)
 
     def eval(self) -> dict[str, dict]:
+        self._metric_eval_seconds_by_scene = {}
+        self._metric_eval_frames_by_scene = {}
         summary: dict[str, dict] = {}
         print(f"\n{'=' * 60}")
         print("Evaluating POSE for ScanNet")
@@ -850,6 +854,7 @@ class ScanNetEvaluator:
         dataset = self.datasets.scannet
         dataset_results = AttrDict()
         for scene in tqdm(self._get_scenes(dataset), desc="scannet scenes", leave=False):
+            start_scene = time.perf_counter()
             export_dir = self._export_dir("scannet", scene)
             result_path = dataset.result_path(export_dir)
             if not dataset.result_exists(result_path):
@@ -867,6 +872,10 @@ class ScanNetEvaluator:
                 num_pairs = num_frames * (num_frames - 1) // 2
                 tqdm.write(f"[INFO] Pose start | scannet | {scene} | frames={num_frames} pairs={num_pairs}")
                 result = self._compute_pose_with_gt(dataset, result_path, scene_data)
+            self._metric_eval_frames_by_scene[scene] = int(num_frames)
+            self._metric_eval_seconds_by_scene[scene] = (
+                self._metric_eval_seconds_by_scene.get(scene, 0.0) + time.perf_counter() - start_scene
+            )
             dataset_results[scene] = self._to_float_dict(result)
             tqdm.write(f"[INFO] Pose done  | scannet | {scene} | {result}")
 
@@ -882,9 +891,13 @@ class ScanNetEvaluator:
         dataset_results = AttrDict()
         tqdm.write(f"[INFO] Starting recon eval for dataset=scannet with {len(scenes)} scene(s)")
         for scene in scenes:
+            start_scene = time.perf_counter()
             export_dir = self._export_dir("scannet", scene)
             result_path = dataset.result_path(export_dir)
             result = dataset.eval3d(scene, result_path)
+            self._metric_eval_seconds_by_scene[scene] = (
+                self._metric_eval_seconds_by_scene.get(scene, 0.0) + time.perf_counter() - start_scene
+            )
             dataset_results[scene] = self._to_float_dict(result)
             tqdm.write(f"  recon | scannet | {scene}: {result}")
 
@@ -917,6 +930,15 @@ class ScanNetEvaluator:
             torch.from_numpy(as_homogeneous(gt_meta["extrinsics"])),
             self.config.pose,
         )
+
+    def metric_eval_timing(self) -> dict[str, dict[str, float]]:
+        timing = {}
+        for scene, seconds in self._metric_eval_seconds_by_scene.items():
+            frames = self._metric_eval_frames_by_scene.get(scene)
+            if frames is None:
+                continue
+            timing[scene] = {"frames": int(frames), "seconds": float(seconds)}
+        return timing
 
     @property
     def _metric_dir(self) -> str:

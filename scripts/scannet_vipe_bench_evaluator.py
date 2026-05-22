@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from pathlib import Path
 from typing import Any
@@ -249,6 +250,76 @@ def _write_vipe_manifest(
     print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
 
+def _metric_dir(args: argparse.Namespace) -> Path:
+    return args.work_dir / "metric_results"
+
+
+def _write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=4) + "\n", encoding="utf-8")
+
+
+def _worker_timing_path(args: argparse.Namespace) -> Path:
+    return _metric_dir(args) / "timing_workers" / f"scannet_timing_worker_{args.gpu_id}.json"
+
+
+def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
+    frames = int(frames)
+    seconds = float(seconds)
+    fps = frames / seconds if seconds > 0.0 else 0.0
+    return {"frames": frames, "seconds": seconds, "fps": fps}
+
+
+def _write_worker_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
+    _write_json(_worker_timing_path(args), {"build": build_timing, "metric_eval": metric_timing})
+
+
+def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[dict, dict]:
+    build_timing = {}
+    metric_timing = {}
+    for gpu_id in range(total_gpus):
+        path = _metric_dir(args) / "timing_workers" / f"scannet_timing_worker_{gpu_id}.json"
+        with path.open(encoding="utf-8") as f:
+            worker_timing = json.load(f)
+        build_timing.update(worker_timing.get("build", {}))
+        metric_timing.update(worker_timing.get("metric_eval", {}))
+    return build_timing, metric_timing
+
+
+def _merge_scene_timing(base: dict, extra: dict) -> dict:
+    merged = dict(base)
+    for scene, entry in extra.items():
+        frames = int(entry["frames"])
+        seconds = float(entry["seconds"])
+        if scene in merged:
+            frames = int(merged[scene].get("frames", frames))
+            seconds += float(merged[scene].get("seconds", 0.0))
+        merged[scene] = _timing_entry(frames, seconds)
+    return merged
+
+
+def _mean_fps(scene_timing: dict) -> float:
+    fps_values = [float(entry["fps"]) for entry in scene_timing.values()]
+    if not fps_values:
+        return 0.0
+    return float(np.mean(fps_values).item())
+
+
+def _write_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> dict:
+    timing = {
+        "build": {
+            "mean_fps": _mean_fps(build_timing),
+            "scenes": build_timing,
+        },
+        "metric_eval": {
+            "mean_fps": _mean_fps(metric_timing),
+            "scenes": metric_timing,
+        },
+    }
+    _write_json(_metric_dir(args) / "scannet_timing.json", timing)
+    return timing
+
+
 def _load_evaluator(args: argparse.Namespace, eval_config: dict[str, Any]):
     return ScanNetEvaluator(
         work_dir=str(args.work_dir),
@@ -268,9 +339,9 @@ def _append_common_cli_args(cmd: list[str], args: argparse.Namespace, vipe_overr
     return cmd
 
 
-def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> bool:
+def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> tuple[dict, dict] | None:
     if args.print_only or os.environ.get(WORKER_ENV) == "1":
-        return False
+        return None
 
     cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_devices is not None and cuda_devices.strip():
@@ -281,7 +352,7 @@ def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> 
         gpu_list = [str(i) for i in range(torch.cuda.device_count())]
 
     if len(gpu_list) <= 1:
-        return False
+        return None
 
     base_cmd = _append_common_cli_args([sys.executable, os.path.abspath(__file__)], args, vipe_overrides)
 
@@ -301,7 +372,7 @@ def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> 
             raise SystemExit(process.returncode)
 
     print("[INFO] All ViPE workers completed")
-    return True
+    return _load_parallel_timing(args, len(gpu_list))
 
 
 def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
@@ -325,13 +396,18 @@ def prepare_vipe_benchmark_exports(
     args: argparse.Namespace,
     evaluator,
     vipe_overrides: list[str],
-) -> None:
+) -> tuple[dict, dict]:
+    build_timing = {}
+    metric_timing = {}
     for scene in _scenes_for_worker(args, evaluator):
+        start_scene = time.perf_counter()
         scene_overrides, frame_dir, vipe_output_dir = _prepare_vipe_overrides(args, vipe_overrides, scene)
         full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(
             args, evaluator, scene, frame_dir, scene_overrides
         )
+        start_build = time.perf_counter()
         run_vipe(scene_overrides, vipe_output_dir)
+        build_seconds = time.perf_counter() - start_build
         _write_vipe_manifest(
             args,
             evaluator,
@@ -343,10 +419,19 @@ def prepare_vipe_benchmark_exports(
             _artifact_name(frame_dir),
             scene_overrides,
         )
+        frames = len(frame_indices)
+        metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
+        build_timing[scene] = _timing_entry(frames, build_seconds)
+        metric_timing[scene] = _timing_entry(frames, metric_seconds)
+    return build_timing, metric_timing
 
 
 def _fmt(value):
     return "N/A" if value is None else f"{value:.4f}"
+
+
+def _fmt_fps(value):
+    return "N/A" if value is None else f"{float(value):.2f}"
 
 
 def _fmt_scale_summary(recon_metrics: dict) -> str:
@@ -374,6 +459,7 @@ def print_scannet_summary(metrics) -> None:
     pose_mean = _get_nested(metrics, "scannet_pose", "mean") or {}
     recon_metrics = _get_nested(metrics, "scannet_recon") or {}
     recon = recon_metrics.get("mean") or {}
+    timing = _get_nested(metrics, "scannet_timing") or {}
 
     auc3 = pose_mean.get("auc03")
     auc30 = pose_mean.get("auc30")
@@ -398,6 +484,13 @@ def print_scannet_summary(metrics) -> None:
     print(f"{'PSNR':<{col1}}{_fmt(recon.get('psnr')):<{col2}}")
     print(f"{'SSIM':<{col1}}{_fmt(recon.get('ssim')):<{col2}}")
 
+    print("\nFPS")
+    print("-" * (col1 + col2))
+    print(f"{'Stage':<{col1}}{'Frames/sec':<{col2}}")
+    print("-" * (col1 + col2))
+    print(f"{'Build Run':<{col1}}{_fmt_fps(_get_nested(timing, 'build', 'mean_fps')):<{col2}}")
+    print(f"{'Metric Eval':<{col1}}{_fmt_fps(_get_nested(timing, 'metric_eval', 'mean_fps')):<{col2}}")
+
 
 def main() -> None:
     eval_config = _load_eval_config()
@@ -413,15 +506,22 @@ def main() -> None:
         print_scannet_summary(metrics)
         return
 
-    if maybe_spawn_workers(args, vipe_overrides):
+    build_timing = maybe_spawn_workers(args, vipe_overrides)
+    if build_timing is not None:
+        build_scene_timing, metric_scene_timing = build_timing
         metrics = evaluator.eval()
+        metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
+        metrics["scannet_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
         print_scannet_summary(metrics)
         return
 
-    prepare_vipe_benchmark_exports(args, evaluator, vipe_overrides)
+    build_scene_timing, metric_scene_timing = prepare_vipe_benchmark_exports(args, evaluator, vipe_overrides)
     if is_worker:
+        _write_worker_timing(args, build_scene_timing, metric_scene_timing)
         return
     metrics = evaluator.eval()
+    metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
+    metrics["scannet_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
     print_scannet_summary(metrics)
 
 

@@ -1028,7 +1028,13 @@ So the saved reconstruction artifact is the sampled colored point cloud extracte
 pipeline.output.save_artifacts=true
 ```
 
-for each scene, then writes a local benchmark manifest pointing at the native ViPE artifacts:
+for each scene. ViPE artifacts for benchmark runs are written under:
+
+```text
+<work-dir>/vipe_outputs/<scene>
+```
+
+The adapter then writes a local benchmark manifest pointing at those native ViPE artifacts:
 
 ```text
 exports/vipe_manifest.json
@@ -1043,6 +1049,8 @@ pcd/<artifact_name>_tsdf.ply
 ```
 
 For reconstruction metrics, the evaluator computes the fixed SE3 transform that maps the first ViPE camera pose to the first matched ScanNet GT camera pose, applies that rigid transform to the TSDF PLY, caches the aligned PLY under the benchmark `eval_cache`, then computes geometry and render metrics in the ScanNet GT coordinate frame. It also reports a separate scale diagnostic: after this first-camera SE3 alignment, it solves the single best scalar for the matched camera-center deltas, but does not apply that scale to the evaluated point cloud.
+
+The printed summary reports the mean scale and the individual scene scales in parentheses, so per-scene scale spread stays visible.
 
 ## Object Glossary
 

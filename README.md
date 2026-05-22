@@ -59,4 +59,5 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
 ```
 
 The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
+For benchmark runs, `--work-dir` owns the outputs: ViPE artifacts are written under `<work-dir>/vipe_outputs/<scene>`, benchmark manifests/caches under `<work-dir>/model_results/...`, and metric JSONs under `<work-dir>/metric_results/...`.
 ScanNet-specific benchmark knobs live in `configs/eval_scannet_config.yaml`; dataset roots stay explicit CLI inputs via `--input-root` and `--raw-root`.
