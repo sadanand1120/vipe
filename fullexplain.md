@@ -21,9 +21,9 @@ export MKL_NUM_THREADS=16
 export CUDA_VISIBLE_DEVICES='2'
 
 python run.py \
+  --output-dir /robodata/smodak/repos/vipe/outputs/scene00 \
   streams.base_path=/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/color \
   streams.fps=30 \
-  pipeline.output.path=/robodata/smodak/repos/vipe/outputs/scene00 \
   pipeline.output.save_artifacts=true
 ```
 
@@ -66,7 +66,7 @@ Source files:
 
 | File | Role |
 | --- | --- |
-| `run.py` | Hydra entrypoint, logging setup, `FrameDir` construction, pipeline launch. |
+| `run.py` | Argparse `--output-dir`, Hydra config composition, logging setup, `FrameDir` construction, pipeline launch. |
 | `configs/default.yaml` | The remaining runtime config. |
 | `vipe/streams/base.py` | `FrameDir`, `SensorCamera`, `FrameData`, `FrameStream`. |
 | `vipe/pipeline.py` | External-camera initialization and optional OpenCV undistortion wrapper. |
@@ -75,13 +75,14 @@ Source files:
 
 ```python
 pipeline = VipePipeline(
-    slam=args.pipeline.slam,
-    output=args.pipeline.output,
+    slam=cfg.pipeline.slam,
+    output=cfg.pipeline.output,
+    output_dir=cli_args.output_dir,
 )
 
 frame_stream = FrameDir(
-    path=args.streams.base_path,
-    fps=args.streams.fps,
+    path=cfg.streams.base_path,
+    fps=cfg.streams.fps,
 )
 
 pipeline.run(frame_stream)
@@ -1033,13 +1034,15 @@ for each scene, then writes a local benchmark manifest pointing at the native Vi
 exports/vipe_manifest.json
 ```
 
+ScanNet-specific benchmark constants are centralized in `configs/eval_scannet_config.yaml`: dataset file patterns, pose AUC thresholds/chunking, geometry nearest-neighbor settings, render sampling/rasterization settings, image metric constants, and evaluator output names. Dataset roots are explicit CLI inputs via `--input-root` and `--raw-root`.
+
 The local ScanNet evaluator in `vipe/bench/scannet.py` consumes pose and GT metadata through that manifest for pose metrics. For reconstruction, there is one mode named `recon`: the evaluator uses the TSDF point cloud written by ViPE:
 
 ```text
 pcd/<artifact_name>_tsdf.ply
 ```
 
-For reconstruction metrics, the evaluator computes a RANSAC Umeyama Sim3 from ViPE camera centers to the matched ScanNet GT camera centers, applies that transform to the TSDF PLY, caches the aligned PLY under the benchmark `eval_cache`, then computes geometry and render metrics in the ScanNet GT coordinate frame.
+For reconstruction metrics, the evaluator computes the fixed SE3 transform that maps the first ViPE camera pose to the first matched ScanNet GT camera pose, applies that rigid transform to the TSDF PLY, caches the aligned PLY under the benchmark `eval_cache`, then computes geometry and render metrics in the ScanNet GT coordinate frame. It also reports a separate scale diagnostic: after this first-camera SE3 alignment, it solves the single best scalar for the matched camera-center deltas, but does not apply that scale to the evaluated point cloud.
 
 ## Object Glossary
 

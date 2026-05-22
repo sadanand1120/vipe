@@ -34,7 +34,6 @@ pipeline:
       dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
 
   output:
-    path: vipe_results/                  # Output directory for all saved artifacts.
     save_artifacts: false                # Save pose and TSDF point-cloud artifacts.
     pcd_max_points: 10000000             # Max saved TSDF PCD points.
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
@@ -42,10 +41,3 @@ pipeline:
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
     pcd_tsdf_num_voxels_per_block_edge: 16 # Number of voxels along each sparse TSDF block edge.
     pcd_tsdf_depth_sampling_stride: 4     # Sample every Nth depth pixel when opening TSDF voxel blocks.
-
-hydra:
-  output_subdir: null  # Do not create .hydra metadata directories.
-  job:
-    chdir: false       # Do not change working directory when Hydra launches.
-  run:
-    dir: .             # Keep Hydra run directory at current working directory.

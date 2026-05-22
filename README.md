@@ -30,9 +30,9 @@ Depth PNG values are interpreted as millimeters and converted to meters. Image n
 
 ```bash
 python run.py \
+  --output-dir /path/to/output \
   streams.base_path=/path/to/scene/color \
   streams.fps=30 \
-  pipeline.output.path=/path/to/output \
   pipeline.output.save_artifacts=true
 ```
 
@@ -55,8 +55,8 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   --work-dir ./workspace/evaluation_scannet_vipe_external_depth \
   --input-root /robodata/smodak/repos/ovo/data/input/ScanNet \
   --raw-root /robodata/smodak/datasets/scannet_v2/scans \
-  --max-frames -1 \
   streams.fps=30
 ```
 
-The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval Sim3-aligns the saved TSDF PLY to the ScanNet GT camera centers before computing geometry and render metrics.
+The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
+ScanNet-specific benchmark knobs live in `configs/eval_scannet_config.yaml`; dataset roots stay explicit CLI inputs via `--input-root` and `--raw-root`.

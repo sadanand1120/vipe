@@ -117,10 +117,10 @@ class OpenCVPinholeNormalizedFrameStream(FrameStream):
 
 
 class VipePipeline:
-    def __init__(self, slam: DictConfig, output: DictConfig) -> None:
+    def __init__(self, slam: DictConfig, output: DictConfig, output_dir: str | Path) -> None:
         self.slam_cfg = slam
         self.out_cfg = output
-        self.out_path = Path(self.out_cfg.path)
+        self.out_path = Path(output_dir)
         self.out_path.mkdir(exist_ok=True, parents=True)
 
     def _initialize(self, frame_stream: FrameStream) -> tuple[FrameStream, torch.Tensor]:

@@ -1,0 +1,48 @@
+seed: 42                                  # Seed Python/NumPy/Torch/Open3D RNGs for benchmark-side sampling.
+
+dataset:
+  color_relpath: color                     # Scene-relative RGB frame directory.
+  pose_relpath: pose                       # Scene-relative ScanNet GT pose directory.
+  color_glob: "*.jpg"                      # RGB frames used by ScanNet eval loading.
+  pose_suffix: ".txt"                      # GT pose filename suffix for each RGB frame stem.
+  vipe_image_extensions: [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"] # Extensions accepted in ViPE frame dirs.
+  intrinsic_relpath: intrinsic/intrinsic_color.txt # Scene-relative ScanNet color intrinsic file.
+  gt_mesh_suffix: _vh_clean_2.ply          # Preferred raw ScanNet GT mesh suffix.
+  gt_mesh_fallback_suffix: _vh_clean.ply   # Fallback raw ScanNet GT mesh suffix.
+
+pose:
+  device: cuda:0                           # Torch device for pose AUC computation.
+  auc_threshold_degrees: [30, 15, 5, 3]    # Pose AUC angular thresholds in degrees.
+  pair_chunk_size: 1000000                 # Relative camera-pair chunk size for pose eval.
+  angle_epsilon: 0.000000000000001         # Numerical floor for angular error computations.
+  invalid_error_value: 1000000.0           # Error assigned to invalid/NaN translation-angle cases.
+  quaternion_floor: 0.1                    # Quaternion conversion denominator floor.
+
+geometry:
+  nn_device: CUDA:0                        # Open3D tensor device for nearest-neighbor geometry metrics.
+  nn_chunk_size: 1000000                   # Query chunk size for Open3D nearest-neighbor search.
+  gt_aabb_padding_m: 0.1                   # Padding around GT mesh AABB before cropping predicted PCD.
+
+render:
+  device: cuda:0                           # Torch device for CUDA point-cloud rendering.
+  voxel_size_m: 0.001                      # Voxel downsample size before render metrics.
+  num_images: 800                          # Number of frames sampled for PSNR/SSIM; -1 uses all frames.
+  frame_sample_seed: 42                    # RNG seed for render-frame subsampling.
+  chunk_size: 1000000                      # Point chunk size for CUDA rendering.
+  radius_cap_px: 8                         # Maximum point splat radius in pixels.
+  near_plane_m: 0.0001                     # Ignore rendered points closer than this camera-space depth.
+  splat_radius_scale: 0.5                  # Converts projected voxel diameter into splat radius.
+  z_tie_epsilon: 0.000001                  # Z-buffer tie tolerance for assigning splat colors.
+
+image_metrics:
+  rgb_normalizer: 255.0                    # Converts uint8 RGB targets into [0,1] floats.
+  psnr_max_value: 1.0                      # Peak value used in PSNR.
+  ssim_k1: 0.01                            # SSIM luminance stabilization constant factor.
+  ssim_k2: 0.03                            # SSIM contrast stabilization constant factor.
+  ssim_window_size: 11                     # Gaussian window size for SSIM.
+  ssim_sigma: 1.5                          # Gaussian sigma for SSIM.
+  ssim_denominator_epsilon: 0.000000000001 # Numerical denominator floor for SSIM.
+
+outputs:
+  aligned_ply_filename: pcd_tsdf_first_se3_aligned.ply # Cached first-camera SE3-aligned TSDF PLY name.
+  reconstruction_method_name: pcd_tsdf_first_se3 # Metric key/name for the reconstructed TSDF PCD.
