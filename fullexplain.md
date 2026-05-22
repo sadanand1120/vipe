@@ -56,7 +56,7 @@ flowchart LR
 | Stage 2 | Once over all frames | Keyframe-only `GraphBuffer`, incrementally optimized by frontend BA. |
 | Stage 3 | Once over all keyframes | Same `GraphBuffer`, refined by a fresh global backend `FactorGraph`. |
 | Stage 4 | Once over all frames | One pose for every selected RGB frame. |
-| Stage 5 | Once over all frames | Native artifacts: pose, depth zip, intrinsics JSON, TSDF PCD. |
+| Stage 5 | Once over all frames | Native artifacts: pose NPZ and TSDF PCD. |
 
 ## Stage 1: Frame Stream, Camera, And Depth Inputs
 
@@ -325,7 +325,7 @@ cx -= crop_left
 cy -= crop_top
 ```
 
-`GraphBuffer` allocates fixed-size tensors:
+`GraphBuffer` allocates fixed-size tensors. Slot `k` means "the `k`-th buffered SLAM frame/keyframe", not necessarily raw input frame `k`; the original selected-frame index is stored in `tstamp[k]`.
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
@@ -342,6 +342,23 @@ cy -= crop_top
 | `inps` | `(buffer,128,H/8,W/8)` float16 | DROID context input. |
 
 Initial poses are identity world-to-camera transforms. Initial disparities are `pipeline.slam.init_disp`, default `1.0`.
+
+The important ownership split is:
+
+| Object | What it owns | What it does not own |
+| --- | --- | --- |
+| `GraphBuffer` | Persistent node/state table: poses, disparities, images, DROID features, timestamps, intrinsics, sensor-depth anchors. | The active pairwise edge list. |
+| `FactorGraph` | Active directed edges `(ii,jj)` plus learned per-edge state: correlation/update state, target coordinates, residual weights, factor ages. | Pose/disparity variables. |
+| `GraphBuffer.bundle_adjustment(...)` | Builds solver terms and calls `Solver.run_inplace(...)`. | Long-lived graph construction policy. |
+
+So:
+
+```text
+GraphBuffer ~= nodes/state variables
+FactorGraph ~= edges/factors plus DROID learned edge machinery
+```
+
+`FactorGraph` prepares learned targets and weights, then calls `GraphBuffer.bundle_adjustment(...)`, which is where `GraphBuffer.poses` and `GraphBuffer.disps` actually change.
 
 ### Per-Frame Pass-1 Loop
 
@@ -464,10 +481,44 @@ residual = [-0.6, 0.2]
 
 BA updates poses and disparities to reduce many such residuals over all active factors and all low-res pixels.
 
+There are two levels of "factor" in this code:
+
+| Level | Meaning |
+| --- | --- |
+| Graph-construction factors | Which directed frame pairs `(i,j)` become edges in a `FactorGraph`. |
+| Solver factors | The mathematical residual terms created inside `GraphBuffer.bundle_adjustment(...)`. |
+
+When `FactorGraph.add_factors(ii,jj)` adds directed edges, it removes duplicates, optionally appends incremental `CorrBlock` state, initializes `target` from the current geometric projection, initializes `weight` to zero, appends DROID recurrent state, and stores `age=0`. The initialized target is only a starting point; the next DROID update turns it into a learned target.
+
+The graph-construction methods used here are:
+
+| Method | Current use | Edge rule |
+| --- | --- | --- |
+| `add_neighborhood_factors(t0,t1,r=1)` | Frontend warmup. | Add all directed edges with `0 < abs(i-j) <= 1` inside `[t0,t1)`. |
+| `add_proximity_factors(...)` | Frontend incremental updates and backend global BA. | Use current poses/disparities to score view overlap, always add local bidirectional edges, then add low-distance pairs after thresholding and NMS. |
+
+Solver-level terms are:
+
+| Term | Residual | Variables touched |
+| --- | --- | --- |
+| `DenseDepthFlowTerm` | Project each source low-res pixel through `pose_i`, `dense_disp_i`, and `pose_j`; compare to the DROID target coordinate. | `pose_i`, `pose_j`, `dense_disp_i`. |
+| `DispSensRegularizationTerm` | Keep optimized disparity close to `GraphBuffer.disps_sens`, weighted by `pipeline.slam.ba.dense_disp_alpha * disps_sens_weight`. | `dense_disp` only. |
+
+`DispSensRegularizationTerm` is skipped for `motion_only=True` and is added only for frames with at least one nonzero sensor-depth anchor. Within those frames, invalid external depth or undistort-invalid pixels contribute zero because `disps_sens_weight` is zero there.
+
+`frontend.run()` is called after every pass-1 frame, but it mutates the graph only in two cases:
+
+```text
+1. once, when GraphBuffer.n_frames == warmup
+2. later, when a newly accepted keyframe makes GraphBuffer.n_frames > frontend.t1
+```
+
 Frontend warmup starts once `buffer.n_frames == pipeline.slam.warmup`:
 
 ```python
+frontend.t1 = buffer.n_frames
 frontend.graph.add_neighborhood_factors(0, warmup, r=1)
+
 for _ in range(frontend_init_updates):
     frontend.graph.update(t0=1, itrs=frontend_ba_iters)
 ```
@@ -475,34 +526,73 @@ for _ in range(frontend_init_updates):
 After warmup, whenever a new keyframe arrives:
 
 ```python
-frontend.graph.rm_factors(frontend.graph.age > frontend_max_age)
+frontend.t1 += 1
+
+if frontend.graph.corr is not None:
+    frontend.graph.rm_factors(frontend.graph.age > frontend_max_age)
+
 frontend.graph.add_proximity_factors(...)
 
 for _ in range(frontend_update_iters1):
     frontend.graph.update(itrs=frontend_ba_iters)
 
-if second_newest_keyframe_is_too_close:
-    frontend.graph.rm_second_newest_keyframe(...)
+d = buffer.frame_distance_dense_disp(
+    torch.tensor([frontend.t1 - 3]),
+    torch.tensor([frontend.t1 - 2]),
+    beta=beta,
+    bidirectional=True,
+)
+
+if d.max() < keyframe_thresh:
+    frontend.graph.rm_second_newest_keyframe(frontend.t1 - 2)
+    frontend.t1 -= 1
 else:
     for _ in range(frontend_update_iters2):
         frontend.graph.update(itrs=frontend_ba_iters)
 ```
 
+When `rm_second_newest_keyframe(ix)` prunes a keyframe, `GraphBuffer.remove_second_newest(ix)` overwrites the second-newest slot with the newest slot and decrements `n_frames`. `FactorGraph.rm_second_newest_keyframe(ix)` also removes edges touching the deleted slot and shifts later edge indices down by one, so the edge list stays consistent with the compacted buffer.
+
 Frontend config values are all visible in `configs/default.yaml`:
 
-| Config | Role |
-| --- | --- |
-| `warmup` | Number of keyframes before frontend initialization. |
-| `frontend_window` | Recent keyframe window considered for proximity factors. |
-| `frontend_radius` | Forced local edge radius. |
-| `frontend_nms` | Suppression radius for proximity edge selection. |
-| `frontend_thresh` | Distance threshold for proximity edges. |
-| `frontend_max_factors` | Factor budget for the incremental frontend graph. |
-| `frontend_max_age` | Active factors older than this many updates are removed. |
-| `frontend_init_updates` | Outer `graph.update` calls during warmup. |
-| `frontend_update_iters1` | Outer updates after adding a keyframe before pruning. |
-| `frontend_update_iters2` | Extra outer updates if the candidate keyframe is kept. |
-| `frontend_ba_iters` | Inner BA solver iterations per outer graph update. |
+| Config | Default | Role |
+| --- | ---: | --- |
+| `warmup` | `8` | Number of keyframes before frontend initialization. |
+| `keyframe_thresh` | `4.0` | Threshold for pruning the second-newest keyframe as redundant. |
+| `frontend_window` | `25` | Recent keyframe window considered for proximity factors. |
+| `frontend_radius` | `2` | Forced local edge radius. |
+| `frontend_nms` | `1` | Suppression radius for proximity edge selection. |
+| `frontend_thresh` | `16.0` | Distance threshold for proximity edges. |
+| `frontend_max_factors` | `48` | Factor budget for the incremental frontend graph. |
+| `frontend_max_age` | `25` | Active factors older than this many graph updates are removed. |
+| `frontend_init_updates` | `8` | Outer `graph.update` calls during warmup. |
+| `frontend_update_iters1` | `4` | Outer updates after adding a keyframe before pruning. |
+| `frontend_update_iters2` | `2` | Extra outer updates if the candidate keyframe is kept. |
+| `frontend_ba_iters` | `3` | Inner BA solver iterations per outer graph update. |
+
+With the default values, frontend warmup performs:
+
+```text
+8 outer graph.update calls
+1 DROID target/weight refresh per outer call
+3 inner BA solver iterations per outer call
+24 total inner BA solver iterations
+```
+
+For each later accepted keyframe that is kept:
+
+```text
+4 + 2 = 6 outer graph.update calls
+18 total inner BA solver iterations
+```
+
+For each later accepted keyframe that is pruned:
+
+```text
+4 outer graph.update calls
+12 total inner BA solver iterations
+then the second-newest keyframe is removed
+```
 
 ### One FactorGraph Update
 
@@ -521,6 +611,31 @@ age += 1
 ```
 
 The edge list `(ii,jj)` is fixed during this `graph.update` call. `target`, `weight`, `damping`, and `f_net` are refreshed once before the inner BA iterations. During the inner BA iterations, the solver updates `GraphBuffer.poses` and `GraphBuffer.disps`.
+
+Frontend state changes by cadence:
+
+| Cadence | State |
+| --- | --- |
+| Fixed during frontend lifetime | `GraphBuffer` object identity, `frontend.graph` object identity, DROID network weights, shared intrinsics. |
+| When a keyframe is added | `GraphBuffer.n_frames`, `tstamp`, `images`, `fmaps`, `nets`, `inps`, `disps_sens`, `disps_sens_weight`. |
+| When factors are added or removed | `FactorGraph.ii`, `FactorGraph.jj`, `FactorGraph.age`, incremental correlation/context state. |
+| Once per outer `graph.update` | `FactorGraph.target`, `FactorGraph.weight`, `FactorGraph.damping`, `FactorGraph.f_net`. |
+| During inner BA solver iterations | `GraphBuffer.poses`, `GraphBuffer.disps`. |
+
+Exact frontend BA call path:
+
+```text
+SLAMSystem.run pass 1
+-> keyframe accepted
+-> GraphBuffer slot filled
+-> GraphBuffer.disps_sens filled from external sensor depth
+-> SLAMFrontend.run
+-> frontend.graph.add_neighborhood_factors or add_proximity_factors
+-> frontend.graph.update
+-> GraphBuffer.bundle_adjustment
+-> Solver.run_inplace
+-> GraphBuffer.poses/disps mutated
+```
 
 ### Bundle Adjustment Objective
 
@@ -641,6 +756,61 @@ for _ in range(backend_iters):
 
 The backend edge list is built once. Across each backend outer step, DROID targets/weights are refreshed, then BA runs `backend_ba_iters` inner solver iterations. Backend updates the same `GraphBuffer.poses` and `GraphBuffer.disps` that frontend produced.
 
+If the backend graph has no factors, which can happen when there is only one keyframe, backend does not call `update_batch`. Instead it copies valid sensor-depth anchor disparities into `GraphBuffer.disps[0]` and leaves the rest of the initialized disparity values unchanged.
+
+The backend graph is not a continuation of `frontend.graph`. It is a new temporary `FactorGraph` object that points at the same `GraphBuffer`, optimizes that shared state, then is discarded.
+
+Backend config values are all visible in `configs/default.yaml`:
+
+| Config | Default | Role |
+| --- | ---: | --- |
+| `backend_thresh` | `22.0` | Distance threshold for global backend proximity edges. |
+| `backend_radius` | `2` | Forced local edge radius. |
+| `backend_nms` | `3` | Suppression radius for backend proximity edge selection. |
+| `backend_iters` | `31` | Outer backend `update_batch` steps. |
+| `backend_ba_iters` | `8` | Inner BA solver iterations per backend outer step. |
+| `backend_max_factors_per_keyframe` | `16` | Factor budget multiplier, so max factors is `16 * n_keyframes`. |
+| `backend_batch_size` | `8` | Source-keyframe-index batch size for DROID correlation/update. |
+| `beta` | `0.3` | Translation/rotation blend for graph proximity scoring. |
+
+With the default values, backend performs:
+
+```text
+31 outer update_batch steps
+1 full DROID target/weight refresh over all backend edges per outer step
+8 inner BA solver iterations per outer step
+248 total inner BA solver iterations
+```
+
+Backend state changes by cadence:
+
+| Cadence | State |
+| --- | --- |
+| Fixed for the backend run | Backend `FactorGraph.ii/jj` edge list, `GraphBuffer` object identity, DROID network weights, shared intrinsics. |
+| Once per backend outer step | `FactorGraph.target`, `FactorGraph.weight`, `FactorGraph.damping`, `FactorGraph.f_net`. |
+| During inner BA solver iterations | `GraphBuffer.poses`, `GraphBuffer.disps`. |
+| Not changed by backend | `GraphBuffer.n_frames`, `images`, `fmaps`, `nets`, `inps`, `disps_sens`, `disps_sens_weight`, backend edge set. |
+
+Exact backend BA call path:
+
+```text
+SLAMSystem.run after pass 1
+-> SLAMBackend.run
+-> local FactorGraph created
+-> local graph.add_proximity_factors
+-> local graph.update_batch
+-> GraphBuffer.bundle_adjustment
+-> Solver.run_inplace
+-> same GraphBuffer.poses/disps mutated
+```
+
+One useful mental model:
+
+```text
+Outer graph update step = refresh learned targets/weights using DROID, then call BA.
+Inner BA solver iterations = optimize GraphBuffer.poses/disps against fixed targets/weights.
+```
+
 ## Stage 4: Pose Infill
 
 Pass 1 and backend optimize only keyframes. Stage 4 produces one pose for every selected RGB frame.
@@ -724,11 +894,9 @@ flowchart TD
     B --> C[attach final c2w pose]
     C --> D[attach recovered original-resolution intrinsics]
     D --> E[metric_depth = valid sensor_depth]
-    E --> F[write depth zip entry]
-    E --> G[append pose]
-    E --> H[write intrinsics once]
-    E --> I[integrate TSDF frame]
-    I --> J[extract native TSDF surface and write final PLY]
+    E --> F[append pose]
+    E --> G[integrate TSDF frame]
+    G --> H[extract native TSDF surface and write final PLY]
 ```
 
 `VipePipeline._final_frames` re-reads frames lazily:
@@ -748,7 +916,7 @@ for frame_idx in range(len(frame_stream)):
     yield frame
 ```
 
-This means final depth artifacts and PCDs are built from the provided sensor depth, after any OpenCV camera normalization and invalid-mask application.
+This means the TSDF PCD is built from the provided sensor depth, after any OpenCV camera normalization and invalid-mask application.
 
 ### Saved Artifacts
 
@@ -757,8 +925,6 @@ This means final depth artifacts and PCDs are built from the provided sensor dep
 | Artifact | Path | Contents |
 | --- | --- | --- |
 | Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: selected frame indices. |
-| Depth ZIP | `depth/<artifact_name>.zip` | One float16 NumPy `.npy` depth per selected frame. |
-| Intrinsics JSON | `intrinsics/<artifact_name>.json` | Shared downstream pinhole intrinsics at output depth/RGB resolution. |
 | TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points sampled from the native TSDF zero-crossing surface. |
 
 `artifact_name` is the frame directory name, for example `color`.

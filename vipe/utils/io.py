@@ -13,12 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import logging
-import zipfile
 
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -41,16 +38,8 @@ class ArtifactPath:
         return self.base_path / "pose" / f"{self.artifact_name}.npz"
 
     @property
-    def depth_path(self) -> Path:
-        return self.base_path / "depth" / f"{self.artifact_name}.zip"
-
-    @property
     def tsdf_pcd_path(self) -> Path:
         return self.base_path / "pcd" / f"{self.artifact_name}_tsdf.ply"
-
-    @property
-    def intrinsics_path(self) -> Path:
-        return self.base_path / "intrinsics" / f"{self.artifact_name}.json"
 
 
 def _image_valid_numpy(frame_data: FrameData, shape: tuple[int, int]) -> np.ndarray | None:
@@ -101,42 +90,6 @@ def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
     write_binary_ply(out_path.tsdf_pcd_path, points, colors)
 
 
-def _write_intrinsics_json(out_path: ArtifactPath, intrinsics: np.ndarray, frame_size: tuple[int, int]) -> None:
-    height, width = frame_size
-    fx, fy, cx, cy = intrinsics[:4]
-    out_path.intrinsics_path.parent.mkdir(exist_ok=True, parents=True)
-    out_path.intrinsics_path.write_text(
-        json.dumps(
-            {
-                "camera_model": "pinhole",
-                "width": int(width),
-                "height": int(height),
-                "params": [float(fx), float(fy), float(cx), float(cy)],
-                "fx": float(fx),
-                "fy": float(fy),
-                "cx": float(cx),
-                "cy": float(cy),
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
-def _write_depth_frame(depth_zip: zipfile.ZipFile, frame_idx: int, frame_data: FrameData) -> None:
-    if frame_data.metric_depth is None:
-        raise ValueError(f"Frame {frame_idx} is missing metric depth")
-
-    depth = frame_data.metric_depth.detach().cpu().numpy().astype(np.float16)
-    image_valid = _image_valid_numpy(frame_data, depth.shape)
-    if image_valid is not None:
-        depth[~image_valid] = np.float16(0.0)
-    buffer = BytesIO()
-    np.save(buffer, depth, allow_pickle=False)
-    depth_zip.writestr(f"{frame_idx:06d}.npy", buffer.getvalue())
-
-
 def save_artifacts(
     out_path: ArtifactPath,
     final_frames,
@@ -153,8 +106,6 @@ def save_artifacts(
     """
 
     pose_list = []
-    intrinsics = None
-    intrinsics_frame_size = None
     tsdf_volume = _make_tsdf_volume(
         pcd_tsdf_voxel_edge_m,
         pcd_tsdf_sdf_trunc_m,
@@ -162,33 +113,22 @@ def save_artifacts(
         pcd_tsdf_depth_sampling_stride,
     )
 
-    out_path.depth_path.parent.mkdir(exist_ok=True, parents=True)
-    with zipfile.ZipFile(out_path.depth_path, "w", compression=zipfile.ZIP_STORED) as depth_zip:
-        for frame_idx, frame_data in pbar(
-            enumerate(final_frames),
-            total=n_frames,
-            desc="Saving artifacts",
-        ):
-            assert isinstance(frame_data, FrameData)
-            _write_depth_frame(depth_zip, frame_idx, frame_data)
+    for frame_idx, frame_data in pbar(
+        enumerate(final_frames),
+        total=n_frames,
+        desc="Saving artifacts",
+    ):
+        assert isinstance(frame_data, FrameData)
 
-            if frame_data.pose is not None:
-                pose_list.append((frame_idx, frame_data.pose.matrix().cpu().numpy()))
+        if frame_data.pose is not None:
+            pose_list.append((frame_idx, frame_data.pose.matrix().cpu().numpy()))
 
-            if intrinsics is None and frame_data.intrinsics is not None:
-                intrinsics = frame_data.intrinsics.cpu().numpy()
-                intrinsics_frame_size = frame_data.size()
-
-            _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc_m)
+        _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc_m)
 
     if len(pose_list) > 0:
         pose_data = np.stack([pose for _, pose in pose_list], axis=0)
         pose_inds = np.array([frame_idx for frame_idx, _ in pose_list])
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
         np.savez(out_path.pose_path, data=pose_data, inds=pose_inds)
-
-    if intrinsics is not None:
-        assert intrinsics_frame_size is not None
-        _write_intrinsics_json(out_path, intrinsics, intrinsics_frame_size)
 
     _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)

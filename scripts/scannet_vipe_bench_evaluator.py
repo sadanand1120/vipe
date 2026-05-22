@@ -229,10 +229,8 @@ def _write_vipe_manifest(
     print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={len(frame_indices)}", flush=True)
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
-    depth_path = vipe_output_dir / "depth" / f"{artifact_name}.zip"
-    intrinsics_path = vipe_output_dir / "intrinsics" / f"{artifact_name}.json"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
-    required_artifacts = [pose_path, depth_path, intrinsics_path]
+    required_artifacts = [pose_path]
     if "recon" in args.modes:
         required_artifacts.append(tsdf_pcd_path)
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
@@ -246,8 +244,6 @@ def _write_vipe_manifest(
         "artifact_name": artifact_name,
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
-        "depth_path": str(depth_path.resolve()),
-        "intrinsics_path": str(intrinsics_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
         "output": {
             "pcd_max_points": int(cfg.pipeline.output.pcd_max_points),

@@ -1,6 +1,6 @@
 # ViPE: External-Depth Frame-Directory Fork
 
-This fork keeps one supported runtime path: a single RGB frame directory with external RGB/color intrinsics and external sensor depth. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided depth as the dense depth source, and writes pose/depth/intrinsics plus a native TSDF point-cloud export.
+This fork keeps one supported runtime path: a single RGB frame directory with external RGB/color intrinsics and external sensor depth. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided depth as the dense depth source, and writes pose plus native TSDF point-cloud artifacts.
 
 ## Installation
 
@@ -45,8 +45,6 @@ Useful output knobs:
 Saved artifacts:
 
 - `pose/color.npz`: camera-to-world pose per selected frame.
-- `depth/color.zip`: per-frame sensor depth after any camera normalization, as float16 NumPy `.npy` entries.
-- `intrinsics/color.json`: one shared original-resolution downstream pinhole intrinsics record.
 - `pcd/color_tsdf.ply`: native TSDF-fused sampled point cloud.
 
 ## ScanNet Benchmark
