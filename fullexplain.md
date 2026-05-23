@@ -186,34 +186,6 @@ The extractor always overwrites the output directory, exports raw audit data, sy
 
 Depth ROS topics are expected to be `uint16` millimeters. Float depth topics are converted to millimeters before writing. If `CameraInfo` contains nonzero distortion coefficients, RGB and depth are rectified at extraction time and the output pinhole projection matrix is written.
 
-### DepthCaptureLab MCAP Extraction
-
-Command:
-
-```bash
-TMPDIR=data/depthcapture_rosbags/processed python3 scripts/data_extract/depthcapture_to_vipe.py data/depthcapture_rosbags/raw/Balanced.zip --output-dir data/depthcapture_rosbags/processed/Balanced
-```
-
-The extractor accepts a DepthCaptureLab `.zip`, a session directory, or a direct `recording.mcap`. For zip input it extracts into a Python temporary directory and deletes those temporary files before exiting.
-
-Default topics:
-
-| Topic | Meaning |
-| --- | --- |
-| `/camera/color/image/compressed` | JPEG `sensor_msgs/msg/CompressedImage`. |
-| `/camera/depth/image_rect` | `32FC1` depth image in meters. |
-| `/camera/color/camera_info` | Rectified pinhole color camera info. |
-| `/camera/depth/camera_info` | Rectified pinhole depth camera info. |
-
-DepthCaptureLab writes depth in meters, not millimeters. The extractor decodes the float depth, maps it from the depth intrinsic grid into the color intrinsic grid assuming identity extrinsics, then writes canonical `uint16` millimeter PNG depth:
-
-```python
-aligned_m = cv2.remap(depth_m, map_x, map_y, interpolation=cv2.INTER_NEAREST)
-depth_mm = round(aligned_m * 1000).clip(0, 65535).astype(uint16)
-```
-
-It also computes synchronized frame FPS from color timestamps and stores that rounded FPS in `metadata.json`.
-
 ## Stage 1: Frame Stream, Camera, And Depth Inputs
 
 ### Runtime Construction
