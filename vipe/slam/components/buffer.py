@@ -23,7 +23,6 @@ import logging
 import torch
 
 from einops import rearrange
-from omegaconf.dictconfig import DictConfig
 
 from vipe.ext.lietorch.groups import SE3
 from vipe.streams.base import FrameData
@@ -45,7 +44,7 @@ class GraphBuffer:
         width: int,
         buffer_size: int,
         init_disp: float,
-        ba_config: DictConfig,
+        ba_config,
         camera_type: CameraType,
         device: torch.device = torch.device("cuda"),
     ):

@@ -23,8 +23,8 @@ disable_progress_bar: bool = False
 
 def configure_logging() -> logging.Logger:
     """
-    Configure ViPE logging. This owns every logger under ``vipe.*`` so Hydra
-    entrypoints and direct script entrypoints emit the same messages.
+    Configure ViPE logging. This owns every logger under ``vipe.*`` so script
+    entrypoints emit consistent messages.
     """
     logger = logging.getLogger("vipe")
     logger.handlers.clear()

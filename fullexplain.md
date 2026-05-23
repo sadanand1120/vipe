@@ -1,77 +1,247 @@
 # Full Computation Walkthrough For The Current ViPE Run
 
-This document describes the supported ViPE runtime path:
+This document describes the current supported ViPE pipeline after the canonical RGB-D refactor:
 
 ```text
-one RGB frame directory
-+ sibling external sensor depth directory
-+ sibling external RGB/color intrinsics file
--> ViPE SLAM poses
--> sensor-depth artifacts and point clouds
+raw dataset export
+-> canonical ViPE RGB-D scene
+-> lazy FrameDir stream
+-> DROID/ViPE SLAM with external sensor-depth anchors
+-> full camera trajectory
+-> pose NPZ and native TSDF point cloud
+-> optional ScanNet benchmark metrics
 ```
 
-Intrinsics and depth are input data.
+The important design rule is now simple: dataset-specific mess is handled before `run.py`. The runtime does not inspect raw ScanNet folders, raw rosbags, loose JPG sequences, TXT intrinsics, Hydra stream overrides, or distorted camera models. If data reaches `run.py` or the benchmark, it must already be in the canonical ViPE scene format.
 
 Example standalone command:
 
 ```bash
-export NUMEXPR_MAX_THREADS=16
-export OMP_NUM_THREADS=16
-export MKL_NUM_THREADS=16
-export CUDA_VISIBLE_DEVICES='2'
-
-python run.py \
-  --output-dir /robodata/smodak/repos/vipe/outputs/scene00 \
-  streams.base_path=/robodata/smodak/repos/ovo/data/input/ScanNet/scene0000_00/color \
-  streams.fps=30 \
-  pipeline.output.save_artifacts=true
+python3 run.py --input-dir data/scannet/scene0000_00 --output-dir outputs/scene00
 ```
 
 The required input layout is:
 
 ```text
-<scene>/color/<frame_id>.jpg|png
-<scene>/depth/<frame_id>.png
-<scene>/intrinsic/intrinsic_color.json  # preferred
-<scene>/intrinsic/intrinsic_color.txt   # fallback
+<scene>/
+  metadata.json
+  color/
+    000000.png
+    000001.png
+  depth/
+    000000.png
+    000001.png
+  intrinsic/
+    intrinsic_color.json
+  pose/                    # required only for ScanNet benchmark GT
+    000000.txt
+    000001.txt
 ```
 
-Depth PNG values are interpreted as millimeters and converted to meters.
+Depth PNG values are `uint16` millimeters on disk and are converted to float meters in memory. Intrinsics are undistorted pinhole RGB/color intrinsics.
 
 ## High-Level Flow
 
-The runtime is easiest to understand as five one-time handoff stages. A later stage does not loop back and update an earlier stage.
+The runtime is easiest to understand as one extraction contract followed by five one-way computation stages. A later stage does not loop back and mutate an earlier stage.
 
 ```mermaid
 flowchart LR
-    S1[Stage 1: frame stream, external camera, sensor depth] -->|pinhole frame stream plus shared intrinsics| S2[Stage 2: SLAM pass 1 frontend loop]
-    S2 -->|GraphBuffer with keyframe poses, features, disparities, sensor-depth anchors| S3[Stage 3: backend global BA over keyframes]
+    S0[Stage 0: extract raw source into canonical scene] --> S1[Stage 1: FrameDir stream, camera, sensor depth]
+    S1 -->|pinhole frame stream plus shared intrinsics| S2[Stage 2: SLAM pass 1 frontend loop]
+    S2 -->|GraphBuffer with keyframes, poses, features, disparities, sensor-depth anchors| S3[Stage 3: backend global BA over keyframes]
     S3 -->|refined keyframe state in same GraphBuffer| S4[Stage 4: SLAM pass 2 pose infill]
     S4 -->|SLAMOutput: full trajectory, recovered intrinsics, keyframe indices| S5[Stage 5: replay sensor depth and save outputs]
 ```
 
 | Stage | Loop grain | Main output |
 | --- | --- | --- |
-| Stage 1 | Mostly once, frames are still lazy | `FrameStream` that yields RGB plus sensor depth, and one shared pinhole intrinsics tensor. |
+| Stage 0 | Once per raw dataset/session | Canonical scene directory with metadata, color, depth, intrinsics, and optional GT poses. |
+| Stage 1 | Mostly once; frames remain lazy | `FrameStream` that yields RGB plus sensor depth, and one shared pinhole intrinsics tensor. |
 | Stage 2 | Once over all frames | Keyframe-only `GraphBuffer`, incrementally optimized by frontend BA. |
 | Stage 3 | Once over all keyframes | Same `GraphBuffer`, refined by a fresh global backend `FactorGraph`. |
-| Stage 4 | Once over all frames | One pose for every selected RGB frame. |
+| Stage 4 | Once over all frames | One pose for every canonical frame. |
 | Stage 5 | Once over all frames | Native artifacts: pose NPZ and TSDF PCD. |
+
+## Stage 0: Canonical Scene Extraction
+
+Runtime accepts exactly one input representation. Raw datasets are converted into this representation by scripts in `scripts/data_extract/`.
+
+### Canonical Metadata
+
+`metadata.json` is the source of truth for frame order. Runtime does not glob and sort files to infer order, so names like `1.png` versus `10.png` are no longer a runtime risk.
+
+Minimal metadata shape:
+
+```json
+{
+  "format": "vipe_rgbd_v1",
+  "name": "scene0000_00",
+  "fps": 30.0,
+  "width": 1296,
+  "height": 968,
+  "color": {"dir": "color", "encoding": "rgb8_png"},
+  "depth": {"dir": "depth", "encoding": "uint16_png", "unit": "millimeter"},
+  "intrinsics": "intrinsic/intrinsic_color.json",
+  "frames": [
+    {
+      "seq": 0,
+      "stem": "000000",
+      "color_file": "color/000000.png",
+      "depth_file": "depth/000000.png",
+      "pose_file": "pose/000000.txt"
+    }
+  ]
+}
+```
+
+Runtime-required fields:
+
+| Field | Requirement |
+| --- | --- |
+| `format` | Must be `vipe_rgbd_v1`. |
+| `fps` | Scene FPS. There is no `streams.fps` runtime override. |
+| `width`, `height` | Must match the decoded RGB frame size. |
+| `frames[*].color_file` | Relative path to an RGB/color PNG frame. |
+| `frames[*].depth_file` | Relative path to a same-resolution `uint16` depth PNG. |
+| `intrinsic/intrinsic_color.json` | Undistorted pinhole RGB intrinsics. |
+
+ScanNet benchmark additionally requires:
+
+| Field | Requirement |
+| --- | --- |
+| `frames[*].pose_file` | Relative path to a 4x4 camera-to-world GT pose text file. |
+| `--raw-root/<scene>/<scene>_vh_clean_2.ply` | Preferred GT mesh; `<scene>_vh_clean.ply` is fallback. |
+
+### Intrinsics Contract
+
+`intrinsic/intrinsic_color.json` has format `vipe_pinhole_intrinsics_v1`:
+
+```json
+{
+  "format": "vipe_pinhole_intrinsics_v1",
+  "camera_model": "pinhole",
+  "width": 1296,
+  "height": 968,
+  "fx": 1170.18798828125,
+  "fy": 1170.18798828125,
+  "cx": 647.75,
+  "cy": 483.75
+}
+```
+
+The runtime tensor is always:
+
+```python
+intrinsics = torch.tensor([fx, fy, cx, cy], dtype=torch.float32, device="cuda")
+```
+
+There is no runtime OpenCV undistortion wrapper anymore. If the source camera is distorted, the extractor must rectify RGB/depth and write the rectified pinhole intrinsics.
+
+### ScanNet Extraction
+
+Command:
+
+```bash
+python3 scripts/data_extract/scannet_to_vipe.py --scans-root /robodata/smodak/datasets/scannet_v2/scans --output-root data/scannet --scenes scene0000_00 scene0011_00 scene0378_00 --frame-skip 1
+```
+
+The extractor reads exactly one `.sens` file from each raw ScanNet scene. It loads the `.sens` header, checks that `depth_shift == 1000.0`, decodes selected frames, and writes a canonical scene under `--output-root/<scene>`.
+
+| Artifact | Details |
+| --- | --- |
+| `color/*.png` | Decoded `.sens` color frames, standard PNG, color resolution. |
+| `depth/*.png` | Decoded `.sens` `uint16` depth, millimeters, nearest-resized to color size if needed. |
+| `pose/*.txt` | 4x4 camera-to-world matrix from the `.sens` frame. |
+| `intrinsic/intrinsic_color.json` | Pinhole color intrinsics from `.sens` `intrinsic_color[:3,:3]`. |
+| `metadata.json` | `fps = source_fps / frame_skip`, frame records, source frame ids, timestamps, source provenance. |
+
+`frame_skip` changes what frames are exported and lowers metadata FPS accordingly. For example, `--fps 30 --frame-skip 4` writes every fourth frame and records `7.5` FPS.
+
+### Kinect Rosbag MCAP Extraction
+
+Command:
+
+```bash
+python3 scripts/data_extract/rosbag_to_vipe.py data/kinect_rosbags/raw/distilled_bag2/distilled_bag2_0.mcap --output-dir data/kinect_rosbags/processed/distilled_bag2
+```
+
+Default topics:
+
+| Topic | Meaning |
+| --- | --- |
+| `/rgb/image_raw` | RGB/color image. |
+| `/depth_to_rgb/image_raw` | Depth already projected into RGB frame. |
+| `/rgb/camera_info` | RGB camera calibration. |
+
+The extractor always overwrites the output directory, exports raw audit data, syncs RGB/depth, and writes canonical runtime data.
+
+| Artifact | Details |
+| --- | --- |
+| `raw/color/*.png`, `raw/depth/*.png` | Raw topic dumps for audit/debug. |
+| `raw/color/meta.json`, `raw/depth/meta.json` | Raw timestamps, encodings, dimensions, count, rounded FPS. |
+| `color/*.png`, `depth/*.png` | Synced canonical RGB-D stream. |
+| `sync_meta.json` | Color/depth pairing, max sync delta, synced FPS. |
+| `intrinsic/intrinsic_color.json` | Pinhole RGB intrinsics from `CameraInfo`; rectified if needed. |
+| `metadata.json` | Canonical runtime metadata. |
+
+Depth ROS topics are expected to be `uint16` millimeters. Float depth topics are converted to millimeters before writing. If `CameraInfo` contains nonzero distortion coefficients, RGB and depth are rectified at extraction time and the output pinhole projection matrix is written.
+
+### DepthCaptureLab MCAP Extraction
+
+Command:
+
+```bash
+TMPDIR=data/depthcapture_rosbags/processed python3 scripts/data_extract/depthcapture_to_vipe.py data/depthcapture_rosbags/raw/Balanced.zip --output-dir data/depthcapture_rosbags/processed/Balanced
+```
+
+The extractor accepts a DepthCaptureLab `.zip`, a session directory, or a direct `recording.mcap`. For zip input it extracts into a Python temporary directory and deletes those temporary files before exiting.
+
+Default topics:
+
+| Topic | Meaning |
+| --- | --- |
+| `/camera/color/image/compressed` | JPEG `sensor_msgs/msg/CompressedImage`. |
+| `/camera/depth/image_rect` | `32FC1` depth image in meters. |
+| `/camera/color/camera_info` | Rectified pinhole color camera info. |
+| `/camera/depth/camera_info` | Rectified pinhole depth camera info. |
+
+DepthCaptureLab writes depth in meters, not millimeters. The extractor decodes the float depth, maps it from the depth intrinsic grid into the color intrinsic grid assuming identity extrinsics, then writes canonical `uint16` millimeter PNG depth:
+
+```python
+aligned_m = cv2.remap(depth_m, map_x, map_y, interpolation=cv2.INTER_NEAREST)
+depth_mm = round(aligned_m * 1000).clip(0, 65535).astype(uint16)
+```
+
+It also computes synchronized frame FPS from color timestamps and stores that rounded FPS in `metadata.json`.
 
 ## Stage 1: Frame Stream, Camera, And Depth Inputs
 
-### Construction
+### Runtime Construction
 
 Source files:
 
 | File | Role |
 | --- | --- |
-| `run.py` | Argparse `--output-dir`, Hydra config composition, logging setup, `FrameDir` construction, pipeline launch. |
-| `configs/default.yaml` | The remaining runtime config. |
+| `run.py` | Argparse CLI, fixed config loading, logging setup, `FrameDir` construction, pipeline launch. |
+| `configs/default.yaml` | Runtime SLAM and output config. |
+| `vipe/utils/data_format.py` | Canonical metadata and intrinsics readers/writers. |
 | `vipe/streams/base.py` | `FrameDir`, `SensorCamera`, `FrameData`, `FrameStream`. |
-| `vipe/pipeline.py` | External-camera initialization and optional OpenCV undistortion wrapper. |
+| `vipe/pipeline.py` | External-camera initialization, SLAM call, artifact replay/save. |
 
-`run.py` composes `configs/default.yaml`, applies CLI overrides, and constructs:
+`run.py` has two required CLI flags:
+
+```bash
+python3 run.py --input-dir <canonical-scene-dir> --output-dir <artifact-output-dir>
+```
+
+It always loads the fixed runtime config:
+
+```python
+DEFAULT_CONFIG_PATH = get_config_path() / "default.yaml"
+cfg = load_yaml_config(DEFAULT_CONFIG_PATH)
+```
+
+and constructs:
 
 ```python
 pipeline = VipePipeline(
@@ -80,15 +250,11 @@ pipeline = VipePipeline(
     output_dir=cli_args.output_dir,
 )
 
-frame_stream = FrameDir(
-    path=cfg.streams.base_path,
-    fps=cfg.streams.fps,
-)
-
+frame_stream = FrameDir(path=cli_args.input_dir)
 pipeline.run(frame_stream)
 ```
 
-`FrameDir` always reads the full sorted frame directory from the first frame through the last frame.
+There are no Hydra overrides and no runtime config-path flags. Dataset roots and output roots are explicit CLI paths. Low-level solver and TSDF knobs stay in YAML.
 
 The shell variables influence external libraries but do not change ViPE control flow:
 
@@ -101,47 +267,26 @@ The shell variables influence external libraries but do not change ViPE control 
 
 ### Frame Ordering And Lazy Loading
 
-`FrameDir.__init__` first collects images from `streams.base_path` with these extensions:
+`FrameDir.__init__` reads `metadata.json` and then reads `metadata["frames"]` in list order:
 
 ```python
-[".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+self.metadata = read_scene_metadata(path)
+self.frames = read_scene_frames(path)
+self.frame_files = [path / frame["color_file"] for frame in self.frames]
+self.depth_files = [path / frame["depth_file"] for frame in self.frames]
 ```
 
-and uppercase variants.
+It does not list the `color/` directory, does not glob image extensions, and does not sort filenames. The extractor-generated metadata is therefore the ordering authority.
 
-Ordering is:
-
-```python
-def sort_image_sequence(paths):
-    paths = list(paths)
-    if paths and all(Path(path).stem.isdigit() for path in paths):
-        return sorted(paths, key=lambda path: (int(Path(path).stem), str(path)))
-    return sorted(paths, key=str)
-```
-
-So:
-
-| Names | Order |
-| --- | --- |
-| `0.png`, `1.png`, `2.png`, `10.png` | Numeric: `0, 1, 2, 10`. |
-| `frame1.png`, `frame10.png`, `frame2.png` | Lexicographic: `frame1, frame10, frame2`. |
-| Mixed numeric and nonnumeric stems | Lexicographic. |
-
-`FrameDir` does not cache all RGB/depth tensors. It stores file paths and re-reads frames lazily in every pass:
-
-```python
-frame_idx = self.start + index * self.step
-frame_path = self.frame_files[frame_idx]
-```
-
-`FrameData.raw_frame_idx` is this index into the full sorted file list.
+`FrameDir` does not cache all RGB/depth tensors. It stores file paths and re-reads frames lazily in every pass. This matters because the SLAM system iterates the stream twice and the artifact writer replays it one more time.
 
 ### Required Sensor Depth
 
-For every selected color frame, `FrameDir.__init__` checks that the sibling depth PNG exists:
+For every frame record, `FrameDir.__init__` checks that both files exist:
 
 ```text
-<scene>/depth/<frame_path.stem>.png
+<scene>/<frame.color_file>
+<scene>/<frame.depth_file>
 ```
 
 `FrameDir.__getitem__` reads RGB and depth:
@@ -153,7 +298,7 @@ frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
 
 raw_depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
 if raw_depth.shape[:2] != frame.shape[:2]:
-    raw_depth = cv2.resize(raw_depth, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+    raise ValueError(...)
 
 sensor = raw_depth.astype(np.float32) / 1000.0
 sensor[~np.isfinite(sensor)] = 0.0
@@ -161,11 +306,13 @@ sensor[sensor <= 0.0] = 0.0
 sensor_depth = torch.as_tensor(sensor).float().cuda()
 ```
 
+Current runtime refuses mismatched RGB/depth dimensions. Resizing or reprojection must happen in Stage 0 extraction.
+
 Initial frame object:
 
 ```python
 FrameData(
-    raw_frame_idx=<sorted-file index>,
+    raw_frame_idx=<metadata frame seq or list index>,
     rgb=<H x W x 3 CUDA float32 in 0..1>,
     sensor_depth=<H x W CUDA float32 in meters>,
     image_valid_mask=None,
@@ -183,480 +330,245 @@ FrameData(
 
 ```text
 <scene>/intrinsic/intrinsic_color.json
-<scene>/intrinsic/intrinsic_color.txt
 ```
 
-JSON is preferred if present.
-
-The TXT path is ScanNet-style:
-
-```python
-matrix = np.loadtxt(path, dtype=np.float32)
-K = matrix[:3, :3]
-```
-
-The JSON path accepts these common forms:
-
-| JSON key | Meaning |
-| --- | --- |
-| `camera_matrix` | Raw input camera matrix, 3x3. |
-| `scannet_intrinsic_matrix` | ScanNet 4x4 matrix; `[:3,:3]` is used. |
-| `intrinsics` | Dict containing `fx`, `fy`, `cx`, `cy`. |
-| `projection_matrix` | Output pinhole matrix when distortion metadata exists. |
-| `distortion_model` | Supported: `plumb_bob`, `rational_polynomial`. |
-| `distortion_coefficients` | OpenCV distortion vector. |
-| `width`, `height` | Must match RGB image size if present. |
+The JSON must have `format == "vipe_pinhole_intrinsics_v1"`. TXT intrinsics and multiple JSON variants are intentionally gone.
 
 The loaded metadata is stored as:
 
 ```python
 SensorCamera(
-    input_k=<raw input K>,
-    output_k=<downstream pinhole K>,
+    source_path=<intrinsic json path>,
+    k=<3x3 pinhole K>,
     width=<RGB width>,
     height=<RGB height>,
-    distortion_model=<optional string>,
-    distortion_coefficients=<optional vector>,
 )
 ```
 
 The downstream intrinsics tensor is always:
 
 ```python
-intrinsics = torch.as_tensor([fx, fy, cx, cy], dtype=torch.float32).cuda()
+torch.as_tensor([fx, fy, cx, cy], dtype=torch.float32).cuda()
 ```
 
-where `fx,fy,cx,cy` come from `SensorCamera.output_k`.
-
-### Camera Normalization
+### Pipeline Initialization
 
 `VipePipeline.run` starts with:
 
 ```python
 frame_stream, intrinsics = self._initialize(frame_stream)
+artifact_path = ArtifactPath(self.out_path, frame_stream.name())
+slam_output = self._run_slam(frame_stream, intrinsics)
+self._save_outputs(artifact_path, frame_stream, slam_output)
 ```
 
-If the loaded camera has no nonzero distortion coefficients, `_initialize` returns the original `FrameDir` plus the pinhole intrinsics tensor.
-
-If the loaded camera has nonzero OpenCV distortion coefficients, `_initialize` wraps the stream in `OpenCVPinholeNormalizedFrameStream`. The wrapper builds one fixed undistortion map:
+`_initialize` enforces external intrinsics:
 
 ```python
-mapx, mapy = cv2.initUndistortRectifyMap(
-    camera.input_k,
-    camera.distortion_coefficients,
-    np.eye(3, dtype=np.float32),
-    camera.output_k,
-    (camera.width, camera.height),
-    cv2.CV_32FC1,
-)
+camera = frame_stream.sensor_camera()
+if camera is None:
+    raise ValueError("Input stream must provide external RGB/color intrinsics")
+intrinsics = camera.pinhole_intrinsics()
 ```
 
-The map is converted to a CUDA `grid_sample` grid:
+The only camera type passed into SLAM is:
 
 ```python
-grid = 2.0 * stack(mapx, mapy) / [width - 1, height - 1] - 1.0
+CameraType.PINHOLE
 ```
 
-For each frame, the wrapper applies:
-
-| Field | Remap |
-| --- | --- |
-| `rgb` | Bilinear `grid_sample`. |
-| `sensor_depth` | Nearest-neighbor `grid_sample`. |
-| `image_valid_mask` | `grid` in `[-1,1]` and optional incoming mask. |
-
-Pixels that map outside the original RGB/depth support are marked invalid and zeroed:
-
-```python
-image_valid_mask = isfinite(grid) & -1 <= grid_x <= 1 & -1 <= grid_y <= 1
-rgb = torch.where(image_valid_mask[..., None], rgb, 0)
-sensor_depth = torch.where(sensor_depth > 0 and image_valid_mask, sensor_depth, 0)
-```
-
-After Stage 1, every later stage sees a pinhole stream. The input may have started as OpenCV-distorted RGB/depth, but the stream yields pinhole-normalized RGB/depth plus one shared `[fx, fy, cx, cy]` tensor.
+There is no camera-normalization stream wrapper at runtime. If a source camera is distorted or if depth is not in the RGB frame, Stage 0 must solve that and write a canonical pinhole RGB-D scene.
 
 ## Stage 2: SLAM Pass 1 Frontend Loop
 
-Stage 2 estimates keyframe poses and keyframe inverse-depth maps incrementally.
+Stage 2 is the first pass through all frames. It decides which frames become keyframes and optimizes those keyframes incrementally.
 
-Source files:
+```mermaid
+flowchart TD
+    A[FrameDir iterator] --> B[attach shared pinhole intrinsics]
+    B --> C[resize to about 384x512 area]
+    C --> D[center-crop to multiples of 8]
+    D --> E[DROID motion filter]
+    E --> F{keyframe or final frame?}
+    F -->|yes| G[store in GraphBuffer]
+    G --> H[sample sensor depth into 1/8 disparity anchors]
+    F -->|no| I[skip keyframe storage]
+    H --> J[SLAMFrontend.run]
+    I --> J
+    J --> K[frontend FactorGraph update and BA]
+```
+
+Relevant files:
 
 | File | Role |
 | --- | --- |
-| `vipe/slam/system.py` | `SLAMSystem.run`, resizing, pass loops, component construction. |
-| `vipe/slam/components/motion_filter.py` | DROID feature extraction and keyframe decision. |
-| `vipe/slam/components/buffer.py` | `GraphBuffer`, sensor-depth anchors, bundle adjustment call. |
-| `vipe/slam/components/frontend.py` | Incremental frontend factor graph logic. |
-| `vipe/slam/components/factor_graph.py` | Factor edge management, DROID update, BA driver. |
-| `vipe/slam/ba/*` | Solver terms and sparse solver. |
+| `vipe/slam/system.py` | Two-pass orchestration, frame resizing/cropping, component calls. |
+| `vipe/slam/components/motion_filter.py` | DROID motion check and cached feature/context tensors for accepted keyframes. |
+| `vipe/slam/components/buffer.py` | Persistent keyframe state and sensor-depth disparity anchors. |
+| `vipe/slam/components/frontend.py` | Incremental frontend factor graph. |
+| `vipe/slam/components/factor_graph.py` | Factor storage, learned DROID target updates, BA invocation. |
+| `vipe/slam/ba/terms.py` | Dense flow term and sensor-depth disparity regularization term. |
 
-### Setup
+### Standard Resize And Crop
 
-```mermaid
-flowchart TD
-    A[pinhole frame_stream plus intrinsics] --> B[StandardResizeFrameProcessor]
-    B --> C[compute SLAM H,W around 384x512 area and divisible by 8]
-    C --> D[build DroidNet]
-    D --> E[GraphBuffer]
-    D --> F[MotionFilter]
-    D --> G[SLAMFrontend]
-    D --> H[SLAMBackend]
-    D --> I[InnerFiller]
-    E --> J[empty keyframe state]
-```
-
-`StandardResizeFrameProcessor` chooses a SLAM working resolution:
+The SLAM network runs at a normalized resolution. For original size `(H0,W0)`, `StandardResizeFrameProcessor` computes:
 
 ```python
-scale_factor = sqrt((384 * 512) / (h0 * w0))
-h1 = int(h0 * scale_factor)
-w1 = int(w0 * scale_factor)
-crop_h = h1 % 8
-crop_w = w1 % 8
+scale_factor = sqrt((384 * 512) / (H0 * W0))
+H1 = int(H0 * scale_factor)
+W1 = int(W0 * scale_factor)
 ```
 
-Each frame is resized to `(h1,w1)`, then center-cropped so both dimensions are divisible by 8. RGB uses bilinear interpolation; sensor depth and image-valid masks use nearest-neighbor interpolation. Intrinsics are scaled and cropped consistently:
+Then it center-crops so both dimensions are divisible by 8:
 
 ```python
-fx *= w1 / w0
-cx *= w1 / w0
-fy *= h1 / h0
-cy *= h1 / h0
-cx -= crop_left
-cy -= crop_top
+crop_h = H1 % 8
+crop_w = W1 % 8
 ```
 
-`GraphBuffer` allocates fixed-size tensors. Slot `k` means "the `k`-th buffered SLAM frame/keyframe", not necessarily raw input frame `k`; the original selected-frame index is stored in `tstamp[k]`.
+`FrameData.resize` applies:
+
+| Field | Operation |
+| --- | --- |
+| `rgb` | Bilinear interpolation. |
+| `sensor_depth` | Nearest-neighbor interpolation. |
+| `image_valid_mask` | Nearest-neighbor interpolation if present. |
+| `intrinsics` | `fx,cx` scaled by `W1/W0`; `fy,cy` scaled by `H1/H0`. |
+
+`FrameData.crop` then applies:
+
+| Field | Operation |
+| --- | --- |
+| `rgb` | Tensor crop. |
+| `sensor_depth` | Tensor crop. |
+| `image_valid_mask` | Tensor crop if present. |
+| `intrinsics` | `cx -= left`, `cy -= top`. |
+
+The resized/cropped intrinsics are the intrinsics optimized inside the SLAM graph. Original-resolution intrinsics are recovered in Stage 4.
+
+### Component Construction
+
+`SLAMSystem._build_components` creates:
+
+```python
+self.droid_net = DroidNet().to(self.device)
+self.buffer = GraphBuffer(...)
+self.motion_filter = MotionFilter(...)
+self.frontend = SLAMFrontend(...)
+self.backend = SLAMBackend(...)
+self.inner_filler = InnerFiller(...)
+```
+
+The `GraphBuffer` is the persistent state table. With height `H` and width `W` after resizing/cropping, its dense-disparity grid is `(H/8, W/8)`.
+
+Important buffer fields:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `n_frames` | int | Number of active buffer slots. |
-| `tstamp` | `(buffer,)` | Original selected-frame index for each keyframe slot. |
-| `images` | `(buffer,3,H,W)` float16 | Resized keyframe RGB. |
-| `poses` | `(buffer,7)` float32 | World-to-camera SE3 state. |
-| `intrinsics` | `(4,)` float32 | Shared resized pinhole intrinsics. |
-| `disps` | `(buffer,H/8,W/8)` float32 | Optimized inverse depth. |
-| `disps_sens` | `(buffer,H/8,W/8)` float32 | External sensor-depth anchor converted to inverse depth. |
-| `disps_sens_weight` | `(buffer,H/8,W/8)` float32 | 1 for valid anchor pixels, 0 for invalid pixels. |
-| `fmaps` | `(buffer,128,H/8,W/8)` float16 | DROID feature maps. |
-| `nets` | `(buffer,128,H/8,W/8)` float16 | DROID recurrent hidden state. |
-| `inps` | `(buffer,128,H/8,W/8)` float16 | DROID context input. |
+| `tstamp` | `(buffer,)` | Canonical stream frame index for each buffered keyframe. |
+| `images` | `(buffer,3,H,W)` | Resized/cropped RGB keyframes, float16. |
+| `poses` | `(buffer,7)` | World-to-camera SE3 pose parameters. |
+| `intrinsics` | `(4,)` | Shared resized/cropped `[fx,fy,cx,cy]`. |
+| `disps` | `(buffer,H/8,W/8)` | Optimized dense disparity maps. |
+| `disps_sens` | `(buffer,H/8,W/8)` | Sensor-depth disparity anchors. |
+| `disps_sens_weight` | `(buffer,H/8,W/8)` | Validity weight for each sensor-depth anchor. |
+| `fmaps` | `(buffer,128,H/8,W/8)` | DROID feature maps. |
+| `nets`, `inps` | `(buffer,128,H/8,W/8)` | DROID context state. |
 
-Initial poses are identity world-to-camera transforms. Initial disparities are `pipeline.slam.init_disp`, default `1.0`.
+Initial pose is identity. Initial disparity is `pipeline.slam.init_disp`.
 
-The important ownership split is:
+### Motion Filter And Keyframes
 
-| Object | What it owns | What it does not own |
-| --- | --- | --- |
-| `GraphBuffer` | Persistent node/state table: poses, disparities, images, DROID features, timestamps, intrinsics, sensor-depth anchors. | The active pairwise edge list. |
-| `FactorGraph` | Active directed edges `(ii,jj)` plus learned per-edge state: correlation/update state, target coordinates, residual weights, factor ages. | Pose/disparity variables. |
-| `GraphBuffer.bundle_adjustment(...)` | Builds solver terms and calls `Solver.run_inplace(...)`. | Long-lived graph construction policy. |
-
-So:
-
-```text
-GraphBuffer ~= nodes/state variables
-FactorGraph ~= edges/factors plus DROID learned edge machinery
-```
-
-`FactorGraph` prepares learned targets and weights, then calls `GraphBuffer.bundle_adjustment(...)`, which is where `GraphBuffer.poses` and `GraphBuffer.disps` actually change.
-
-### Per-Frame Pass-1 Loop
-
-```mermaid
-flowchart TD
-    A[next frame] --> B[attach shared intrinsics and PINHOLE camera type]
-    B --> C[resize and crop to SLAM size]
-    C --> D[RGB HWC -> BCHW]
-    D --> E[MotionFilter.check]
-    E --> F{first frame, enough motion, or last frame?}
-    F -->|yes| G[append keyframe to GraphBuffer]
-    F -->|no| H[do not append]
-    G --> I[sample sensor-depth anchor into disps_sens]
-    H --> J[frontend.run]
-    I --> J
-    J --> K{warmup reached or new keyframe after init?}
-    K -->|yes| L[DROID factor update + BA]
-    K -->|no| M[no-op]
-```
-
-Every selected frame goes through:
+For each frame:
 
 ```python
-frame_data.intrinsics = intrinsics
-frame_data.camera_type = CameraType.PINHOLE
+frame_data = attach_intrinsics(frame_data, intrinsics, CameraType.PINHOLE)
 frame_data = resizer(frame_data)
 images = frame_data.rgb.permute(2, 0, 1)[None]
-motion_result = motion_filter.check(images)
+motion_result = self.motion_filter.check(images)
 ```
 
-`images` has shape `(1,3,H,W)`.
-
-### Motion Filter
-
-`MotionFilter.check(images)` always computes the current DROID feature map:
+If `motion_result.is_keyframe` is true, or if this is the final frame, the frame is stored in the buffer:
 
 ```python
-gmap = self.net.encode_features(images)  # (1,128,H/8,W/8)
+kf_idx = self.buffer.n_frames
+self.buffer.tstamp[kf_idx] = frame_idx
+self.buffer.images[kf_idx] = images[0]
+self.buffer.fmaps[kf_idx] = motion_result.fmap[0]
+self.buffer.nets[kf_idx], self.buffer.inps[kf_idx] = motion_result.net[0], motion_result.inp[0]
+self.buffer.n_frames += 1
 ```
 
-For the first frame, it also computes DROID context:
+The final frame is forced into the keyframe set so pose infill has a right boundary at the end of the stream.
 
-```python
-net, inp = self.net.encode_context(images)
-return MotionFilterResult(True, gmap, net, inp)
-```
+### Sensor-Depth Anchors
 
-For later frames, it compares the current feature map against the last accepted keyframe feature map:
-
-```python
-coords0 = coords_grid(H/8, W/8)[None, None]
-corr = CorrBlock(last_keyframe_fmap[None], current_fmap[None])(coords0)
-_, delta, weight = self.net.update.forward(last_keyframe_net[None], last_keyframe_inp[None], corr)
-dense_motion_score = delta.norm(dim=-1)[0].mean([1, 2]).item()
-```
-
-A frame becomes a keyframe if:
-
-```python
-dense_motion_score > pipeline.slam.filter_thresh
-```
-
-The final selected frame is also forced into the keyframe set so pose infill has a right boundary.
-
-### Keyframe Storage And Sensor-Depth Anchors
-
-When a keyframe is accepted:
-
-```python
-kf_idx = buffer.n_frames
-buffer.tstamp[kf_idx] = frame_idx
-buffer.images[kf_idx] = images[0]
-buffer.fmaps[kf_idx] = motion_result.fmap[0]
-buffer.nets[kf_idx], buffer.inps[kf_idx] = context_tensors
-buffer.n_frames += 1
-```
-
-The first keyframe stores the shared resized intrinsics:
-
-```python
-buffer.intrinsics = frame_data.intrinsics
-```
-
-Then `GraphBuffer.update_disps_sens(kf_idx, frame_data)` uses external sensor depth directly:
+When a keyframe is added, `GraphBuffer.update_disps_sens` samples the external depth into the same 1/8-resolution grid used by DROID disparities:
 
 ```python
 metric_depth = frame_data.sensor_depth.float()
 valid = torch.isfinite(metric_depth) & (metric_depth > 0.0)
 if frame_data.image_valid_mask is not None:
-    valid &= frame_data.image_valid_mask
-metric_depth = torch.where(valid, metric_depth, 0)
+    valid &= frame_data.image_valid_mask.to(valid.device)
+metric_depth = torch.where(valid, metric_depth, torch.zeros_like(metric_depth))
 
 disp_sens = metric_depth[3::8, 3::8]
-disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
-
-buffer.disps_sens[kf_idx] = disp_sens
-buffer.disps_sens_weight[kf_idx] = valid[3::8, 3::8].float()
+disp_sens = torch.where(disp_sens > 0, 1.0 / disp_sens, 0.0)
+self.disps_sens[kf_idx] = disp_sens
+self.disps_sens_weight[kf_idx] = valid[3::8, 3::8].float()
 ```
 
-The `3::8` sampling picks one depth sample near the center of each 8x8 image block, matching the DROID low-resolution disparity grid.
-
-If a sampled sensor depth is invalid, the anchor disparity is `0` and the matching weight is `0`, so it contributes nothing to the depth-anchor BA term.
+So the external depth does not replace SLAM. It regularizes the optimized disparity map at valid sensor-depth samples.
 
 ### Frontend Factor Graph
 
-`frontend.graph` is a persistent incremental `FactorGraph`.
+`SLAMFrontend.run` maintains a persistent incremental `FactorGraph`.
 
-A factor is an edge `(i,j)` saying: source keyframe `i`, with its current pose and dense disparity, should reproject into target keyframe `j` at learned DROID target coordinates.
-
-Toy one-pixel factor:
+Conceptually:
 
 ```text
-source keyframe i = 4
-target keyframe j = 6
-low-res source pixel p = [10, 5]
-current projection into j = [12.4, 5.7]
-DROID learned target = [13.0, 5.5]
-residual = [-0.6, 0.2]
+new keyframe enters GraphBuffer
+-> add neighborhood/proximity factors
+-> run learned DROID update to refresh target correspondences and weights
+-> run BA to mutate GraphBuffer poses/disparities
+-> prune old/redundant active factors
 ```
 
-BA updates poses and disparities to reduce many such residuals over all active factors and all low-res pixels.
-
-There are two levels of "factor" in this code:
-
-| Level | Meaning |
-| --- | --- |
-| Graph-construction factors | Which directed frame pairs `(i,j)` become edges in a `FactorGraph`. |
-| Solver factors | The mathematical residual terms created inside `GraphBuffer.bundle_adjustment(...)`. |
-
-When `FactorGraph.add_factors(ii,jj)` adds directed edges, it removes duplicates, optionally appends incremental `CorrBlock` state, initializes `target` from the current geometric projection, initializes `weight` to zero, appends DROID recurrent state, and stores `age=0`. The initialized target is only a starting point; the next DROID update turns it into a learned target.
-
-The graph-construction methods used here are:
-
-| Method | Current use | Edge rule |
-| --- | --- | --- |
-| `add_neighborhood_factors(t0,t1,r=1)` | Frontend warmup. | Add all directed edges with `0 < abs(i-j) <= 1` inside `[t0,t1)`. |
-| `add_proximity_factors(...)` | Frontend incremental updates and backend global BA. | Use current poses/disparities to score view overlap, always add local bidirectional edges, then add low-distance pairs after thresholding and NMS. |
-
-Solver-level terms are:
-
-| Term | Residual | Variables touched |
-| --- | --- | --- |
-| `DenseDepthFlowTerm` | Project each source low-res pixel through `pose_i`, `dense_disp_i`, and `pose_j`; compare to the DROID target coordinate. | `pose_i`, `pose_j`, `dense_disp_i`. |
-| `DispSensRegularizationTerm` | Keep optimized disparity close to `GraphBuffer.disps_sens`, weighted by `pipeline.slam.ba.dense_disp_alpha * disps_sens_weight`. | `dense_disp` only. |
-
-`DispSensRegularizationTerm` is skipped for `motion_only=True` and is added only for frames with at least one nonzero sensor-depth anchor. Within those frames, invalid external depth or undistort-invalid pixels contribute zero because `disps_sens_weight` is zero there.
-
-`frontend.run()` is called after every pass-1 frame, but it mutates the graph only in two cases:
-
-```text
-1. once, when GraphBuffer.n_frames == warmup
-2. later, when a newly accepted keyframe makes GraphBuffer.n_frames > frontend.t1
-```
-
-Frontend warmup starts once `buffer.n_frames == pipeline.slam.warmup`:
-
-```python
-frontend.t1 = buffer.n_frames
-frontend.graph.add_neighborhood_factors(0, warmup, r=1)
-
-for _ in range(frontend_init_updates):
-    frontend.graph.update(t0=1, itrs=frontend_ba_iters)
-```
-
-After warmup, whenever a new keyframe arrives:
-
-```python
-frontend.t1 += 1
-
-if frontend.graph.corr is not None:
-    frontend.graph.rm_factors(frontend.graph.age > frontend_max_age)
-
-frontend.graph.add_proximity_factors(...)
-
-for _ in range(frontend_update_iters1):
-    frontend.graph.update(itrs=frontend_ba_iters)
-
-d = buffer.frame_distance_dense_disp(
-    torch.tensor([frontend.t1 - 3]),
-    torch.tensor([frontend.t1 - 2]),
-    beta=beta,
-    bidirectional=True,
-)
-
-if d.max() < keyframe_thresh:
-    frontend.graph.rm_second_newest_keyframe(frontend.t1 - 2)
-    frontend.t1 -= 1
-else:
-    for _ in range(frontend_update_iters2):
-        frontend.graph.update(itrs=frontend_ba_iters)
-```
-
-When `rm_second_newest_keyframe(ix)` prunes a keyframe, `GraphBuffer.remove_second_newest(ix)` overwrites the second-newest slot with the newest slot and decrements `n_frames`. `FactorGraph.rm_second_newest_keyframe(ix)` also removes edges touching the deleted slot and shifts later edge indices down by one, so the edge list stays consistent with the compacted buffer.
-
-Frontend config values are all visible in `configs/default.yaml`:
+Important frontend config values are in `configs/default.yaml`:
 
 | Config | Default | Role |
 | --- | ---: | --- |
-| `warmup` | `8` | Number of keyframes before frontend initialization. |
-| `keyframe_thresh` | `4.0` | Threshold for pruning the second-newest keyframe as redundant. |
-| `frontend_window` | `25` | Recent keyframe window considered for proximity factors. |
-| `frontend_radius` | `2` | Forced local edge radius. |
-| `frontend_nms` | `1` | Suppression radius for proximity edge selection. |
-| `frontend_thresh` | `16.0` | Distance threshold for proximity edges. |
-| `frontend_max_factors` | `48` | Factor budget for the incremental frontend graph. |
-| `frontend_max_age` | `25` | Active factors older than this many graph updates are removed. |
-| `frontend_init_updates` | `8` | Outer `graph.update` calls during warmup. |
-| `frontend_update_iters1` | `4` | Outer updates after adding a keyframe before pruning. |
-| `frontend_update_iters2` | `2` | Extra outer updates if the candidate keyframe is kept. |
-| `frontend_ba_iters` | `3` | Inner BA solver iterations per outer graph update. |
+| `filter_thresh` | `2.4` | Dense motion threshold for accepting keyframes. |
+| `warmup` | `8` | Keyframes collected before initializing frontend graph. |
+| `keyframe_thresh` | `4.0` | Threshold for pruning redundant keyframes. |
+| `frontend_thresh` | `16.0` | Proximity threshold for frontend edge creation. |
+| `frontend_window` | `25` | Number of recent keyframes considered by frontend. |
+| `frontend_radius` | `2` | Local forced-neighbor factor radius. |
+| `frontend_nms` | `1` | Non-max suppression radius for proximity factors. |
+| `frontend_max_factors` | `48` | Max active frontend factors. |
+| `frontend_max_age` | `25` | Delete active factors after this many graph updates. |
+| `frontend_init_updates` | `8` | Graph update calls during warmup initialization. |
+| `frontend_update_iters1` | `4` | First update loop after adding a keyframe. |
+| `frontend_update_iters2` | `2` | Extra update loop when candidate keyframe is retained. |
+| `frontend_ba_iters` | `3` | Inner BA solver iterations per frontend graph update. |
 
-With the default values, frontend warmup performs:
-
-```text
-8 outer graph.update calls
-1 DROID target/weight refresh per outer call
-3 inner BA solver iterations per outer call
-24 total inner BA solver iterations
-```
-
-For each later accepted keyframe that is kept:
-
-```text
-4 + 2 = 6 outer graph.update calls
-18 total inner BA solver iterations
-```
-
-For each later accepted keyframe that is pruned:
-
-```text
-4 outer graph.update calls
-12 total inner BA solver iterations
-then the second-newest keyframe is removed
-```
-
-### One FactorGraph Update
-
-`FactorGraph.update` performs one learned target refresh followed by BA:
-
-```python
-coords1, _ = buffer.reproject_dense_disp(ii, jj)
-motn = cat([coords1 - coords0, target - coords1])
-corr = corr_block(coords1)
-f_net, delta, weight, damping, _ = droid_net.update.forward(...)
-target = coords1 + delta
-weight = weight
-damping[unique_source_frames] = damping
-buffer.bundle_adjustment(..., n_iters=frontend_ba_iters)
-age += 1
-```
-
-The edge list `(ii,jj)` is fixed during this `graph.update` call. `target`, `weight`, `damping`, and `f_net` are refreshed once before the inner BA iterations. During the inner BA iterations, the solver updates `GraphBuffer.poses` and `GraphBuffer.disps`.
-
-Frontend state changes by cadence:
-
-| Cadence | State |
-| --- | --- |
-| Fixed during frontend lifetime | `GraphBuffer` object identity, `frontend.graph` object identity, DROID network weights, shared intrinsics. |
-| When a keyframe is added | `GraphBuffer.n_frames`, `tstamp`, `images`, `fmaps`, `nets`, `inps`, `disps_sens`, `disps_sens_weight`. |
-| When factors are added or removed | `FactorGraph.ii`, `FactorGraph.jj`, `FactorGraph.age`, incremental correlation/context state. |
-| Once per outer `graph.update` | `FactorGraph.target`, `FactorGraph.weight`, `FactorGraph.damping`, `FactorGraph.f_net`. |
-| During inner BA solver iterations | `GraphBuffer.poses`, `GraphBuffer.disps`. |
-
-Exact frontend BA call path:
-
-```text
-SLAMSystem.run pass 1
--> keyframe accepted
--> GraphBuffer slot filled
--> GraphBuffer.disps_sens filled from external sensor depth
--> SLAMFrontend.run
--> frontend.graph.add_neighborhood_factors or add_proximity_factors
--> frontend.graph.update
--> GraphBuffer.bundle_adjustment
--> Solver.run_inplace
--> GraphBuffer.poses/disps mutated
-```
+The frontend graph is active only over keyframes. Non-keyframes do not get stored until Stage 4.
 
 ### Bundle Adjustment Objective
 
-For one low-resolution pixel `p=(u,v)` in source keyframe `i`, with disparity `d_i(p)`, depth is:
-
-```math
-z_i(p)=\frac{1}{d_i(p)}.
-```
-
-Inverse projection with low-resolution intrinsics `K=(fx,fy,cx,cy)` is:
+For one low-resolution pixel `p=(u,v)` in source keyframe `i`, with disparity `d_i(p)`, the code uses an inverse-depth homogeneous point:
 
 ```math
 \Pi_K^{-1}(p,d_i)=
 \begin{bmatrix}
-(u-c_x)z_i/f_x \\
-(v-c_y)z_i/f_y \\
-z_i \\
-1
+(u-c_x)/f_x \\
+(v-c_y)/f_y \\
+1 \\
+d_i
 \end{bmatrix}.
 ```
+
+This is equivalent to the Euclidean depth point with `z_i = 1/d_i` after homogeneous division, but it matches the actual `PinholeCameraModel.iproj_disp` representation.
 
 The current projection into keyframe `j` is:
 
@@ -672,7 +584,7 @@ The dense visual term is:
 E_{\text{flow}}
 =
 \sum_{(i,j)\in\mathcal{F}}
-\sum_{p}
+\sum_p
 w_{ij}(p)
 \left\|
 \hat{p}_{ij}(p)-p^*_{ij}(p)
@@ -707,6 +619,21 @@ E = E_{\text{flow}} + E_{\text{sens}}.
 ```
 
 For frontend/backend BA, both poses and disparities are optimized. For pose infill in Stage 4, `motion_only=True`, so dense disparities are fixed and only poses are optimized.
+
+Exact frontend BA call path:
+
+```text
+SLAMSystem.run pass 1
+-> keyframe accepted
+-> GraphBuffer slot filled
+-> GraphBuffer.disps_sens filled from external sensor depth
+-> SLAMFrontend.run
+-> frontend.graph.add_neighborhood_factors or add_proximity_factors
+-> frontend.graph.update
+-> GraphBuffer.bundle_adjustment
+-> Solver.run_inplace
+-> GraphBuffer.poses/disps mutated
+```
 
 ## Stage 3: Backend Global BA
 
@@ -761,7 +688,7 @@ If the backend graph has no factors, which can happen when there is only one key
 
 The backend graph is not a continuation of `frontend.graph`. It is a new temporary `FactorGraph` object that points at the same `GraphBuffer`, optimizes that shared state, then is discarded.
 
-Backend config values are all visible in `configs/default.yaml`:
+Backend config values:
 
 | Config | Default | Role |
 | --- | ---: | --- |
@@ -787,7 +714,7 @@ Backend state changes by cadence:
 
 | Cadence | State |
 | --- | --- |
-| Fixed for the backend run | Backend `FactorGraph.ii/jj` edge list, `GraphBuffer` object identity, DROID network weights, shared intrinsics. |
+| Fixed for backend run | Backend `FactorGraph.ii/jj` edge list, `GraphBuffer` identity, DROID weights, shared intrinsics. |
 | Once per backend outer step | `FactorGraph.target`, `FactorGraph.weight`, `FactorGraph.damping`, `FactorGraph.f_net`. |
 | During inner BA solver iterations | `GraphBuffer.poses`, `GraphBuffer.disps`. |
 | Not changed by backend | `GraphBuffer.n_frames`, `images`, `fmaps`, `nets`, `inps`, `disps_sens`, `disps_sens_weight`, backend edge set. |
@@ -805,7 +732,7 @@ SLAMSystem.run after pass 1
 -> same GraphBuffer.poses/disps mutated
 ```
 
-One useful mental model:
+Mental model:
 
 ```text
 Outer graph update step = refresh learned targets/weights using DROID, then call BA.
@@ -814,7 +741,7 @@ Inner BA solver iterations = optimize GraphBuffer.poses/disps against fixed targ
 
 ## Stage 4: Pose Infill
 
-Pass 1 and backend optimize only keyframes. Stage 4 produces one pose for every selected RGB frame.
+Pass 1 and backend optimize only keyframes. Stage 4 produces one pose for every canonical RGB-D frame.
 
 ```mermaid
 flowchart TD
@@ -823,13 +750,19 @@ flowchart TD
     C --> D[append frame to GraphBuffer after keyframes]
     D --> E{chunk full or last frame?}
     E -->|no| C
-    E -->|yes| F[initialize appended poses from nearest keyframe velocity]
+    E -->|yes| F[initialize appended poses from neighboring keyframes]
     F --> G[build factors from left/right keyframes to appended frames]
     G --> H[10 motion-only graph updates]
     H --> I[append filled poses]
     I --> J[reset buffer.n_frames back to keyframe count]
     J --> C
 ```
+
+Relevant file:
+
+| File | Role |
+| --- | --- |
+| `vipe/slam/components/inner_filler.py` | Appends pending non-keyframes and optimizes their poses against fixed keyframes. |
 
 For each pending non-keyframe frame at timestamp `t`, `InnerFiller.fill_pending_chunk` finds adjacent keyframe timestamps `t0` and `t1`:
 
@@ -838,7 +771,7 @@ t0 = searchsorted(keyframe_timestamps, pending_timestamps, right=True) - 1
 t1 = min(t0 + 1, last_keyframe)
 ```
 
-It initializes pose by constant velocity interpolation in SE3:
+It initializes pose by constant-velocity interpolation in SE3:
 
 ```python
 d_pose = key_pose[t1] * key_pose[t0].inv()
@@ -877,21 +810,21 @@ keyframe_indices = buffer.tstamp[:buffer.n_frames].cpu().tolist()
 
 ```python
 SLAMOutput(
-    trajectory=<camera-to-world SE3 for every selected frame>,
-    intrinsics=<original-resolution downstream pinhole [fx,fy,cx,cy]>,
-    keyframe_indices=<selected-frame indices of optimized SLAM keyframes>,
+    trajectory=<camera-to-world SE3 for every canonical frame>,
+    intrinsics=<original-resolution pinhole [fx,fy,cx,cy]>,
+    keyframe_indices=<canonical frame indices of optimized SLAM keyframes>,
 )
 ```
 
-`keyframe_indices` are useful diagnostics. Final dense depth comes from replayed external sensor depth.
+`keyframe_indices` are diagnostics. Final dense depth comes from replayed external sensor depth in Stage 5.
 
 ## Stage 5: Replay Sensor Depth And Save Outputs
 
-Stage 5 runs only when `pipeline.output.save_artifacts=true`.
+Stage 5 always runs in the current `run.py` and benchmark path.
 
 ```mermaid
 flowchart TD
-    A[SLAMOutput] --> B[replay pinhole frame stream]
+    A[SLAMOutput] --> B[replay FrameDir lazily]
     B --> C[attach final c2w pose]
     C --> D[attach recovered original-resolution intrinsics]
     D --> E[metric_depth = valid sensor_depth]
@@ -917,7 +850,7 @@ for frame_idx in range(len(frame_stream)):
     yield frame
 ```
 
-This means the TSDF PCD is built from the provided sensor depth, after any OpenCV camera normalization and invalid-mask application.
+This means the TSDF PCD is built from the provided sensor depth. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
 
 ### Saved Artifacts
 
@@ -925,14 +858,21 @@ This means the TSDF PCD is built from the provided sensor depth, after any OpenC
 
 | Artifact | Path | Contents |
 | --- | --- | --- |
-| Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: selected frame indices. |
+| Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: sequential canonical frame indices. |
 | TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points sampled from the native TSDF zero-crossing surface. |
 
-`artifact_name` is the frame directory name, for example `color`.
+`artifact_name` is `frame_stream.name()`, which is the input scene directory name unless explicitly overridden.
+
+`pose/<artifact_name>.npz` arrays:
+
+| Array | Shape | Meaning |
+| --- | --- | --- |
+| `data` | `(N,4,4)` | Camera-to-world pose matrix for each saved frame. |
+| `inds` | `(N,)` | Sequential canonical frame index used by the artifact writer. |
 
 ### TSDF PCD
 
-For TSDF output, each final frame is integrated into the native `vipe_ext.tsdf_ext.TSDFVolume` through the small Python wrapper `vipe.utils.tsdf.TSDFVolume`:
+For TSDF output, each final frame is integrated into the native `vipe_ext.tsdf_ext.TSDFVolume` through `vipe.utils.tsdf.TSDFVolume`:
 
 ```python
 volume = TSDFVolume(
@@ -1020,49 +960,184 @@ write_binary_ply(...)
 
 So the saved reconstruction artifact is the sampled colored point cloud extracted from the final native sparse TSDF volume.
 
-### Benchmark Adapter
+Important output knobs in `configs/default.yaml`:
 
-`scripts/scannet_vipe_bench_evaluator.py` uses the same `VipePipeline` and `FrameDir` construction as `run.py`. It forces:
+| Config | Meaning |
+| --- | --- |
+| `pipeline.output.pcd_max_points` | Maximum sampled TSDF point-cloud points. |
+| `pipeline.output.pcd_tsdf_voxel_edge_m` | TSDF voxel edge length in meters. |
+| `pipeline.output.pcd_tsdf_sdf_trunc_m` | Signed-distance truncation band in meters. |
+| `pipeline.output.pcd_tsdf_depth_trunc_m` | Ignore depth samples beyond this many meters. |
+| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge. |
+| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks. |
 
-```python
-pipeline.output.save_artifacts=true
+## ScanNet Benchmark Adapter
+
+The benchmark uses the same `VipePipeline` and `FrameDir` construction as `run.py`. It adds ScanNet GT pose/mesh loading, manifest writing, metric evaluation, and optional multi-GPU worker splitting.
+
+Command:
+
+```bash
+python3 scripts/scannet_vipe_bench_evaluator.py --scenes scene0000_00 scene0011_00 scene0378_00 --work-dir ./workspace/evaluation_scannet_default --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans
 ```
 
-for each scene. ViPE artifacts for benchmark runs are written under:
+Benchmark data loading is canonical-only:
+
+| Source | Meaning |
+| --- | --- |
+| `--input-root/<scene>` | Canonical ViPE scene. |
+| `--raw-root/<scene>` | Raw ScanNet scene folder used only for GT mesh lookup. |
+| `configs/default.yaml` | Fixed ViPE runtime config for SLAM and TSDF output knobs. |
+| `configs/eval_scannet_config.yaml` | Metric thresholds, render settings, cache filenames, GT mesh suffixes. |
+
+The benchmark does not accept runtime path overrides. Scene data comes only from `--input-root/<scene>`, which avoids the previous ambiguous branch where a benchmark could evaluate one scene while running ViPE on a separately formatted path.
+
+For every scene, the adapter:
+
+1. Loads canonical frame records and GT poses from `metadata.json` and `pose/*.txt`.
+2. Runs `VipePipeline` on `--input-root/<scene>`.
+3. Writes `vipe_manifest.json` under the benchmark workspace.
+4. Writes `gt_meta.npz` containing the exact evaluated GT frame subset.
+5. Runs pose and reconstruction metrics.
+
+ViPE artifacts for benchmark runs are written under:
 
 ```text
 <work-dir>/vipe_outputs/<scene>
 ```
 
-The adapter then writes a local benchmark manifest pointing at those native ViPE artifacts:
+The local benchmark manifest is written under:
 
 ```text
-exports/vipe_manifest.json
+<work-dir>/model_results/scannet/<scene>/recon/exports/vipe_manifest.json
 ```
 
-ScanNet-specific benchmark constants are centralized in `configs/eval_scannet_config.yaml`: dataset file patterns, pose AUC thresholds/chunking, geometry nearest-neighbor settings, render sampling/rasterization settings, image metric constants, and evaluator output names. Dataset roots are explicit CLI inputs via `--input-root` and `--raw-root`.
+Manifest contents include:
 
-The local ScanNet evaluator in `vipe/bench/scannet.py` consumes pose and GT metadata through that manifest for pose metrics. For reconstruction, there is one mode named `recon`: the evaluator uses the TSDF point cloud written by ViPE:
+| Key | Meaning |
+| --- | --- |
+| `format` | `vipe_artifacts_v1`. |
+| `scene` | ScanNet scene id. |
+| `artifact_name` | Canonical scene directory name. |
+| `vipe_output_dir` | Absolute path to ViPE output directory. |
+| `pose_path` | Absolute path to ViPE pose NPZ. |
+| `tsdf_pcd_path` | Absolute path to ViPE TSDF PLY. |
+| `output` | TSDF output parameters used for this run. |
+| `frame_indices` | Sequential canonical frame indices. |
+
+### Pose Metric
+
+The pose metric uses the matched canonical frames:
+
+1. Load predicted ViPE poses by `frame_indices`.
+2. Load ScanNet GT camera-to-world poses from canonical `pose/*.txt`.
+3. Convert predicted and GT camera-to-world poses to world-to-camera extrinsics.
+4. Align both trajectories to their first camera.
+5. Compute relative-pair rotation/translation angular errors.
+6. Report AUC at configured degree thresholds.
+
+The metric is relative after first-frame normalization. It does not apply per-frame alignment.
+
+### Reconstruction Metric
+
+The reconstruction metric consumes the TSDF PLY written by Stage 5:
 
 ```text
 pcd/<artifact_name>_tsdf.ply
 ```
 
-For reconstruction metrics, the evaluator computes the fixed SE3 transform that maps the first ViPE camera pose to the first matched ScanNet GT camera pose, applies that rigid transform to the TSDF PLY, caches the aligned PLY under the benchmark `eval_cache`, then computes geometry and render metrics in the ScanNet GT coordinate frame. It also reports a separate scale diagnostic: after this first-camera SE3 alignment, it solves the single best scalar for the matched camera-center deltas, but does not apply that scale to the evaluated point cloud.
+For reconstruction metrics, the evaluator:
 
-The printed summary reports the mean scale and the individual scene scales in parentheses, so per-scene scale spread stays visible.
+1. Loads ViPE TSDF PLY.
+2. Computes one rigid SE3 transform mapping the first predicted camera pose to the first ScanNet GT camera pose.
+3. Applies that single SE3 to the whole predicted point cloud.
+4. Caches the aligned PLY under the benchmark eval cache.
+5. Samples/caches the ScanNet GT mesh point cloud.
+6. Crops predicted points to the padded GT AABB.
+7. Computes nearest-neighbor L2 geometry metrics.
+8. Renders the aligned predicted cloud into sampled GT cameras for PSNR/SSIM.
+
+The reported `scale_diagnostic` is not applied to the evaluated PLY. It is a diagnostic scalar fitted after first-camera SE3 alignment to expose scale drift:
+
+```text
+scale = sum(pred_delta * gt_delta) / sum(pred_delta * pred_delta)
+```
+
+The printed summary reports mean scale and individual scene scales in parentheses, so per-scene scale spread stays visible.
+
+### Benchmark Parallelism
+
+If `CUDA_VISIBLE_DEVICES` contains multiple GPUs and the process is not already a worker, the benchmark script spawns one worker process per visible GPU. Scenes are partitioned by scene index modulo GPU count:
+
+```python
+scenes = [scene for idx, scene in enumerate(all_scenes) if idx % total_gpus == gpu_id]
+```
+
+Each worker writes timing JSON under:
+
+```text
+<work-dir>/metric_results/timing_workers/
+```
+
+The parent process merges build timing, runs metric evaluation, writes `scannet_timing.json`, and prints the final summary.
+
+## Runtime Config Boundaries
+
+The current CLI/YAML split is intentional:
+
+| Location | Belongs there |
+| --- | --- |
+| CLI | Dataset/session paths, output/workspace paths, scene list. |
+| `configs/default.yaml` | Solver, keyframe, BA, and TSDF output knobs. |
+| `configs/eval_scannet_config.yaml` | ScanNet metric thresholds, render settings, cache names, GT mesh suffixes. |
+
+No CLI flag and YAML key should represent the same path or stream. This removes the old conflict class where a command line could set `--input-root` but Hydra overrides could silently point `streams.base_path` somewhere else.
+
+Important runtime config values:
+
+| Config | Role |
+| --- | --- |
+| `seed` | Seeds Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels. |
+| `pipeline.slam.buffer` | Max number of keyframes kept in the graph buffer. |
+| `pipeline.slam.filter_thresh` | Motion threshold for keyframe creation. |
+| `pipeline.slam.ba.dense_disp_alpha` | Weight for external sensor-depth disparity regularization. |
+| `pipeline.slam.infill_chunk_size` | Non-keyframe pose infill chunk size. |
+| `pipeline.output.*` | TSDF point-cloud output controls. |
+
+## What Is Intentionally Gone
+
+The current codebase intentionally does not support these runtime branches:
+
+| Removed branch | Replacement |
+| --- | --- |
+| Image directory without metadata | Extract or convert to canonical `metadata.json` first. |
+| `streams.base_path` | `run.py --input-dir`. |
+| `streams.fps` | `metadata.json["fps"]`. |
+| JPG/BMP/TIFF runtime discovery | Canonical `metadata.json["frames"]` paths. |
+| Filename sort heuristics | Metadata frame order. |
+| ScanNet TXT intrinsic fallback | `intrinsic/intrinsic_color.json`. |
+| Multiple intrinsic JSON schemas | `vipe_pinhole_intrinsics_v1`. |
+| Runtime OpenCV distortion wrapper | Rectify in extractor, write pinhole intrinsics. |
+| Runtime depth resizing | Extractor must write RGB-sized depth. |
+| Benchmark stream overrides | `--input-root/<scene>` only. |
+| `pipeline.output.save_artifacts` | Artifacts are always saved. |
+
+This is the key invariant: if a path reaches `run.py` or the ScanNet benchmark, it must already be canonical.
 
 ## Object Glossary
 
 | Object | Meaning |
 | --- | --- |
-| `FrameDir` | Lazy reader for one RGB directory, its sibling depth directory, and its sibling intrinsic file. |
-| `SensorCamera` | External RGB/color calibration metadata loaded from JSON/TXT. |
-| `OpenCVPinholeNormalizedFrameStream` | Lazy wrapper that undistorts RGB/depth into the loaded output pinhole camera. |
-| `FrameData.sensor_depth` | External input depth in meters, already resized/undistorted if a wrapper is active. |
+| `metadata.json` | Canonical scene manifest and frame-order authority. |
+| `FrameDir` | Lazy canonical scene reader for RGB, depth, metadata, and pinhole intrinsics. |
+| `SensorCamera` | Loaded undistorted pinhole RGB/color calibration metadata. |
+| `FrameData.sensor_depth` | External input depth in meters, already aligned to RGB frame by extraction. |
 | `FrameData.metric_depth` | Final output depth, assigned from valid `sensor_depth` in Stage 5. |
+| `StandardResizeFrameProcessor` | Resize/crop logic used before DROID/SLAM, plus inverse intrinsics recovery. |
 | `GraphBuffer` | Persistent SLAM state table: keyframe poses, disparities, sensor-depth anchors, DROID features. |
 | `FactorGraph` | Edge/factor manager that refreshes learned DROID targets and invokes BA. |
 | `frontend.graph` | Persistent incremental factor graph used during pass 1. |
-| backend graph | Fresh non-incremental factor graph created once in Stage 3. |
-| `SLAMOutput` | Final handoff object containing full trajectory and recovered original-resolution intrinsics. |
+| Backend graph | Fresh non-incremental factor graph created once in Stage 3. |
+| `InnerFiller` | Motion-only pose optimizer for non-keyframe frames. |
+| `SLAMOutput` | Final handoff object containing full trajectory, original-resolution intrinsics, and keyframe indices. |
+| `ArtifactPath` | Output naming wrapper for `pose/<scene>.npz` and `pcd/<scene>_tsdf.ply`. |

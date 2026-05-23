@@ -17,7 +17,6 @@ import logging
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
 
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
@@ -80,11 +79,10 @@ class SLAMSystem:
     def __init__(
         self,
         device: torch.device,
-        config: DictConfig,
+        config,
     ) -> None:
         self.device = device
         self.config = config.copy()
-        OmegaConf.set_struct(self.config, False)
 
     def _build_components(self):
         self.droid_net = DroidNet().to(self.device)

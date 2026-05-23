@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from tqdm import tqdm
 
-from vipe.utils.misc import sort_image_sequence
+from vipe.utils.data_format import intrinsic_matrix, read_pinhole_intrinsics, read_scene_frames
 
 
 class AttrDict(dict):
@@ -514,18 +514,12 @@ class ScanNetDataset:
         if scene in self._scene_cache:
             return self._scene_cache[scene]
 
-        dataset_config = self.config.dataset
         scene_dir = self.data_root / scene
-        color_dir = scene_dir / dataset_config.color_relpath
-        pose_dir = scene_dir / dataset_config.pose_relpath
-        intrinsic_path = scene_dir / dataset_config.intrinsic_relpath
-        if not color_dir.is_dir():
-            raise FileNotFoundError(f"Missing ScanNet color dir: {color_dir}")
-        if not pose_dir.is_dir():
-            raise FileNotFoundError(f"Missing ScanNet pose dir: {pose_dir}")
+        intrinsic_path = scene_dir / "intrinsic" / "intrinsic_color.json"
         if not intrinsic_path.is_file():
             raise FileNotFoundError(f"Missing ScanNet intrinsic file: {intrinsic_path}")
 
+        dataset_config = self.config.dataset
         raw_scene_dir = self.raw_root / scene
         gt_mesh_path = raw_scene_dir / f"{scene}{dataset_config.gt_mesh_suffix}"
         if not gt_mesh_path.is_file():
@@ -535,17 +529,19 @@ class ScanNetDataset:
             else:
                 raise FileNotFoundError(f"Missing ScanNet GT mesh: {gt_mesh_path} (and fallback {fallback})")
 
-        ixt_shared = np.loadtxt(intrinsic_path, dtype=np.float32)[:3, :3]
-        image_files = sort_image_sequence(color_dir.glob(dataset_config.color_glob))
+        ixt_shared = intrinsic_matrix(read_pinhole_intrinsics(intrinsic_path))
+        frames = read_scene_frames(scene_dir, require_pose=True)
         out = AttrDict(image_files=[], extrinsics=[], intrinsics=[], aux=AttrDict(gt_mesh_path=str(gt_mesh_path)))
-        for img_path in tqdm(image_files, desc=f"[ScanNet] {scene} load poses", leave=False):
-            frame_id = img_path.stem
-            pose_path = pose_dir / f"{frame_id}{dataset_config.pose_suffix}"
+        for frame in tqdm(frames, desc=f"[ScanNet] {scene} load poses", leave=False):
+            img_path = scene_dir / frame["color_file"]
+            pose_path = scene_dir / frame["pose_file"]
+            if not img_path.is_file():
+                raise FileNotFoundError(f"Missing ScanNet color frame: {img_path}")
             if not pose_path.is_file():
-                continue
+                raise FileNotFoundError(f"Missing ScanNet pose file: {pose_path}")
             c2w = np.loadtxt(pose_path, dtype=np.float32)
             if c2w.shape != (4, 4):
-                continue
+                raise ValueError(f"Expected 4x4 ScanNet pose matrix: {pose_path}")
             out.image_files.append(str(img_path))
             out.extrinsics.append(np.linalg.inv(c2w).astype(np.float32))
             out.intrinsics.append(ixt_shared.copy())

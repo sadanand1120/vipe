@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
 from typing import Optional, TypeVar
 
 
@@ -26,11 +25,3 @@ def unpack_optional(maybe_value: Optional[T]) -> T:
         raise ValueError("Can't unpack empty optional")
 
     return maybe_value
-
-
-def sort_image_sequence(paths):
-    """Sort pure numeric frame names numerically; otherwise use plain lexicographic order."""
-    paths = list(paths)
-    if paths and all(Path(path).stem.isdigit() for path in paths):
-        return sorted(paths, key=lambda path: (int(Path(path).stem), str(path)))
-    return sorted(paths, key=str)

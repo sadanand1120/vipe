@@ -11,24 +11,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import yaml
-
 from vipe import get_config_path
 from vipe.bench.scannet import AttrDict, ScanNetEvaluator
+from vipe.utils.config import load_yaml_config
 from vipe.utils.determinism import seed_everything
-from vipe.utils.misc import sort_image_sequence
 
 
 WORKER_ENV = "_VIPE_SCANNET_BENCH_WORKER"
+PIPELINE_CONFIG_PATH = get_config_path() / "default.yaml"
 EVAL_CONFIG_PATH = get_config_path() / "eval_scannet_config.yaml"
-
-
-def _load_eval_config() -> dict[str, Any]:
-    with EVAL_CONFIG_PATH.open("r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    if not isinstance(config, dict):
-        raise ValueError(f"Invalid ScanNet eval config: {EVAL_CONFIG_PATH}")
-    return config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="ScanNet scene names, e.g. scene0000_00 scene0011_00",
     )
     parser.add_argument("--work-dir", required=True, type=Path, help="Benchmark workspace/output directory")
-    parser.add_argument("--input-root", required=True, type=Path, help="Processed ScanNet input root")
+    parser.add_argument("--input-root", required=True, type=Path, help="Canonical ViPE ScanNet scene root")
     parser.add_argument("--raw-root", required=True, type=Path, help="Raw ScanNet scans root with GT meshes")
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
@@ -51,93 +42,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _override_value(overrides: list[str], key: str) -> str | None:
-    prefix = f"{key}="
-    for item in reversed(overrides):
-        if item.startswith(prefix):
-            return item[len(prefix) :]
-    return None
-
-
-def _set_override(overrides: list[str], key: str, value: Any) -> list[str]:
-    prefix = f"{key}="
-    return [item for item in overrides if not item.startswith(prefix)] + [f"{key}={value}"]
-
-
-def _image_files(frame_dir: Path, extensions: list[str]) -> list[Path]:
-    files: list[Path] = []
-    for ext in extensions:
-        files.extend(frame_dir.glob(f"*{ext}"))
-        files.extend(frame_dir.glob(f"*{ext.upper()}"))
-    return sort_image_sequence(set(files))
-
-
-def _format_scene_path(value: str | Path, scene: str) -> Path:
-    return Path(str(value).format(scene=scene))
-
-
-def _single_scene(args: argparse.Namespace) -> bool:
-    return len(args.scenes) == 1
-
-
-def _resolve_scene_value(args: argparse.Namespace, value: str | Path | None, scene: str, name: str) -> Path | None:
-    if value is None:
-        return None
-    value_str = str(value)
-    if "{scene}" in value_str:
-        return _format_scene_path(value_str, scene)
-    if _single_scene(args):
-        return Path(value_str)
-    raise ValueError(f"{name} must include '{{scene}}' when evaluating multiple scenes")
-
-
-def _resolve_frame_dir(args: argparse.Namespace, vipe_overrides: list[str], scene: str) -> Path:
-    base_path = _override_value(vipe_overrides, "streams.base_path")
-    resolved = _resolve_scene_value(args, base_path, scene, "streams.base_path")
-    if resolved is not None:
-        return resolved
-    return args.input_root / scene / "color"
-
-
 def _resolve_vipe_output_dir(args: argparse.Namespace, scene: str) -> Path:
     return args.work_dir / "vipe_outputs" / scene
 
 
-def _prepare_vipe_overrides(args: argparse.Namespace, vipe_overrides: list[str], scene: str) -> tuple[list[str], Path, Path]:
-    frame_dir = _resolve_frame_dir(args, vipe_overrides, scene)
-    vipe_output_dir = _resolve_vipe_output_dir(args, scene)
-
-    overrides = list(vipe_overrides)
-    overrides = _set_override(overrides, "streams.base_path", frame_dir)
-    overrides = _set_override(overrides, "pipeline.output.save_artifacts", "true")
-    return overrides, frame_dir, vipe_output_dir
+def _scene_dir(args: argparse.Namespace, scene: str) -> Path:
+    return args.input_root / scene
 
 
-def _compose_vipe_cfg(overrides: list[str]):
-    import hydra
-
-    from vipe import get_config_path
-
-    with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
-        return hydra.compose("default", overrides=overrides)
-
-
-def run_vipe(overrides: list[str], output_dir: Path) -> None:
+def run_vipe(scene_dir: Path, pipeline_cfg, output_dir: Path) -> None:
     from vipe.pipeline import VipePipeline
     from vipe.streams.base import FrameDir
     from vipe.utils.logging import configure_logging
 
-    cfg = _compose_vipe_cfg(overrides)
+    seed_everything(pipeline_cfg.seed)
     logger = configure_logging()
     pipeline = VipePipeline(
-        slam=cfg.pipeline.slam,
-        output=cfg.pipeline.output,
+        slam=pipeline_cfg.pipeline.slam,
+        output=pipeline_cfg.pipeline.output,
         output_dir=output_dir,
     )
-    stream = FrameDir(
-        path=cfg.streams.base_path,
-        fps=cfg.streams.fps,
-    )
+    stream = FrameDir(path=scene_dir)
     logger.info(f"Running ViPE on {stream.name()}")
     pipeline.run(stream)
 
@@ -159,42 +84,18 @@ def _subset_scene_data(scene_data, keep_indices: list[int]):
 
 
 def _benchmark_frame_request(
-    args: argparse.Namespace,
     evaluator,
     scene: str,
-    frame_dir: Path,
-    scene_overrides: list[str],
 ) -> tuple[Any, list[int], list[int]]:
     dataset = evaluator.datasets["scannet"]
     full_scene_data = dataset.get_data(scene)
-
-    frame_files = _image_files(frame_dir, evaluator.config.dataset.vipe_image_extensions)
-    frame_index_by_path = {str(path.resolve()): idx for idx, path in enumerate(frame_files)}
-    full_index_by_image = {str(Path(path).resolve()): idx for idx, path in enumerate(full_scene_data.image_files)}
-    frame_indices = []
-    kept_scene_indices = []
-    missing = []
-
-    for image_file in full_scene_data.image_files:
-        image_key = str(Path(image_file).resolve())
-        if image_key not in frame_index_by_path:
-            missing.append(f"{image_file}: not found in ViPE frame dir")
-            continue
-        raw_frame_idx = frame_index_by_path[image_key]
-        if image_key not in full_index_by_image:
-            missing.append(f"{image_file}: not found in full ScanNet scene data")
-            continue
-
-        frame_indices.append(raw_frame_idx)
-        kept_scene_indices.append(full_index_by_image[image_key])
-
-    if missing:
-        raise ValueError("ViPE input frames do not cover the benchmark frame set:\n" + "\n".join(missing[:20]))
+    frame_indices = list(range(len(full_scene_data.image_files)))
+    kept_scene_indices = list(frame_indices)
     return full_scene_data, frame_indices, kept_scene_indices
 
 
-def _artifact_name(frame_dir: Path) -> str:
-    return frame_dir.name
+def _artifact_name(scene_dir: Path) -> str:
+    return scene_dir.name
 
 
 def _write_vipe_manifest(
@@ -206,7 +107,7 @@ def _write_vipe_manifest(
     kept_scene_indices: list[int],
     vipe_output_dir: Path,
     artifact_name: str,
-    scene_overrides: list[str],
+    pipeline_cfg,
 ) -> None:
     print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={len(frame_indices)}", flush=True)
 
@@ -217,7 +118,6 @@ def _write_vipe_manifest(
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
 
-    cfg = _compose_vipe_cfg(scene_overrides)
     manifest = {
         "format": "vipe_artifacts_v1",
         "scene": scene,
@@ -226,12 +126,12 @@ def _write_vipe_manifest(
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
         "output": {
-            "pcd_max_points": int(cfg.pipeline.output.pcd_max_points),
-            "pcd_tsdf_voxel_edge_m": float(cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
-            "pcd_tsdf_sdf_trunc_m": float(cfg.pipeline.output.pcd_tsdf_sdf_trunc_m),
-            "pcd_tsdf_depth_trunc_m": float(cfg.pipeline.output.pcd_tsdf_depth_trunc_m),
-            "pcd_tsdf_num_voxels_per_block_edge": int(cfg.pipeline.output.pcd_tsdf_num_voxels_per_block_edge),
-            "pcd_tsdf_depth_sampling_stride": int(cfg.pipeline.output.pcd_tsdf_depth_sampling_stride),
+            "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
+            "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
+            "pcd_tsdf_sdf_trunc_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_sdf_trunc_m),
+            "pcd_tsdf_depth_trunc_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_depth_trunc_m),
+            "pcd_tsdf_num_voxels_per_block_edge": int(pipeline_cfg.pipeline.output.pcd_tsdf_num_voxels_per_block_edge),
+            "pcd_tsdf_depth_sampling_stride": int(pipeline_cfg.pipeline.output.pcd_tsdf_depth_sampling_stride),
         },
         "frame_indices": [int(idx) for idx in frame_indices],
     }
@@ -330,16 +230,15 @@ def _load_evaluator(args: argparse.Namespace, eval_config: dict[str, Any]):
     )
 
 
-def _append_common_cli_args(cmd: list[str], args: argparse.Namespace, vipe_overrides: list[str]) -> list[str]:
+def _append_common_cli_args(cmd: list[str], args: argparse.Namespace) -> list[str]:
     cmd += ["--scenes", *args.scenes]
     cmd += ["--work-dir", str(args.work_dir)]
     cmd += ["--input-root", str(args.input_root)]
     cmd += ["--raw-root", str(args.raw_root)]
-    cmd += vipe_overrides
     return cmd
 
 
-def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> tuple[dict, dict] | None:
+def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
     if args.print_only or os.environ.get(WORKER_ENV) == "1":
         return None
 
@@ -354,7 +253,7 @@ def maybe_spawn_workers(args: argparse.Namespace, vipe_overrides: list[str]) -> 
     if len(gpu_list) <= 1:
         return None
 
-    base_cmd = _append_common_cli_args([sys.executable, os.path.abspath(__file__)], args, vipe_overrides)
+    base_cmd = _append_common_cli_args([sys.executable, os.path.abspath(__file__)], args)
 
     print(f"[INFO] Detected {len(gpu_list)} GPUs for ViPE ScanNet benchmark: {gpu_list}")
     processes = []
@@ -395,18 +294,17 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
 def prepare_vipe_benchmark_exports(
     args: argparse.Namespace,
     evaluator,
-    vipe_overrides: list[str],
+    pipeline_cfg,
 ) -> tuple[dict, dict]:
     build_timing = {}
     metric_timing = {}
     for scene in _scenes_for_worker(args, evaluator):
         start_scene = time.perf_counter()
-        scene_overrides, frame_dir, vipe_output_dir = _prepare_vipe_overrides(args, vipe_overrides, scene)
-        full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(
-            args, evaluator, scene, frame_dir, scene_overrides
-        )
+        scene_dir = _scene_dir(args, scene)
+        vipe_output_dir = _resolve_vipe_output_dir(args, scene)
+        full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(evaluator, scene)
         start_build = time.perf_counter()
-        run_vipe(scene_overrides, vipe_output_dir)
+        run_vipe(scene_dir, pipeline_cfg, vipe_output_dir)
         build_seconds = time.perf_counter() - start_build
         _write_vipe_manifest(
             args,
@@ -416,8 +314,8 @@ def prepare_vipe_benchmark_exports(
             frame_indices,
             kept_scene_indices,
             vipe_output_dir,
-            _artifact_name(frame_dir),
-            scene_overrides,
+            _artifact_name(scene_dir),
+            pipeline_cfg,
         )
         frames = len(frame_indices)
         metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
@@ -493,10 +391,11 @@ def print_scannet_summary(metrics) -> None:
 
 
 def main() -> None:
-    eval_config = _load_eval_config()
     parser = build_parser()
-    args, vipe_overrides = parser.parse_known_args()
-    seed_everything(int(eval_config["seed"]))
+    args = parser.parse_args()
+    pipeline_cfg = load_yaml_config(PIPELINE_CONFIG_PATH)
+    eval_config = load_yaml_config(EVAL_CONFIG_PATH)
+    seed_everything(int(eval_config.seed))
     is_worker = os.environ.get(WORKER_ENV) == "1"
 
     evaluator = _load_evaluator(args, eval_config)
@@ -506,7 +405,7 @@ def main() -> None:
         print_scannet_summary(metrics)
         return
 
-    build_timing = maybe_spawn_workers(args, vipe_overrides)
+    build_timing = maybe_spawn_workers(args)
     if build_timing is not None:
         build_scene_timing, metric_scene_timing = build_timing
         metrics = evaluator.eval()
@@ -515,7 +414,7 @@ def main() -> None:
         print_scannet_summary(metrics)
         return
 
-    build_scene_timing, metric_scene_timing = prepare_vipe_benchmark_exports(args, evaluator, vipe_overrides)
+    build_scene_timing, metric_scene_timing = prepare_vipe_benchmark_exports(args, evaluator, pipeline_cfg)
     if is_worker:
         _write_worker_timing(args, build_scene_timing, metric_scene_timing)
         return

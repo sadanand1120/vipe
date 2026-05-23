@@ -6,16 +6,11 @@ import logging
 from pathlib import Path
 from typing import Iterator
 
-import cv2
-import numpy as np
 import torch
-
-from omegaconf import DictConfig
-from torch.nn import functional as F
 
 from vipe.slam.interface import SLAMOutput
 from vipe.slam.system import SLAMSystem
-from vipe.streams.base import FrameData, FrameStream, SensorCamera
+from vipe.streams.base import FrameData, FrameStream
 from vipe.utils import io
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
@@ -24,100 +19,8 @@ from vipe.utils.logging import pbar
 logger = logging.getLogger(__name__)
 
 
-class OpenCVPinholeNormalizedFrameStream(FrameStream):
-    def __init__(self, frame_stream: FrameStream, camera: SensorCamera) -> None:
-        super().__init__()
-        self.frame_stream = frame_stream
-        self.camera = camera
-        self.grid = self._build_undistort_grid(camera)
-        self.grid_valid_mask = self._grid_valid_mask(self.grid)
-
-    @staticmethod
-    def _build_undistort_grid(camera: SensorCamera) -> torch.Tensor:
-        assert camera.distortion_coefficients is not None
-        mapx, mapy = cv2.initUndistortRectifyMap(
-            camera.input_k,
-            camera.distortion_coefficients,
-            np.eye(3, dtype=np.float32),
-            camera.output_k,
-            (camera.width, camera.height),
-            cv2.CV_32FC1,
-        )
-        grid = torch.as_tensor(np.stack((mapx, mapy), axis=-1), dtype=torch.float32).cuda()[None]
-        scale = torch.tensor([camera.width - 1, camera.height - 1], dtype=torch.float32).cuda()
-        return 2.0 * grid / scale - 1.0
-
-    @staticmethod
-    def _grid_valid_mask(grid: torch.Tensor) -> torch.Tensor:
-        xy = grid[0]
-        return (
-            torch.isfinite(xy).all(dim=-1)
-            & (xy[..., 0] >= -1.0)
-            & (xy[..., 0] <= 1.0)
-            & (xy[..., 1] >= -1.0)
-            & (xy[..., 1] <= 1.0)
-        )
-
-    def _remap_image(self, image: torch.Tensor) -> torch.Tensor:
-        remapped = F.grid_sample(
-            image.permute(2, 0, 1)[None],
-            self.grid,
-            mode="bilinear",
-            align_corners=True,
-        )[0]
-        return remapped.permute(1, 2, 0).clamp(0.0, 1.0)
-
-    def _remap_map(self, image: torch.Tensor, mode: str) -> torch.Tensor:
-        return F.grid_sample(image[None, None], self.grid, mode=mode, align_corners=True)[0, 0]
-
-    def _remap_valid_mask(self, mask: torch.Tensor | None) -> torch.Tensor:
-        if mask is None:
-            return self.grid_valid_mask
-        return (self._remap_map(mask.float(), mode="nearest") > 0.5) & self.grid_valid_mask
-
-    def frame_size(self) -> tuple[int, int]:
-        return self.frame_stream.frame_size()
-
-    def name(self) -> str:
-        return self.frame_stream.name()
-
-    def fps(self) -> float:
-        return self.frame_stream.fps()
-
-    def sensor_camera(self) -> SensorCamera | None:
-        return self.frame_stream.sensor_camera()
-
-    def __len__(self) -> int:
-        return len(self.frame_stream)
-
-    def __getitem__(self, index: int) -> FrameData:
-        frame = self.frame_stream[index]
-        image_valid_mask = self._remap_valid_mask(frame.image_valid_mask)
-        rgb = self._remap_image(frame.rgb)
-        rgb = torch.where(image_valid_mask[..., None], rgb, torch.zeros_like(rgb))
-
-        sensor_depth = self._remap_map(frame.sensor_depth, mode="nearest")
-        valid_depth = torch.isfinite(sensor_depth) & (sensor_depth > 0.0) & image_valid_mask
-        sensor_depth = torch.where(valid_depth, sensor_depth, torch.zeros_like(sensor_depth))
-
-        return FrameData(
-            raw_frame_idx=frame.raw_frame_idx,
-            rgb=rgb,
-            sensor_depth=sensor_depth,
-            pose=frame.pose,
-            camera_type=frame.camera_type,
-            intrinsics=frame.intrinsics,
-            image_valid_mask=image_valid_mask,
-            information=frame.information,
-        )
-
-    def __iter__(self) -> Iterator[FrameData]:
-        for frame_idx in range(len(self)):
-            yield self[frame_idx]
-
-
 class VipePipeline:
-    def __init__(self, slam: DictConfig, output: DictConfig, output_dir: str | Path) -> None:
+    def __init__(self, slam, output, output_dir: str | Path) -> None:
         self.slam_cfg = slam
         self.out_cfg = output
         self.out_path = Path(output_dir)
@@ -129,18 +32,6 @@ class VipePipeline:
             raise ValueError("Input stream must provide external RGB/color intrinsics")
 
         intrinsics = camera.pinhole_intrinsics()
-        if camera.has_distortion:
-            logger.info(
-                "Normalizing loaded %s camera to pinhole from %s: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
-                camera.distortion_model,
-                camera.source_path,
-                intrinsics[0].item(),
-                intrinsics[1].item(),
-                intrinsics[2].item(),
-                intrinsics[3].item(),
-            )
-            return OpenCVPinholeNormalizedFrameStream(frame_stream, camera), intrinsics
-
         logger.info(
             "Using loaded pinhole intrinsics from %s: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
             camera.source_path,
@@ -181,9 +72,6 @@ class VipePipeline:
         frame_stream: FrameStream,
         slam_output: SLAMOutput,
     ) -> None:
-        if not self.out_cfg.save_artifacts:
-            return
-
         logger.info(f"Saving artifacts to {artifact_path}")
         io.save_artifacts(
             artifact_path,

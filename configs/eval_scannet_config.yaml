@@ -1,12 +1,6 @@
 seed: 42                                  # Seed Python/NumPy/Torch/Open3D RNGs for benchmark-side sampling.
 
 dataset:
-  color_relpath: color                     # Scene-relative RGB frame directory.
-  pose_relpath: pose                       # Scene-relative ScanNet GT pose directory.
-  color_glob: "*.jpg"                      # RGB frames used by ScanNet eval loading.
-  pose_suffix: ".txt"                      # GT pose filename suffix for each RGB frame stem.
-  vipe_image_extensions: [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"] # Extensions accepted in ViPE frame dirs.
-  intrinsic_relpath: intrinsic/intrinsic_color.txt # Scene-relative ScanNet color intrinsic file.
   gt_mesh_suffix: _vh_clean_2.ply          # Preferred raw ScanNet GT mesh suffix.
   gt_mesh_fallback_suffix: _vh_clean.ply   # Fallback raw ScanNet GT mesh suffix.
 

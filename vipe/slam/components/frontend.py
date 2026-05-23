@@ -20,8 +20,6 @@
 
 import torch
 
-from omegaconf import DictConfig
-
 from vipe.ext.lietorch.groups import SE3
 
 from ..networks.droid_net import DroidNet
@@ -35,7 +33,7 @@ class SLAMFrontend:
     For keyframe, it handles the system initialization and partial update logic (i.e. use BA to get pose for this kf).
     """
 
-    def __init__(self, net: DroidNet, video: GraphBuffer, args: DictConfig, device: torch.device):
+    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device):
         self.video = video
         self.graph = FactorGraph(
             net,

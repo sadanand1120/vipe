@@ -1,7 +1,3 @@
-streams:
-  base_path: ??       # Required input frame directory.
-  fps: ??             # Required input frame rate.
-
 seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels.
 
 pipeline:
@@ -34,7 +30,6 @@ pipeline:
       dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
 
   output:
-    save_artifacts: false                # Save pose and TSDF point-cloud artifacts.
     pcd_max_points: 10000000             # Max saved TSDF PCD points.
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
     pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.

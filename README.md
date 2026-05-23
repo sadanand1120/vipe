@@ -1,6 +1,6 @@
-# ViPE: External-Depth Frame-Directory Fork
+# ViPE: Canonical RGB-D Scene Fork
 
-This fork keeps one supported runtime path: a single RGB frame directory with external RGB/color intrinsics and external sensor depth. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided depth as the dense depth source, and writes pose plus native TSDF point-cloud artifacts.
+This fork keeps one supported runtime path: a canonical ViPE RGB-D scene directory. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided metric depth as the dense depth source, and writes pose plus native TSDF point-cloud artifacts. Dataset-specific cleanup, synchronization, and rectification happen before runtime in `scripts/data_extract/`.
 
 ## Installation
 
@@ -15,28 +15,34 @@ pip3 install --no-build-isolation -e .
 
 ## Input Layout
 
-`streams.base_path` must point to the RGB directory. The sibling `depth/` and `intrinsic/` directories are required:
+`--input-dir` must point to the canonical scene root:
 
 ```text
-<scene>/color/<frame_id>.jpg|png
-<scene>/depth/<frame_id>.png
-<scene>/intrinsic/intrinsic_color.json  # preferred when present
-<scene>/intrinsic/intrinsic_color.txt   # ScanNet-style pinhole fallback
+<scene>/metadata.json
+<scene>/color/000000.png
+<scene>/depth/000000.png
+<scene>/intrinsic/intrinsic_color.json
 ```
 
-Depth PNG values are interpreted as millimeters and converted to meters. Image names with pure numeric stems are sorted numerically; all other names are sorted lexicographically.
+`metadata.json` is the source of truth for frame order. Each frame record names `color_file` and `depth_file`, and ScanNet benchmark scenes also include `pose_file`. Color is RGB8 PNG on disk, depth is `uint16` PNG in millimeters, and intrinsics are undistorted pinhole only. Runtime does not accept sidecar TXT intrinsics, JPG image discovery, `streams.fps`, or runtime OpenCV distortion branches.
+
+Dataset converters live under `scripts/data_extract/`:
+
+```bash
+python3 scripts/data_extract/scannet_to_vipe.py --scans-root /path/to/scannet/scans --output-root data/scannet --scenes scene0000_00 --frame-skip 1
+python3 scripts/data_extract/rosbag_to_vipe.py /path/to/bag.mcap --output-dir data/kinect_rosbags/processed/bag_scene
+TMPDIR=data/depthcapture_rosbags/processed python3 scripts/data_extract/depthcapture_to_vipe.py data/depthcapture_rosbags/raw/Balanced.zip --output-dir data/depthcapture_rosbags/processed/Balanced
+```
 
 ## Standalone Run
 
 ```bash
 python run.py \
-  --output-dir /path/to/output \
-  streams.base_path=/path/to/scene/color \
-  streams.fps=30 \
-  pipeline.output.save_artifacts=true
+  --input-dir /path/to/scene \
+  --output-dir /path/to/output
 ```
 
-Useful output knobs:
+Useful output knobs in `configs/default.yaml`:
 
 - `pipeline.output.pcd_max_points=10000000`: cap saved TSDF point cloud points.
 - `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=16`: TSDF voxel block edge size.
@@ -44,8 +50,8 @@ Useful output knobs:
 
 Saved artifacts:
 
-- `pose/color.npz`: camera-to-world pose per selected frame.
-- `pcd/color_tsdf.ply`: native TSDF-fused sampled point cloud.
+- `pose/<scene>.npz`: camera-to-world pose per selected frame.
+- `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud.
 
 ## ScanNet Benchmark
 
@@ -53,11 +59,10 @@ Saved artifacts:
 python3 scripts/scannet_vipe_bench_evaluator.py \
   --scenes scene0000_00 scene0011_00 scene0378_00 \
   --work-dir ./workspace/evaluation_scannet_vipe_external_depth \
-  --input-root /robodata/smodak/repos/ovo/data/input/ScanNet \
-  --raw-root /robodata/smodak/datasets/scannet_v2/scans \
-  streams.fps=30
+  --input-root data/scannet \
+  --raw-root /robodata/smodak/datasets/scannet_v2/scans
 ```
 
-The benchmark adapter runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
+The benchmark adapter assumes `--input-root/<scene>` is already canonical. It runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
 For benchmark runs, `--work-dir` owns the outputs: ViPE artifacts are written under `<work-dir>/vipe_outputs/<scene>`, benchmark manifests/caches under `<work-dir>/model_results/...`, and metric JSONs under `<work-dir>/metric_results/...`.
-ScanNet-specific benchmark knobs live in `configs/eval_scannet_config.yaml`; dataset roots stay explicit CLI inputs via `--input-root` and `--raw-root`.
+Runtime knobs live in `configs/default.yaml`; ScanNet-specific benchmark knobs live in `configs/eval_scannet_config.yaml`. Dataset roots stay explicit CLI inputs via `--input-dir`, `--input-root`, and `--raw-root`.

@@ -1,5 +1,11 @@
-export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='4' && python3 run.py streams.base_path=data/rosbags/distilled_bag/color streams.fps=14.0 --output-dir outputs/distilledbag pipeline.output.save_artifacts=true && python3 run.py streams.base_path=data/rosbags/distilled_bag2/color streams.fps=2.5 --output-dir outputs/distilledbag2 pipeline.output.save_artifacts=true && python3 run.py streams.base_path=data/rosbags/distilled_bag3/color streams.fps=2.5 --output-dir outputs/distilledbag3 pipeline.output.save_artifacts=true
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='6' && python3 run.py --input-dir data/kinect_rosbags/processed/distilled_bag --output-dir outputs/distilledbag_new && python3 run.py --input-dir data/kinect_rosbags/processed/distilled_bag2 --output-dir outputs/distilledbag2_new && python3 run.py --input-dir data/kinect_rosbags/processed/distilled_bag3 --output-dir outputs/distilledbag3_new
 
-export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='4,6,7' && python3 scripts/scannet_vipe_bench_evaluator.py --scenes scene0000_00 scene0011_00 scene0378_00 --work-dir ./workspace/evaluation_scannet_default --input-root /robodata/smodak/repos/ovo/data/input/ScanNet --raw-root /robodata/smodak/datasets/scannet_v2/scans streams.fps=30
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='4,6,7' && python3 scripts/scannet_vipe_bench_evaluator.py --scenes scene0000_00 scene0011_00 scene0378_00 --work-dir ./workspace/evaluation_scannet_default --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans
 
-python3 scripts/export_distilled_bag_scannet.py data/rosbags/distilled_bag --overwrite
+python3 scripts/data_extract/rosbag_to_vipe.py data/kinect_rosbags/raw/distilled_bag2/distilled_bag2_0.mcap --output-dir data/kinect_rosbags/processed/distilled_bag2
+
+TMPDIR=data/depthcapture_rosbags/processed python3 scripts/data_extract/depthcapture_to_vipe.py data/depthcapture_rosbags/raw/Balanced.zip --output-dir data/depthcapture_rosbags/processed/Balanced
+
+TMPDIR=data/depthcapture_rosbags/processed python3 scripts/data_extract/depthcapture_to_vipe.py data/depthcapture_rosbags/raw/HighQ.zip --output-dir data/depthcapture_rosbags/processed/HighQ
+
+python3 scripts/data_extract/scannet_to_vipe.py --scans-root /robodata/smodak/datasets/scannet_v2/scans --output-root data/scannet --scenes scene0000_00 scene0011_00 scene0378_00 --frame-skip 1

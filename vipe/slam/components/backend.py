@@ -20,8 +20,6 @@
 
 import torch
 
-from omegaconf import DictConfig
-
 from ..networks.droid_net import DroidNet
 from .buffer import GraphBuffer
 from .factor_graph import FactorGraph
@@ -32,7 +30,7 @@ class SLAMBackend:
     Mainly used to run a pretty dense bundle adjustment for all the frames in the graph.
     """
 
-    def __init__(self, net: DroidNet, video: GraphBuffer, args: DictConfig, device: torch.device):
+    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device):
         self.net = net
         self.video = video
         self.args = args

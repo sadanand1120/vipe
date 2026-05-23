@@ -22,8 +22,6 @@ from dataclasses import dataclass
 
 import torch
 
-from omegaconf import DictConfig
-
 from vipe.ext.lietorch.groups import SE3, cat
 
 from ..networks.droid_net import DroidNet
@@ -42,7 +40,7 @@ class PoseInfillResult:
 class InnerFiller:
     """This class is used to fill in non-keyframe poses"""
 
-    def __init__(self, net: DroidNet, video: GraphBuffer, args: DictConfig, device: torch.device):
+    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device):
         self.video = video
         self.net = net
         self.device = device

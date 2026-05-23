@@ -21,12 +21,12 @@ dynamic = ["version"]
 dependencies = [
     "numpy",
     "einops",
-    "omegaconf",
-    "hydra-core",
     "tqdm",
     "imageio[ffmpeg]",
     "opencv-python",
     "gdown",
+    "mcap",
+    "mcap-ros2-support",
     "scipy",
     "open3d>=0.19.0",
 ]
