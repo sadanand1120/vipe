@@ -8,7 +8,7 @@ raw dataset export
 -> lazy FrameDir stream
 -> DROID/ViPE SLAM with external sensor-depth anchors
 -> full camera trajectory
--> pose NPZ and native TSDF point cloud
+-> pose NPZ and native RGB+normal TSDF point cloud
 -> optional ScanNet benchmark metrics
 ```
 
@@ -60,7 +60,7 @@ flowchart LR
 | Stage 2 | Once over all frames | Keyframe-only `GraphBuffer`, incrementally optimized by frontend BA. |
 | Stage 3 | Once over all keyframes | Same `GraphBuffer`, refined by a fresh global backend `FactorGraph`. |
 | Stage 4 | Once over all frames | One pose for every canonical frame. |
-| Stage 5 | Once over all frames | Native artifacts: pose NPZ and TSDF PCD. |
+| Stage 5 | Once over all frames | Native artifacts: pose NPZ and RGB+normal TSDF PCD. |
 
 ## Stage 0: Canonical Scene Extraction
 
@@ -831,7 +831,7 @@ This means the TSDF PCD is built from the provided sensor depth. ViPE estimates 
 | Artifact | Path | Contents |
 | --- | --- | --- |
 | Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: sequential canonical frame indices. |
-| TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points sampled from the native TSDF zero-crossing surface. |
+| TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points with `nx/ny/nz` normals and `normals_red/green/blue` normal colors sampled from the native TSDF zero-crossing surface. |
 
 `artifact_name` is `frame_stream.name()`, which is the input scene directory name unless explicitly overridden.
 
@@ -923,14 +923,18 @@ C
 w \leftarrow w+1.
 ```
 
-After all frames, the extension extracts the zero-crossing surface directly as a point cloud. It scans neighboring voxel samples, keeps cubes whose eight corners are observed and contain both negative and nonnegative TSDF values, decomposes each cube into tetrahedra, linearly interpolates zero-crossing vertices and colors, builds surface triangles, and deterministically samples the resulting triangles by area:
+After all frames, the extension extracts the zero-crossing surface directly as a point cloud. It scans neighboring voxel samples, keeps cubes whose eight corners are observed and contain both negative and nonnegative TSDF values, decomposes each cube into tetrahedra, linearly interpolates zero-crossing vertices, colors, and TSDF-gradient normals, builds surface triangles, and deterministically samples the resulting triangles by area.
+
+Normals are computed from the fused implicit surface, not from per-frame depth maps. At each voxel corner, the extension estimates the TSDF gradient with central differences when both neighbors exist and one-sided differences near sparse-volume boundaries. A zero-crossing vertex interpolates endpoint gradients along the crossing edge and normalizes the result. A sampled point interpolates its triangle vertex normals barycentrically and normalizes again. This writes smooth surface normals tied to the fused TSDF geometry.
 
 ```python
-points, colors = volume.extract_point_cloud(pcd_max_points)
+points, colors, normals = volume.extract_point_cloud(pcd_max_points)
 write_binary_ply(...)
 ```
 
-So the saved reconstruction artifact is the sampled colored point cloud extracted from the final native sparse TSDF volume.
+So the saved reconstruction artifact is the sampled colored point cloud, plus per-point normals, extracted from the final native sparse TSDF volume. The binary PLY vertex schema is `x y z nx ny nz red green blue normals_red normals_green normals_blue`.
+
+The `red/green/blue` properties store the fused RGB color. The `normals_red/normals_green/normals_blue` properties store the normal vector mapped from `[-1,1]` to `[0,255]`, so `quick-tools ply-viewer` can visualize normals as a selectable RGB color set while preserving the actual metric normal vector in `nx/ny/nz`.
 
 Important output knobs in `configs/default.yaml`:
 

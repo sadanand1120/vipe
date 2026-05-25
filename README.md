@@ -50,7 +50,7 @@ Useful output knobs in `configs/default.yaml`:
 Saved artifacts:
 
 - `pose/<scene>.npz`: camera-to-world pose per selected frame.
-- `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud.
+- `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
 
 ## ScanNet Benchmark
 

@@ -51,6 +51,9 @@ struct SurfaceVertex {
     float r;
     float g;
     float b;
+    float nx;
+    float ny;
+    float nz;
 };
 
 struct SurfaceTriangle {
@@ -73,6 +76,12 @@ struct Intrinsics {
     float fy;
     float cx;
     float cy;
+};
+
+struct Vec3f {
+    float x;
+    float y;
+    float z;
 };
 
 static int floor_div(int a, int b) {
@@ -352,13 +361,20 @@ class TSDFVolume {
 
                         std::array<SurfaceVertex, 8> vertices;
                         for (int i = 0; i < 8; ++i) {
+                            const int vx = gx + shifts[i][0];
+                            const int vy = gy + shifts[i][1];
+                            const int vz = gz + shifts[i][2];
+                            const Vec3f normal = tsdf_gradient(vx, vy, vz);
                             vertices[i] = {
-                                    (static_cast<float>(gx + shifts[i][0]) + 0.5f) * voxel_edge_m_,
-                                    (static_cast<float>(gy + shifts[i][1]) + 0.5f) * voxel_edge_m_,
-                                    (static_cast<float>(gz + shifts[i][2]) + 0.5f) * voxel_edge_m_,
+                                    (static_cast<float>(vx) + 0.5f) * voxel_edge_m_,
+                                    (static_cast<float>(vy) + 0.5f) * voxel_edge_m_,
+                                    (static_cast<float>(vz) + 0.5f) * voxel_edge_m_,
                                     voxels[i]->r,
                                     voxels[i]->g,
                                     voxels[i]->b,
+                                    normal.x,
+                                    normal.y,
+                                    normal.z,
                             };
                         }
                         for (const auto &tet : tetrahedra) {
@@ -377,13 +393,15 @@ class TSDFVolume {
         const int64_t out_count = max_points > 0 && tri_count > 0 ? max_points : tri_count * 3;
         auto points = torch::empty({out_count, 3}, torch::dtype(torch::kFloat32).device(torch::kCPU));
         auto colors = torch::empty({out_count, 3}, torch::dtype(torch::kUInt8).device(torch::kCPU));
+        auto normals = torch::empty({out_count, 3}, torch::dtype(torch::kFloat32).device(torch::kCPU));
         float *points_ptr = points.data_ptr<float>();
         uint8_t *colors_ptr = colors.data_ptr<uint8_t>();
+        float *normals_ptr = normals.data_ptr<float>();
         if (max_points <= 0) {
             for (int64_t i = 0; i < tri_count; ++i) {
-                write_vertex(points_ptr, colors_ptr, i * 3 + 0, triangles[i].a);
-                write_vertex(points_ptr, colors_ptr, i * 3 + 1, triangles[i].b);
-                write_vertex(points_ptr, colors_ptr, i * 3 + 2, triangles[i].c);
+                write_vertex(points_ptr, colors_ptr, normals_ptr, i * 3 + 0, triangles[i].a);
+                write_vertex(points_ptr, colors_ptr, normals_ptr, i * 3 + 1, triangles[i].b);
+                write_vertex(points_ptr, colors_ptr, normals_ptr, i * 3 + 2, triangles[i].c);
             }
         } else if (tri_count > 0 && total_area > 0.0) {
             int64_t tri_idx = 0;
@@ -400,10 +418,10 @@ class TSDFVolume {
                 const float w0 = 1.0f - sr1;
                 const float w1 = sr1 * (1.0f - static_cast<float>(r2));
                 const float w2 = sr1 * static_cast<float>(r2);
-                write_vertex(points_ptr, colors_ptr, i, mix_triangle(triangles[tri_idx], w0, w1, w2));
+                write_vertex(points_ptr, colors_ptr, normals_ptr, i, mix_triangle(triangles[tri_idx], w0, w1, w2));
             }
         }
-        return {points, colors};
+        return {points, colors, normals};
     }
 
    private:
@@ -425,9 +443,75 @@ class TSDFVolume {
         return &it->second[index_of(lx, ly, lz)];
     }
 
+    float tsdf_derivative(int gx, int gy, int gz, int ax, int ay, int az, const Voxel *center) const {
+        const Voxel *neg = voxel_at(gx - ax, gy - ay, gz - az);
+        const Voxel *pos = voxel_at(gx + ax, gy + ay, gz + az);
+        const bool has_neg = neg != nullptr && neg->weight > 0.0f;
+        const bool has_pos = pos != nullptr && pos->weight > 0.0f;
+        if (has_neg && has_pos) {
+            return (pos->tsdf - neg->tsdf) / (2.0f * voxel_edge_m_);
+        }
+        if (has_pos) {
+            return (pos->tsdf - center->tsdf) / voxel_edge_m_;
+        }
+        if (has_neg) {
+            return (center->tsdf - neg->tsdf) / voxel_edge_m_;
+        }
+        return 0.0f;
+    }
+
+    Vec3f tsdf_gradient(int gx, int gy, int gz) const {
+        const Voxel *center = voxel_at(gx, gy, gz);
+        if (center == nullptr || center->weight == 0.0f) {
+            return {0.0f, 0.0f, 0.0f};
+        }
+        return {
+                tsdf_derivative(gx, gy, gz, 1, 0, 0, center),
+                tsdf_derivative(gx, gy, gz, 0, 1, 0, center),
+                tsdf_derivative(gx, gy, gz, 0, 0, 1, center),
+        };
+    }
+
     static uint8_t clamp_color(float value) {
         value = std::min(255.0f, std::max(0.0f, value));
         return static_cast<uint8_t>(std::round(value));
+    }
+
+    static float normal_length_sq(const SurfaceVertex &vertex) {
+        return vertex.nx * vertex.nx + vertex.ny * vertex.ny + vertex.nz * vertex.nz;
+    }
+
+    static bool has_normal(const SurfaceVertex &vertex) {
+        return std::isfinite(vertex.nx) && std::isfinite(vertex.ny) && std::isfinite(vertex.nz) &&
+               normal_length_sq(vertex) > 1e-12f;
+    }
+
+    static Vec3f normalize(float x, float y, float z) {
+        const float len_sq = x * x + y * y + z * z;
+        if (!std::isfinite(len_sq) || len_sq <= 1e-12f) {
+            return {0.0f, 0.0f, 0.0f};
+        }
+        const float inv_len = 1.0f / std::sqrt(len_sq);
+        return {x * inv_len, y * inv_len, z * inv_len};
+    }
+
+    static Vec3f face_normal(const SurfaceVertex &a, const SurfaceVertex &b, const SurfaceVertex &c) {
+        const float ux = b.x - a.x;
+        const float uy = b.y - a.y;
+        const float uz = b.z - a.z;
+        const float vx = c.x - a.x;
+        const float vy = c.y - a.y;
+        const float vz = c.z - a.z;
+        return normalize(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+    }
+
+    static SurfaceVertex with_fallback_normal(SurfaceVertex vertex, const Vec3f &fallback) {
+        if (!has_normal(vertex)) {
+            vertex.nx = fallback.x;
+            vertex.ny = fallback.y;
+            vertex.nz = fallback.z;
+        }
+        return vertex;
     }
 
     static SurfaceVertex interpolate(const Voxel *v0, const Voxel *v1, const SurfaceVertex &p0, const SurfaceVertex &p1) {
@@ -435,6 +519,10 @@ class TSDFVolume {
         const float a1 = std::abs(v1->tsdf);
         const float denom = std::max(a0 + a1, 1e-12f);
         const float t = a0 / denom;
+        const Vec3f normal = normalize(
+                p0.nx + t * (p1.nx - p0.nx),
+                p0.ny + t * (p1.ny - p0.ny),
+                p0.nz + t * (p1.nz - p0.nz));
         return {
                 p0.x + t * (p1.x - p0.x),
                 p0.y + t * (p1.y - p0.y),
@@ -442,6 +530,9 @@ class TSDFVolume {
                 (a1 * p0.r + a0 * p1.r) / denom,
                 (a1 * p0.g + a0 * p1.g) / denom,
                 (a1 * p0.b + a0 * p1.b) / denom,
+                normal.x,
+                normal.y,
+                normal.z,
         };
     }
 
@@ -465,7 +556,13 @@ class TSDFVolume {
             const SurfaceVertex &c) {
         const double area = triangle_area(a, b, c);
         if (area > 1e-16) {
-            triangles.push_back({a, b, c, area});
+            const Vec3f fallback = face_normal(a, b, c);
+            triangles.push_back({
+                    with_fallback_normal(a, fallback),
+                    with_fallback_normal(b, fallback),
+                    with_fallback_normal(c, fallback),
+                    area,
+            });
         }
     }
 
@@ -514,6 +611,10 @@ class TSDFVolume {
     }
 
     static SurfaceVertex mix_triangle(const SurfaceTriangle &tri, float w0, float w1, float w2) {
+        const Vec3f normal = normalize(
+                w0 * tri.a.nx + w1 * tri.b.nx + w2 * tri.c.nx,
+                w0 * tri.a.ny + w1 * tri.b.ny + w2 * tri.c.ny,
+                w0 * tri.a.nz + w1 * tri.b.nz + w2 * tri.c.nz);
         return {
                 w0 * tri.a.x + w1 * tri.b.x + w2 * tri.c.x,
                 w0 * tri.a.y + w1 * tri.b.y + w2 * tri.c.y,
@@ -521,16 +622,28 @@ class TSDFVolume {
                 w0 * tri.a.r + w1 * tri.b.r + w2 * tri.c.r,
                 w0 * tri.a.g + w1 * tri.b.g + w2 * tri.c.g,
                 w0 * tri.a.b + w1 * tri.b.b + w2 * tri.c.b,
+                normal.x,
+                normal.y,
+                normal.z,
         };
     }
 
-    static void write_vertex(float *points_ptr, uint8_t *colors_ptr, int64_t out_idx, const SurfaceVertex &vertex) {
+    static void write_vertex(
+            float *points_ptr,
+            uint8_t *colors_ptr,
+            float *normals_ptr,
+            int64_t out_idx,
+            const SurfaceVertex &vertex) {
         points_ptr[out_idx * 3 + 0] = vertex.x;
         points_ptr[out_idx * 3 + 1] = vertex.y;
         points_ptr[out_idx * 3 + 2] = vertex.z;
         colors_ptr[out_idx * 3 + 0] = clamp_color(vertex.r);
         colors_ptr[out_idx * 3 + 1] = clamp_color(vertex.g);
         colors_ptr[out_idx * 3 + 2] = clamp_color(vertex.b);
+        const Vec3f normal = normalize(vertex.nx, vertex.ny, vertex.nz);
+        normals_ptr[out_idx * 3 + 0] = normal.x;
+        normals_ptr[out_idx * 3 + 1] = normal.y;
+        normals_ptr[out_idx * 3 + 2] = normal.z;
     }
 
     static double frac(double value) {

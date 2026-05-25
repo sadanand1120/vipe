@@ -83,11 +83,11 @@ def _integrate_tsdf_frame(volume, frame_data: FrameData, depth_trunc: float) -> 
 
 
 def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
-    points, colors = volume.extract_point_cloud(max_points)
+    points, colors, normals = volume.extract_point_cloud(max_points)
     if len(points) == 0:
         return
 
-    write_binary_ply(out_path.tsdf_pcd_path, points, colors)
+    write_binary_ply(out_path.tsdf_pcd_path, points, colors, normals)
 
 
 def save_artifacts(
