@@ -12,30 +12,31 @@ from typing import Any
 
 import numpy as np
 from vipe import get_config_path
-from vipe.bench.scannet import AttrDict, ScanNetEvaluator
+from vipe.bench.replica import ReplicaEvaluator
+from vipe.bench.scannet import AttrDict
 from vipe.utils.config import load_yaml_config
 from vipe.utils.determinism import seed_everything
 
 
-WORKER_ENV = "_VIPE_SCANNET_BENCH_WORKER"
+WORKER_ENV = "_VIPE_REPLICA_BENCH_WORKER"
 PIPELINE_CONFIG_PATH = get_config_path() / "default.yaml"
-EVAL_CONFIG_PATH = get_config_path() / "eval_scannet_config.yaml"
+EVAL_CONFIG_PATH = get_config_path() / "eval_replica_config.yaml"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate ViPE ScanNet outputs with the local ScanNet benchmark stack."
+        description="Evaluate ViPE Replica outputs with the local Replica benchmark stack."
     )
     parser.add_argument(
         "--scenes",
         nargs="*",
         default=None,
         dest="scenes",
-        help="ScanNet scene names, e.g. scene0000_00 scene0011_00. Defaults to all extracted scenes under --input-root.",
+        help="Replica scene names, e.g. office0 office1 room0. Defaults to all extracted scenes under --input-root.",
     )
     parser.add_argument("--work-dir", required=True, type=Path, help="Benchmark workspace/output directory")
-    parser.add_argument("--input-root", required=True, type=Path, help="Canonical ViPE ScanNet scene root")
-    parser.add_argument("--raw-root", required=True, type=Path, help="Raw ScanNet scans root with GT meshes")
+    parser.add_argument("--input-root", required=True, type=Path, help="Canonical ViPE Replica scene root")
+    parser.add_argument("--raw-root", required=True, type=Path, help="Full Replica asset root with GT meshes")
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--total-gpus", type=int, default=1, help=argparse.SUPPRESS)
@@ -87,7 +88,7 @@ def _benchmark_frame_request(
     evaluator,
     scene: str,
 ) -> tuple[Any, list[int], list[int]]:
-    dataset = evaluator.datasets["scannet"]
+    dataset = evaluator.datasets["replica"]
     full_scene_data = dataset.get_data(scene)
     frame_indices = list(range(len(full_scene_data.image_files)))
     kept_scene_indices = list(frame_indices)
@@ -137,7 +138,7 @@ def _write_vipe_manifest(
     }
 
     exported_scene_data = _subset_scene_data(full_scene_data, kept_scene_indices)
-    export_dir = Path(evaluator._export_dir("scannet", scene))
+    export_dir = Path(evaluator._export_dir("replica", scene))
     exports_dir = export_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
 
@@ -160,7 +161,7 @@ def _write_json(path: Path, obj: dict) -> None:
 
 
 def _worker_timing_path(args: argparse.Namespace) -> Path:
-    return _metric_dir(args) / "timing_workers" / f"scannet_timing_worker_{args.gpu_id}.json"
+    return _metric_dir(args) / "timing_workers" / f"replica_timing_worker_{args.gpu_id}.json"
 
 
 def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
@@ -178,7 +179,7 @@ def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[di
     build_timing = {}
     metric_timing = {}
     for gpu_id in range(total_gpus):
-        path = _metric_dir(args) / "timing_workers" / f"scannet_timing_worker_{gpu_id}.json"
+        path = _metric_dir(args) / "timing_workers" / f"replica_timing_worker_{gpu_id}.json"
         with path.open(encoding="utf-8") as f:
             worker_timing = json.load(f)
         build_timing.update(worker_timing.get("build", {}))
@@ -216,12 +217,12 @@ def _write_timing(args: argparse.Namespace, build_timing: dict, metric_timing: d
             "scenes": metric_timing,
         },
     }
-    _write_json(_metric_dir(args) / "scannet_timing.json", timing)
+    _write_json(_metric_dir(args) / "replica_timing.json", timing)
     return timing
 
 
 def _load_evaluator(args: argparse.Namespace, eval_config: dict[str, Any]):
-    return ScanNetEvaluator(
+    return ReplicaEvaluator(
         work_dir=str(args.work_dir),
         scenes=args.scenes,
         input_root=args.input_root,
@@ -256,7 +257,7 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
 
     base_cmd = _append_common_cli_args([sys.executable, os.path.abspath(__file__)], args)
 
-    print(f"[INFO] Detected {len(gpu_list)} GPUs for ViPE ScanNet benchmark: {gpu_list}")
+    print(f"[INFO] Detected {len(gpu_list)} GPUs for ViPE Replica benchmark: {gpu_list}")
     processes = []
     for idx, visible_gpu in enumerate(gpu_list):
         env = os.environ.copy()
@@ -276,11 +277,11 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
 
 
 def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
-    dataset = evaluator.datasets["scannet"]
+    dataset = evaluator.datasets["replica"]
     known_scenes = set(evaluator._get_scenes(dataset))
     missing = sorted(set(args.scenes) - known_scenes)
     if missing:
-        raise ValueError(f"Unknown ScanNet scenes: {missing}")
+        raise ValueError(f"Unknown Replica scenes: {missing}")
 
     all_scenes = list(args.scenes)
     if args.total_gpus <= 1:
@@ -354,11 +355,11 @@ def _get_nested(d, *keys):
     return cur
 
 
-def print_scannet_summary(metrics) -> None:
-    pose_mean = _get_nested(metrics, "scannet_pose", "mean") or {}
-    recon_metrics = _get_nested(metrics, "scannet_recon") or {}
+def print_replica_summary(metrics) -> None:
+    pose_mean = _get_nested(metrics, "replica_pose", "mean") or {}
+    recon_metrics = _get_nested(metrics, "replica_recon") or {}
     recon = recon_metrics.get("mean") or {}
-    timing = _get_nested(metrics, "scannet_timing") or {}
+    timing = _get_nested(metrics, "replica_timing") or {}
 
     auc3 = pose_mean.get("auc03")
     auc30 = pose_mean.get("auc30")
@@ -366,17 +367,17 @@ def print_scannet_summary(metrics) -> None:
     col1 = 15
     col2 = 14
     print("\n" + "=" * 44)
-    print("SCANNET VIPE BENCHMARK SUMMARY")
+    print("REPLICA VIPE BENCHMARK SUMMARY")
     print("=" * 44)
     print("\nPOSE ESTIMATION")
     print("-" * (col1 + col2))
-    print(f"{'Metric':<{col1}}{'ScanNet':<{col2}}")
+    print(f"{'Metric':<{col1}}{'Replica':<{col2}}")
     print("-" * (col1 + col2))
     print(f"{'Auc3':<{col1}}{_fmt(auc3):<{col2}}")
     print(f"{'Auc30':<{col1}}{_fmt(auc30):<{col2}}")
     print("\nRECONSTRUCTION")
     print("-" * (col1 + col2))
-    print(f"{'Metric':<{col1}}{'ScanNet':<{col2}}")
+    print(f"{'Metric':<{col1}}{'Replica':<{col2}}")
     print("-" * (col1 + col2))
     print(f"{'Overall':<{col1}}{_fmt(recon.get('overall')):<{col2}}")
     print(f"{'Scale':<{col1}}{_fmt_scale_summary(recon_metrics):<{col2}}")
@@ -401,14 +402,14 @@ def main() -> None:
 
     evaluator = _load_evaluator(args, eval_config)
     if not args.scenes:
-        args.scenes = evaluator._get_scenes(evaluator.datasets["scannet"])
+        args.scenes = evaluator._get_scenes(evaluator.datasets["replica"])
         if not args.scenes:
-            raise ValueError(f"No extracted ScanNet scenes found under {args.input_root}")
-        print(f"[INFO] Using all extracted ScanNet scenes from {args.input_root}: {len(args.scenes)} scenes")
+            raise ValueError(f"No extracted Replica scenes found under {args.input_root}")
+        print(f"[INFO] Using all extracted Replica scenes from {args.input_root}: {len(args.scenes)} scenes")
 
     if args.print_only:
         metrics = evaluator._load_metrics()
-        print_scannet_summary(metrics)
+        print_replica_summary(metrics)
         return
 
     build_timing = maybe_spawn_workers(args)
@@ -416,8 +417,8 @@ def main() -> None:
         build_scene_timing, metric_scene_timing = build_timing
         metrics = evaluator.eval()
         metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
-        metrics["scannet_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
-        print_scannet_summary(metrics)
+        metrics["replica_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
+        print_replica_summary(metrics)
         return
 
     build_scene_timing, metric_scene_timing = prepare_vipe_benchmark_exports(args, evaluator, pipeline_cfg)
@@ -426,8 +427,8 @@ def main() -> None:
         return
     metrics = evaluator.eval()
     metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
-    metrics["scannet_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
-    print_scannet_summary(metrics)
+    metrics["replica_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
+    print_replica_summary(metrics)
 
 
 if __name__ == "__main__":

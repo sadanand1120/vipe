@@ -76,7 +76,6 @@ Minimal metadata shape:
 {
   "format": "vipe_rgbd_v1",
   "name": "scene0000_00",
-  "fps": 30.0,
   "width": 1296,
   "height": 968,
   "color": {"dir": "color", "encoding": "rgb8_png"},
@@ -99,7 +98,6 @@ Runtime-required fields:
 | Field | Requirement |
 | --- | --- |
 | `format` | Must be `vipe_rgbd_v1`. |
-| `fps` | Scene FPS. There is no `streams.fps` runtime override. |
 | `width`, `height` | Must match the decoded RGB frame size. |
 | `frames[*].color_file` | Relative path to an RGB/color PNG frame. |
 | `frames[*].depth_file` | Relative path to a same-resolution `uint16` depth PNG. |
@@ -153,9 +151,9 @@ The extractor reads exactly one `.sens` file from each raw ScanNet scene. It loa
 | `depth/*.png` | Decoded `.sens` `uint16` depth, millimeters, nearest-resized to color size if needed. |
 | `pose/*.txt` | 4x4 camera-to-world matrix from the `.sens` frame. |
 | `intrinsic/intrinsic_color.json` | Pinhole color intrinsics from `.sens` `intrinsic_color[:3,:3]`. |
-| `metadata.json` | `fps = source_fps / frame_skip`, frame records, source frame ids, timestamps, source provenance. |
+| `metadata.json` | Frame records, source frame ids, timestamps, and source provenance. |
 
-`frame_skip` changes what frames are exported and lowers metadata FPS accordingly. For example, `--fps 30 --frame-skip 4` writes every fourth frame and records `7.5` FPS.
+`frame_skip` changes what frames are exported. The canonical scene format does not carry or use FPS anymore.
 
 ### Kinect Rosbag MCAP Extraction
 
@@ -178,9 +176,9 @@ The extractor always overwrites the output directory, exports raw audit data, sy
 | Artifact | Details |
 | --- | --- |
 | `raw/color/*.png`, `raw/depth/*.png` | Raw topic dumps for audit/debug. |
-| `raw/color/meta.json`, `raw/depth/meta.json` | Raw timestamps, encodings, dimensions, count, rounded FPS. |
+| `raw/color/meta.json`, `raw/depth/meta.json` | Raw timestamps, encodings, dimensions, and count. |
 | `color/*.png`, `depth/*.png` | Synced canonical RGB-D stream. |
-| `sync_meta.json` | Color/depth pairing, max sync delta, synced FPS. |
+| `sync_meta.json` | Color/depth pairing, max sync delta, and raw file provenance. |
 | `intrinsic/intrinsic_color.json` | Pinhole RGB intrinsics from `CameraInfo`; rectified if needed. |
 | `metadata.json` | Canonical runtime metadata. |
 
@@ -1088,7 +1086,6 @@ The current codebase intentionally does not support these runtime branches:
 | --- | --- |
 | Image directory without metadata | Extract or convert to canonical `metadata.json` first. |
 | `streams.base_path` | `run.py --input-dir`. |
-| `streams.fps` | `metadata.json["fps"]`. |
 | JPG/BMP/TIFF runtime discovery | Canonical `metadata.json["frames"]` paths. |
 | Filename sort heuristics | Metadata frame order. |
 | ScanNet TXT intrinsic fallback | `intrinsic/intrinsic_color.json`. |

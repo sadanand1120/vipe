@@ -154,9 +154,6 @@ class FrameStream:
     def name(self) -> str:
         raise NotImplementedError
 
-    def fps(self) -> float:
-        raise NotImplementedError
-
     def sensor_camera(self) -> SensorCamera | None:
         return None
 
@@ -204,7 +201,6 @@ class FrameDir(FrameStream):
                 f"metadata.json declares {self.metadata['width']}x{self.metadata['height']}, "
                 f"but RGB frames are {self._width}x{self._height}"
             )
-        self._fps = float(self.metadata["fps"])
         self._sensor_camera = self._load_sensor_camera()
 
     def _load_sensor_camera(self) -> SensorCamera:
@@ -226,9 +222,6 @@ class FrameDir(FrameStream):
 
     def frame_size(self) -> tuple[int, int]:
         return (self._height, self._width)
-
-    def fps(self) -> float:
-        return self._fps
 
     def name(self) -> str:
         return self._name

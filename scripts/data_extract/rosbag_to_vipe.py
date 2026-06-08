@@ -14,7 +14,6 @@ from rosidl_runtime_py.utilities import get_message
 from tqdm import tqdm
 
 from vipe.utils.data_format import (
-    fps_from_timestamps_ns,
     frame_stem,
     write_pinhole_intrinsics,
     write_scene_metadata,
@@ -24,6 +23,16 @@ from vipe.utils.data_format import (
 COLOR_TOPIC = "/rgb/image_raw"
 DEPTH_TOPIC = "/depth_to_rgb/image_raw"
 COLOR_INFO_TOPIC = "/rgb/camera_info"
+
+
+def fps_from_timestamps_ns(timestamps_ns: list[int]) -> float:
+    if len(timestamps_ns) < 2:
+        return 0.0
+    deltas = np.diff(np.asarray(timestamps_ns, dtype=np.float64)) / 1e9
+    valid = deltas[deltas > 0]
+    if valid.size == 0:
+        return 0.0
+    return float(1.0 / np.median(valid))
 
 
 def open_reader(bag_path: Path) -> rosbag2_py.SequentialReader:
@@ -206,13 +215,12 @@ def export_raw(args: argparse.Namespace) -> dict[str, float]:
 
     for kind, meta in metas.items():
         meta["count"] = len(meta["items"])
-        meta["fps"] = round(fps_from_timestamps_ns([item["stamp_ns"] for item in meta["items"]]), 2)
         write_json(args.output_dir / "raw" / kind / "meta.json", meta)
 
     print(f"Raw export: color={len(metas['color']['items'])}, depth={len(metas['depth']['items'])}")
     return {
-        "raw_color_fps": metas["color"]["fps"],
-        "raw_depth_fps": metas["depth"]["fps"],
+        "raw_color_fps": round(fps_from_timestamps_ns([item["stamp_ns"] for item in metas["color"]["items"]]), 2),
+        "raw_depth_fps": round(fps_from_timestamps_ns([item["stamp_ns"] for item in metas["depth"]["items"]]), 2),
     }
 
 
@@ -311,7 +319,6 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
         sync_items.append(item)
         frames.append(item)
 
-    synced_fps = round(fps_from_timestamps_ns([item["color_stamp_ns"] for item in sync_items]), 2)
     write_json(
         args.output_dir / "sync_meta.json",
         {
@@ -319,7 +326,6 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
             "color_topic": args.color_topic,
             "depth_topic": args.depth_topic,
             "max_depth_dt_sec": args.max_depth_dt,
-            "fps": synced_fps,
             "count": len(sync_items),
             "items": sync_items,
         },
@@ -327,7 +333,6 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
     write_scene_metadata(
         args.output_dir,
         name=args.output_dir.name,
-        fps=synced_fps,
         width=camera_info["width"],
         height=camera_info["height"],
         frames=frames,
@@ -341,6 +346,7 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
         },
     )
     print(f"Synchronized export: {len(sync_items)} frames")
+    synced_fps = round(fps_from_timestamps_ns([item["color_stamp_ns"] for item in sync_items]), 2)
     return synced_fps, sync_items
 
 

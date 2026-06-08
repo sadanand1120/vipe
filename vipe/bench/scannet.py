@@ -94,6 +94,25 @@ def _first_camera_se3(pred_c2w: np.ndarray, gt_w2c: np.ndarray) -> tuple[np.ndar
     return gt_c2w[0] @ np.linalg.inv(pred_c2w[0]), gt_c2w
 
 
+def _valid_pose_mask(*pose_arrays: np.ndarray) -> np.ndarray:
+    mask = np.ones(len(pose_arrays[0]), dtype=bool)
+    for poses in pose_arrays:
+        mask &= np.isfinite(poses).all(axis=(-2, -1))
+    return mask
+
+
+def _filter_valid_poses(pred_poses: np.ndarray, gt_poses: np.ndarray, label: str) -> tuple[np.ndarray, np.ndarray]:
+    if len(pred_poses) != len(gt_poses):
+        raise ValueError(f"{label}: predicted pose count {len(pred_poses)} does not match GT pose count {len(gt_poses)}")
+    valid = _valid_pose_mask(pred_poses, gt_poses)
+    if not bool(valid.any()):
+        raise ValueError(f"{label}: no finite predicted/GT pose pairs")
+    dropped = int((~valid).sum())
+    if dropped:
+        tqdm.write(f"[WARN] {label}: dropping {dropped:,}/{len(valid):,} frames with non-finite predicted/GT poses")
+    return pred_poses[valid], gt_poses[valid]
+
+
 def _first_camera_scale_diagnostic(pred_c2w: np.ndarray, gt_c2w: np.ndarray, se3: np.ndarray) -> float:
     pred_centers = _apply_se3(_camera_centers_from_c2w(pred_c2w), se3)
     gt_centers = _camera_centers_from_c2w(gt_c2w)
@@ -229,6 +248,7 @@ def mean_squared_nn_distance(
     chunk_size: int,
     device_name: str,
     progress_desc: str | None = None,
+    log_label: str = "ScanNet",
 ) -> float:
     if len(reference) == 0 or len(query) == 0:
         return float("inf")
@@ -237,13 +257,16 @@ def mean_squared_nn_distance(
     reference = np.ascontiguousarray(reference, dtype=np.float32)
     query = np.ascontiguousarray(query, dtype=np.float32)
     if progress_desc is not None:
-        tqdm.write(f"[ScanNet] Open3D CUDA NN index start | {progress_desc} | ref={len(reference):,} query={len(query):,}")
+        tqdm.write(
+            f"[{log_label}] Open3D CUDA NN index start | {progress_desc} | "
+            f"ref={len(reference):,} query={len(query):,}"
+        )
     start_tree = time.perf_counter()
     ref_tensor = o3d.core.Tensor(reference, dtype=o3d.core.Dtype.Float32, device=device)
     nns = o3d.core.nns.NearestNeighborSearch(ref_tensor)
     nns.knn_index()
     if progress_desc is not None:
-        tqdm.write(f"[ScanNet] Open3D CUDA NN index done  | {progress_desc} | {time.perf_counter() - start_tree:.2f}s")
+        tqdm.write(f"[{log_label}] Open3D CUDA NN index done  | {progress_desc} | {time.perf_counter() - start_tree:.2f}s")
 
     total = 0.0
     count = 0
@@ -269,6 +292,7 @@ def evaluate_3d_reconstruction_l2(
     pcd_trgt: o3d.geometry.PointCloud | np.ndarray,
     geometry_config: AttrDict,
     progress_desc: str | None = None,
+    log_label: str = "ScanNet",
 ) -> dict[str, float]:
     if isinstance(pcd_pred, np.ndarray):
         pcd_pred = _point_cloud_from_arrays(pcd_pred)
@@ -288,6 +312,7 @@ def evaluate_3d_reconstruction_l2(
         chunk_size=chunk_size,
         device_name=device_name,
         progress_desc=None if progress_desc is None else f"{progress_desc} pred->gt",
+        log_label=log_label,
     )
     completeness = mean_squared_nn_distance(
         verts_pred,
@@ -295,6 +320,7 @@ def evaluate_3d_reconstruction_l2(
         chunk_size=chunk_size,
         device_name=device_name,
         progress_desc=None if progress_desc is None else f"{progress_desc} gt->pred",
+        log_label=log_label,
     )
     return {"acc": accuracy, "comp": completeness, "overall": (accuracy + completeness) / 2}
 
@@ -503,12 +529,31 @@ def _render_voxel_cloud_cuda(
 
 
 class ScanNetDataset:
+    DATASET_LABEL = "ScanNet"
+
     def __init__(self, input_root: Path, raw_root: Path, eval_config: AttrDict):
         self.data_root = Path(input_root)
         self.raw_root = Path(raw_root)
         self.config = eval_config
-        self.SCENES = _load_scene_list(self.data_root)
+        self.SCENES = self._load_scene_list(self.data_root)
         self._scene_cache: dict[str, AttrDict] = {}
+
+    def _load_scene_list(self, input_root: Path) -> list[str]:
+        return _load_scene_list(input_root)
+
+    def _gt_mesh_path(self, scene: str) -> Path:
+        dataset_config = self.config.dataset
+        raw_scene_dir = self.raw_root / scene
+        gt_mesh_path = raw_scene_dir / f"{scene}{dataset_config.gt_mesh_suffix}"
+        if gt_mesh_path.is_file():
+            return gt_mesh_path
+        fallback = raw_scene_dir / f"{scene}{dataset_config.gt_mesh_fallback_suffix}"
+        if fallback.is_file():
+            return fallback
+        raise FileNotFoundError(f"Missing {self.DATASET_LABEL} GT mesh: {gt_mesh_path} (and fallback {fallback})")
+
+    def _load_gt_mesh(self, mesh_path: str | Path) -> o3d.geometry.TriangleMesh:
+        return o3d.io.read_triangle_mesh(str(mesh_path))
 
     def get_data(self, scene: str) -> AttrDict:
         if scene in self._scene_cache:
@@ -517,31 +562,23 @@ class ScanNetDataset:
         scene_dir = self.data_root / scene
         intrinsic_path = scene_dir / "intrinsic" / "intrinsic_color.json"
         if not intrinsic_path.is_file():
-            raise FileNotFoundError(f"Missing ScanNet intrinsic file: {intrinsic_path}")
+            raise FileNotFoundError(f"Missing {self.DATASET_LABEL} intrinsic file: {intrinsic_path}")
 
-        dataset_config = self.config.dataset
-        raw_scene_dir = self.raw_root / scene
-        gt_mesh_path = raw_scene_dir / f"{scene}{dataset_config.gt_mesh_suffix}"
-        if not gt_mesh_path.is_file():
-            fallback = raw_scene_dir / f"{scene}{dataset_config.gt_mesh_fallback_suffix}"
-            if fallback.is_file():
-                gt_mesh_path = fallback
-            else:
-                raise FileNotFoundError(f"Missing ScanNet GT mesh: {gt_mesh_path} (and fallback {fallback})")
+        gt_mesh_path = self._gt_mesh_path(scene)
 
         ixt_shared = intrinsic_matrix(read_pinhole_intrinsics(intrinsic_path))
         frames = read_scene_frames(scene_dir, require_pose=True)
         out = AttrDict(image_files=[], extrinsics=[], intrinsics=[], aux=AttrDict(gt_mesh_path=str(gt_mesh_path)))
-        for frame in tqdm(frames, desc=f"[ScanNet] {scene} load poses", leave=False):
+        for frame in tqdm(frames, desc=f"[{self.DATASET_LABEL}] {scene} load poses", leave=False):
             img_path = scene_dir / frame["color_file"]
             pose_path = scene_dir / frame["pose_file"]
             if not img_path.is_file():
-                raise FileNotFoundError(f"Missing ScanNet color frame: {img_path}")
+                raise FileNotFoundError(f"Missing {self.DATASET_LABEL} color frame: {img_path}")
             if not pose_path.is_file():
-                raise FileNotFoundError(f"Missing ScanNet pose file: {pose_path}")
+                raise FileNotFoundError(f"Missing {self.DATASET_LABEL} pose file: {pose_path}")
             c2w = np.loadtxt(pose_path, dtype=np.float32)
             if c2w.shape != (4, 4):
-                raise ValueError(f"Expected 4x4 ScanNet pose matrix: {pose_path}")
+                raise ValueError(f"Expected 4x4 {self.DATASET_LABEL} pose matrix: {pose_path}")
             out.image_files.append(str(img_path))
             out.extrinsics.append(np.linalg.inv(c2w).astype(np.float32))
             out.intrinsics.append(ixt_shared.copy())
@@ -549,7 +586,7 @@ class ScanNetDataset:
         out.extrinsics = np.asarray(out.extrinsics, dtype=np.float32)
         out.intrinsics = np.asarray(out.intrinsics, dtype=np.float32)
         self._scene_cache[scene] = out
-        tqdm.write(f"[ScanNet] {scene}: {len(out.image_files)} images")
+        tqdm.write(f"[{self.DATASET_LABEL}] {scene}: {len(out.image_files)} images")
         return out
 
     def result_path(self, export_dir: str) -> str:
@@ -620,18 +657,19 @@ class ScanNetDataset:
 
         pose_map = self._load_vipe_pose_map(manifest)
         pred_c2w = np.stack([as_homogeneous(pose_map[idx]).astype(np.float64) for idx in frame_indices])
-        se3, gt_c2w = _first_camera_se3(pred_c2w, gt_meta.extrinsics)
-        scale_diagnostic = _first_camera_scale_diagnostic(pred_c2w, gt_c2w, se3)
+        pred_c2w_valid, gt_w2c_valid = _filter_valid_poses(pred_c2w, gt_meta.extrinsics, f"{self.DATASET_LABEL} {scene} align")
+        se3, gt_c2w_valid = _first_camera_se3(pred_c2w_valid, gt_w2c_valid)
+        scale_diagnostic = _first_camera_scale_diagnostic(pred_c2w_valid, gt_c2w_valid, se3)
         if self._tsdf_alignment_is_current(aligned_path, source_path, result_path, manifest):
             tqdm.write(
-                f"[ScanNet] aligned TSDF cache hit | {scene} | "
+                f"[{self.DATASET_LABEL}] aligned TSDF cache hit | {scene} | "
                 f"scale_diagnostic={scale_diagnostic:.6f} | {aligned_path}"
             )
             return str(aligned_path), scale_diagnostic
 
         start = time.perf_counter()
         tqdm.write(
-            f"[ScanNet] align TSDF start | {scene} | first-camera SE3 | "
+            f"[{self.DATASET_LABEL}] align TSDF start | {scene} | first-camera SE3 | "
             f"scale_diagnostic={scale_diagnostic:.6f} | {source_path}"
         )
         pcd = o3d.io.read_point_cloud(source_path)
@@ -646,7 +684,7 @@ class ScanNetDataset:
         o3d.io.write_point_cloud(str(tmp_path), pcd)
         os.replace(tmp_path, aligned_path)
         tqdm.write(
-            f"[ScanNet] align TSDF done  | {scene} | "
+            f"[{self.DATASET_LABEL}] align TSDF done  | {scene} | "
             f"points={len(pcd.points):,} | {time.perf_counter() - start:.2f}s"
         )
         return str(aligned_path), scale_diagnostic
@@ -661,26 +699,29 @@ class ScanNetDataset:
         pcd_path, scale_diagnostic = self._align_tsdf_pcd(scene, result_path)
         method_name = str(self.config.outputs.reconstruction_method_name)
         eval_cache_dir = Path(result_path).parents[2] / "eval_cache"
-        tqdm.write(f"[ScanNet] eval3d start | {scene} | {pcd_path}")
+        tqdm.write(f"[{self.DATASET_LABEL}] eval3d start | {scene} | {pcd_path}")
         sample_count = self._artifact_sample_count(result_path)
         gt_cache_path = eval_cache_dir / f"gt_sample_{sample_count}.npz"
         start_gt = time.perf_counter()
         gt_pcd = _load_cached_point_cloud(gt_cache_path)
         if gt_pcd is None:
-            tqdm.write(f"[ScanNet] sample GT start | {scene} | points={sample_count:,}")
-            gt_mesh = o3d.io.read_triangle_mesh(full_gt_data.aux.gt_mesh_path)
+            tqdm.write(f"[{self.DATASET_LABEL}] sample GT start | {scene} | points={sample_count:,}")
+            gt_mesh = self._load_gt_mesh(full_gt_data.aux.gt_mesh_path)
             gt_pcd = sample_points_from_mesh(gt_mesh, sample_count)
             _write_cached_point_cloud(gt_cache_path, gt_pcd)
-            tqdm.write(f"[ScanNet] sample GT done  | {scene} | {time.perf_counter() - start_gt:.2f}s")
+            tqdm.write(f"[{self.DATASET_LABEL}] sample GT done  | {scene} | {time.perf_counter() - start_gt:.2f}s")
         else:
             tqdm.write(
-                f"[ScanNet] sample GT cache hit | {scene} | "
+                f"[{self.DATASET_LABEL}] sample GT cache hit | {scene} | "
                 f"points={len(gt_pcd.points):,} | {time.perf_counter() - start_gt:.2f}s"
             )
 
         start_read = time.perf_counter()
         pred_pcd = o3d.io.read_point_cloud(pcd_path)
-        tqdm.write(f"[ScanNet] read pred done | {scene} | points={len(pred_pcd.points):,} | {time.perf_counter() - start_read:.2f}s")
+        tqdm.write(
+            f"[{self.DATASET_LABEL}] read pred done | {scene} | "
+            f"points={len(pred_pcd.points):,} | {time.perf_counter() - start_read:.2f}s"
+        )
         pred_eval_pcd = pred_pcd
 
         start_crop = time.perf_counter()
@@ -698,7 +739,7 @@ class ScanNetDataset:
             )
             pred_eval_pcd = pred_pcd.select_by_index(np.nonzero(inside_mask)[0])
         tqdm.write(
-            f"[ScanNet] AABB crop done | {scene} | "
+            f"[{self.DATASET_LABEL}] AABB crop done | {scene} | "
             f"eval_points={len(pred_eval_pcd.points):,}/{len(pred_pcd.points):,} | {time.perf_counter() - start_crop:.2f}s"
         )
 
@@ -708,15 +749,16 @@ class ScanNetDataset:
             gt_pcd,
             self.config.geometry,
             progress_desc=f"{scene} {method_name} L2 NN",
+            log_label=self.DATASET_LABEL,
         )
         result["scale_diagnostic"] = scale_diagnostic
-        tqdm.write(f"[ScanNet] geometry metric done | {scene} | {result} | {time.perf_counter() - start_geom:.2f}s")
+        tqdm.write(f"[{self.DATASET_LABEL}] geometry metric done | {scene} | {result} | {time.perf_counter() - start_geom:.2f}s")
         del gt_pcd, pred_eval_pcd, points
         gc.collect()
 
         render_data = self._load_gt_meta(result_path) or full_gt_data
         result.update(self._compute_render_metrics(scene, method_name, pred_pcd, render_data, pcd_path, eval_cache_dir))
-        tqdm.write(f"[ScanNet] eval3d done | {scene} | {method_name} | {time.perf_counter() - start_eval:.2f}s")
+        tqdm.write(f"[{self.DATASET_LABEL}] eval3d done | {scene} | {method_name} | {time.perf_counter() - start_eval:.2f}s")
         return result
 
     def _compute_render_metrics(
@@ -733,7 +775,7 @@ class ScanNetDataset:
         render_config = self.config.render
         image_config = self.config.image_metrics
         voxel_size = float(render_config.voxel_size_m)
-        tqdm.write(f"[ScanNet] render metric voxelize start | {label} | voxel={voxel_size}m")
+        tqdm.write(f"[{self.DATASET_LABEL}] render metric voxelize start | {label} | voxel={voxel_size}m")
         cache_name = f"{method_name}_render_vox_{str(voxel_size).replace('.', 'p')}.npz"
         render_cache_path = cache_dir / cache_name
         cached = _load_cached_render_arrays(render_cache_path, source_path, voxel_size)
@@ -741,17 +783,26 @@ class ScanNetDataset:
             points, colors = _voxelized_render_arrays(pcd, voxel_size)
             _write_cached_render_arrays(render_cache_path, source_path, voxel_size, points, colors)
             tqdm.write(
-                f"[ScanNet] render metric voxelize done  | {label} | "
+                f"[{self.DATASET_LABEL}] render metric voxelize done  | {label} | "
                 f"voxels={len(points):,} | {time.perf_counter() - start_total:.2f}s"
             )
         else:
             points, colors = cached
             tqdm.write(
-                f"[ScanNet] render metric voxelize cache hit | {label} | "
+                f"[{self.DATASET_LABEL}] render metric voxelize cache hit | {label} | "
                 f"voxels={len(points):,} | {time.perf_counter() - start_total:.2f}s"
             )
 
-        frame_indices = np.arange(len(scene_data.image_files))
+        valid_pose_mask = _valid_pose_mask(scene_data.extrinsics)
+        dropped = int((~valid_pose_mask).sum())
+        if dropped:
+            tqdm.write(
+                f"[WARN] {self.DATASET_LABEL} {scene} render: "
+                f"dropping {dropped:,}/{len(valid_pose_mask):,} frames with non-finite GT poses"
+            )
+        frame_indices = np.nonzero(valid_pose_mask)[0]
+        if len(frame_indices) == 0:
+            raise ValueError(f"{self.DATASET_LABEL} {scene} render: no finite GT poses")
         num_images = int(render_config.num_images)
         if num_images != -1:
             sample_count = min(num_images, len(frame_indices))
@@ -764,7 +815,7 @@ class ScanNetDataset:
         ]
         render_device = str(render_config.device)
         tqdm.write(
-            f"[ScanNet] render metric project start | {label} | "
+            f"[{self.DATASET_LABEL}] render metric project start | {label} | "
             f"frames={len(tasks):,}/{len(scene_data.image_files):,} device={render_device}"
         )
         device = torch.device(render_device)
@@ -803,11 +854,14 @@ class ScanNetDataset:
         del points_t, colors_t, offset_shells
         torch.cuda.empty_cache()
         progress.close()
-        tqdm.write(f"[ScanNet] render metric project done  | {label} | {time.perf_counter() - start_total:.2f}s")
+        tqdm.write(f"[{self.DATASET_LABEL}] render metric project done  | {label} | {time.perf_counter() - start_total:.2f}s")
         return {"psnr": float(np.mean(psnr_values)), "ssim": float(np.mean(ssim_values))}
 
 
 class ScanNetEvaluator:
+    DATASET_KEY = "scannet"
+    DATASET_LABEL = "ScanNet"
+
     def __init__(
         self,
         work_dir: str | Path,
@@ -819,10 +873,13 @@ class ScanNetEvaluator:
         self.work_dir = str(work_dir)
         self.config = _to_attr_dict(eval_config)
         self.scenes_filter = scenes
-        self.datasets = AttrDict(scannet=ScanNetDataset(Path(input_root), Path(raw_root), self.config))
+        self.datasets = self._build_datasets(Path(input_root), Path(raw_root))
         self._metric_eval_seconds_by_scene: dict[str, float] = {}
         self._metric_eval_frames_by_scene: dict[str, int] = {}
         os.makedirs(self.work_dir, exist_ok=True)
+
+    def _build_datasets(self, input_root: Path, raw_root: Path) -> AttrDict:
+        return AttrDict(scannet=ScanNetDataset(input_root, raw_root, self.config))
 
     def _get_scenes(self, dataset: ScanNetDataset) -> list[str]:
         if self.scenes_filter:
@@ -834,12 +891,12 @@ class ScanNetEvaluator:
         self._metric_eval_frames_by_scene = {}
         summary: dict[str, dict] = {}
         print(f"\n{'=' * 60}")
-        print("Evaluating POSE for ScanNet")
+        print(f"Evaluating POSE for {self.DATASET_LABEL}")
         print(f"{'=' * 60}")
         for data, result in self._eval_pose():
             summary[f"{data}_pose"] = result
         print(f"\n{'=' * 60}")
-        print("Evaluating RECON for ScanNet")
+        print(f"Evaluating RECON for {self.DATASET_LABEL}")
         print(f"{'=' * 60}")
         for key, result in self._eval_reconstruction():
             summary[key] = result
@@ -847,11 +904,11 @@ class ScanNetEvaluator:
 
     def _eval_pose(self):
         os.makedirs(self._metric_dir, exist_ok=True)
-        dataset = self.datasets.scannet
+        dataset = self.datasets[self.DATASET_KEY]
         dataset_results = AttrDict()
-        for scene in tqdm(self._get_scenes(dataset), desc="scannet scenes", leave=False):
+        for scene in tqdm(self._get_scenes(dataset), desc=f"{self.DATASET_KEY} scenes", leave=False):
             start_scene = time.perf_counter()
-            export_dir = self._export_dir("scannet", scene)
+            export_dir = self._export_dir(self.DATASET_KEY, scene)
             result_path = dataset.result_path(export_dir)
             if not dataset.result_exists(result_path):
                 tqdm.write(f"[ERROR] Result file not found: {result_path}")
@@ -860,45 +917,45 @@ class ScanNetEvaluator:
             if gt_meta is not None:
                 num_frames = len(gt_meta["extrinsics"])
                 num_pairs = num_frames * (num_frames - 1) // 2
-                tqdm.write(f"[INFO] Pose start | scannet | {scene} | frames={num_frames} pairs={num_pairs}")
+                tqdm.write(f"[INFO] Pose start | {self.DATASET_KEY} | {scene} | frames={num_frames} pairs={num_pairs}")
                 result = self._compute_pose_with_gt(dataset, result_path, gt_meta)
             else:
                 scene_data = dataset.get_data(scene)
                 num_frames = len(scene_data.image_files)
                 num_pairs = num_frames * (num_frames - 1) // 2
-                tqdm.write(f"[INFO] Pose start | scannet | {scene} | frames={num_frames} pairs={num_pairs}")
+                tqdm.write(f"[INFO] Pose start | {self.DATASET_KEY} | {scene} | frames={num_frames} pairs={num_pairs}")
                 result = self._compute_pose_with_gt(dataset, result_path, scene_data)
             self._metric_eval_frames_by_scene[scene] = int(num_frames)
             self._metric_eval_seconds_by_scene[scene] = (
                 self._metric_eval_seconds_by_scene.get(scene, 0.0) + time.perf_counter() - start_scene
             )
             dataset_results[scene] = self._to_float_dict(result)
-            tqdm.write(f"[INFO] Pose done  | scannet | {scene} | {result}")
+            tqdm.write(f"[INFO] Pose done  | {self.DATASET_KEY} | {scene} | {result}")
 
         if dataset_results:
             dataset_results["mean"] = self._mean_of_dicts(dataset_results.values())
-        self._dump_json(os.path.join(self._metric_dir, "scannet_pose.json"), dataset_results)
-        yield "scannet", dataset_results
+        self._dump_json(os.path.join(self._metric_dir, f"{self.DATASET_KEY}_pose.json"), dataset_results)
+        yield self.DATASET_KEY, dataset_results
 
     def _eval_reconstruction(self):
         os.makedirs(self._metric_dir, exist_ok=True)
-        dataset = self.datasets.scannet
+        dataset = self.datasets[self.DATASET_KEY]
         scenes = self._get_scenes(dataset)
         dataset_results = AttrDict()
-        tqdm.write(f"[INFO] Starting recon eval for dataset=scannet with {len(scenes)} scene(s)")
+        tqdm.write(f"[INFO] Starting recon eval for dataset={self.DATASET_KEY} with {len(scenes)} scene(s)")
         for scene in scenes:
             start_scene = time.perf_counter()
-            export_dir = self._export_dir("scannet", scene)
+            export_dir = self._export_dir(self.DATASET_KEY, scene)
             result_path = dataset.result_path(export_dir)
             result = dataset.eval3d(scene, result_path)
             self._metric_eval_seconds_by_scene[scene] = (
                 self._metric_eval_seconds_by_scene.get(scene, 0.0) + time.perf_counter() - start_scene
             )
             dataset_results[scene] = self._to_float_dict(result)
-            tqdm.write(f"  recon | scannet | {scene}: {result}")
+            tqdm.write(f"  recon | {self.DATASET_KEY} | {scene}: {result}")
 
         dataset_results["mean"] = self._mean_of_dicts(dataset_results.values())
-        key = "scannet_recon"
+        key = f"{self.DATASET_KEY}_recon"
         self._dump_json(os.path.join(self._metric_dir, f"{key}.json"), dataset_results)
         yield key, dataset_results
 
@@ -921,9 +978,14 @@ class ScanNetEvaluator:
 
     def _compute_pose_with_gt(self, dataset: ScanNetDataset, result_path: str, gt_meta: AttrDict) -> dict[str, float]:
         pred_extrinsics = dataset.load_pred_extrinsics(result_path)
+        pred_extrinsics, gt_extrinsics = _filter_valid_poses(
+            as_homogeneous(pred_extrinsics),
+            as_homogeneous(gt_meta["extrinsics"]),
+            f"{self.DATASET_LABEL} pose",
+        )
         return compute_pose(
-            torch.from_numpy(as_homogeneous(pred_extrinsics)),
-            torch.from_numpy(as_homogeneous(gt_meta["extrinsics"])),
+            torch.from_numpy(pred_extrinsics),
+            torch.from_numpy(gt_extrinsics),
             self.config.pose,
         )
 

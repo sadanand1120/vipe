@@ -24,7 +24,7 @@ pip3 install --no-build-isolation -e .
 <scene>/intrinsic/intrinsic_color.json
 ```
 
-`metadata.json` is the source of truth for frame order. Each frame record names `color_file` and `depth_file`, and ScanNet benchmark scenes also include `pose_file`. Color is RGB8 PNG on disk, depth is `uint16` PNG in millimeters, and intrinsics are undistorted pinhole only. Runtime does not accept sidecar TXT intrinsics, JPG image discovery, `streams.fps`, or runtime OpenCV distortion branches.
+`metadata.json` is the source of truth for frame order. Each frame record names `color_file` and `depth_file`, and ScanNet benchmark scenes also include `pose_file`. Color is RGB8 PNG on disk, depth is `uint16` PNG in millimeters, and intrinsics are undistorted pinhole only. Runtime does not accept sidecar TXT intrinsics, JPG image discovery, or runtime OpenCV distortion branches.
 
 Dataset converters live under `scripts/data_extract/`:
 

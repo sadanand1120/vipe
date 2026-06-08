@@ -45,7 +45,6 @@ def write_scene_metadata(
     scene_dir: str | Path,
     *,
     name: str,
-    fps: float,
     width: int,
     height: int,
     frames: list[dict[str, Any]],
@@ -54,7 +53,6 @@ def write_scene_metadata(
     metadata = {
         "format": SCENE_FORMAT,
         "name": name,
-        "fps": round(float(fps), 2),
         "width": int(width),
         "height": int(height),
         "color": {"dir": "color", "encoding": "rgb8_png"},
@@ -126,13 +124,3 @@ def intrinsic_matrix(intrinsics: dict[str, float | int]) -> np.ndarray:
         ],
         dtype=np.float32,
     )
-
-
-def fps_from_timestamps_ns(timestamps_ns: list[int]) -> float:
-    if len(timestamps_ns) < 2:
-        return 0.0
-    deltas = np.diff(np.asarray(timestamps_ns, dtype=np.float64)) / 1e9
-    valid = deltas[deltas > 0]
-    if valid.size == 0:
-        return 0.0
-    return float(1.0 / np.median(valid))
