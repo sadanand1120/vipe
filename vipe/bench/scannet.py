@@ -882,7 +882,7 @@ class ScanNetEvaluator:
         return AttrDict(scannet=ScanNetDataset(input_root, raw_root, self.config))
 
     def _get_scenes(self, dataset: ScanNetDataset) -> list[str]:
-        if self.scenes_filter:
+        if self.scenes_filter is not None:
             return [scene for scene in dataset.SCENES if scene in self.scenes_filter]
         return list(dataset.SCENES)
 

@@ -12,8 +12,10 @@ from typing import Any
 
 import numpy as np
 from vipe import get_config_path
+from vipe.bench.gt_pose_checks import filter_scenes_with_large_gt_jumps
 from vipe.bench.replica import ReplicaEvaluator
 from vipe.bench.scannet import AttrDict
+from vipe.bench.traj_video import save_trajectory_debug_video
 from vipe.utils.config import load_yaml_config
 from vipe.utils.determinism import seed_everything
 
@@ -126,6 +128,7 @@ def _write_vipe_manifest(
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
+        "traj_video_path": str((args.work_dir / "traj_videos" / f"{scene}_rgb_traj_firstalign.mp4").resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
             "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
@@ -147,6 +150,16 @@ def _write_vipe_manifest(
     print(f"[INFO] Wrote ViPE manifest | {scene} | {manifest_path}", flush=True)
     print(f"[INFO] Writing GT metadata | {scene}", flush=True)
     evaluator._save_gt_meta(str(export_dir), exported_scene_data)
+    print(f"[INFO] Writing trajectory debug video | {scene}", flush=True)
+    traj_video_path = save_trajectory_debug_video(
+        scene=scene,
+        image_files=exported_scene_data.image_files,
+        gt_w2c=exported_scene_data.extrinsics,
+        frame_indices=frame_indices,
+        pred_pose_path=pose_path,
+        out_path=manifest["traj_video_path"],
+    )
+    print(f"[INFO] Wrote trajectory debug video | {scene} | {traj_video_path}", flush=True)
 
     print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
@@ -231,8 +244,19 @@ def _load_evaluator(args: argparse.Namespace, eval_config: dict[str, Any]):
     )
 
 
+def _skip_large_jump_scenes(args: argparse.Namespace, evaluator) -> list[tuple[str, Any]]:
+    dataset = evaluator.datasets["replica"]
+    kept, skipped = filter_scenes_with_large_gt_jumps(dataset, list(args.scenes))
+    args.scenes = kept
+    evaluator.scenes_filter = kept
+    if skipped:
+        scene_names = ", ".join(scene for scene, _ in skipped)
+        print(f"[INFO] Skipped {len(skipped)} Replica scene(s) with large GT pose jumps: {scene_names}", flush=True)
+    return skipped
+
+
 def _append_common_cli_args(cmd: list[str], args: argparse.Namespace) -> list[str]:
-    if args.scenes:
+    if args.scenes is not None:
         cmd += ["--scenes", *args.scenes]
     cmd += ["--work-dir", str(args.work_dir)]
     cmd += ["--input-root", str(args.input_root)]
@@ -401,16 +425,19 @@ def main() -> None:
     is_worker = os.environ.get(WORKER_ENV) == "1"
 
     evaluator = _load_evaluator(args, eval_config)
-    if not args.scenes:
+    if args.scenes is None:
         args.scenes = evaluator._get_scenes(evaluator.datasets["replica"])
         if not args.scenes:
             raise ValueError(f"No extracted Replica scenes found under {args.input_root}")
         print(f"[INFO] Using all extracted Replica scenes from {args.input_root}: {len(args.scenes)} scenes")
+    evaluator.scenes_filter = args.scenes
 
     if args.print_only:
         metrics = evaluator._load_metrics()
         print_replica_summary(metrics)
         return
+
+    _skip_large_jump_scenes(args, evaluator)
 
     build_timing = maybe_spawn_workers(args)
     if build_timing is not None:
