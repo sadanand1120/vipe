@@ -115,7 +115,8 @@ def _write_vipe_manifest(
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
-    required_artifacts = [pose_path, tsdf_pcd_path]
+    slam_debug_path = vipe_output_dir / "debug" / f"{artifact_name}_slam_debug.npz"
+    required_artifacts = [pose_path, tsdf_pcd_path, slam_debug_path]
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
@@ -127,6 +128,7 @@ def _write_vipe_manifest(
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
+        "slam_debug_path": str(slam_debug_path.resolve()),
         "traj_video_path": str((args.work_dir / "traj_videos" / f"{scene}_rgb_traj_firstalign.mp4").resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
@@ -185,6 +187,32 @@ def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
 
 def _write_worker_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
     _write_json(_worker_timing_path(args), {"build": build_timing, "metric_eval": metric_timing})
+
+
+def _incremental_pose_dir(args: argparse.Namespace) -> Path:
+    return _metric_dir(args) / "incremental_pose" / "scannet"
+
+
+def _write_incremental_pose_metric(args: argparse.Namespace, evaluator, scene: str) -> None:
+    dataset = evaluator.datasets["scannet"]
+    export_dir = evaluator._export_dir("scannet", scene)
+    result_path = dataset.result_path(export_dir)
+    if not dataset.result_exists(result_path):
+        raise FileNotFoundError(f"Result file not found for incremental pose eval: {result_path}")
+
+    gt_meta = evaluator._load_gt_meta(export_dir)
+    scene_data = gt_meta if gt_meta is not None else dataset.get_data(scene)
+    start = time.perf_counter()
+    result = evaluator._compute_pose_with_gt(dataset, result_path, scene_data)
+    payload = {
+        "scene": scene,
+        "frames": int(len(scene_data["extrinsics"])),
+        "seconds": float(time.perf_counter() - start),
+        "metrics": evaluator._to_float_dict(result),
+    }
+    out_path = _incremental_pose_dir(args) / f"{scene}.json"
+    _write_json(out_path, payload)
+    print(f"[INFO] Incremental pose done | scannet | {scene} | {payload['metrics']} | {out_path}", flush=True)
 
 
 def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[dict, dict]:
@@ -346,6 +374,7 @@ def prepare_vipe_benchmark_exports(
         metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
         build_timing[scene] = _timing_entry(frames, build_seconds)
         metric_timing[scene] = _timing_entry(frames, metric_seconds)
+        _write_incremental_pose_metric(args, evaluator, scene)
     return build_timing, metric_timing
 
 

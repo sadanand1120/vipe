@@ -41,6 +41,10 @@ class ArtifactPath:
     def tsdf_pcd_path(self) -> Path:
         return self.base_path / "pcd" / f"{self.artifact_name}_tsdf.ply"
 
+    @property
+    def slam_debug_path(self) -> Path:
+        return self.base_path / "debug" / f"{self.artifact_name}_slam_debug.npz"
+
 
 def _image_valid_numpy(frame_data: FrameData, shape: tuple[int, int]) -> np.ndarray | None:
     if frame_data.image_valid_mask is None:
@@ -88,6 +92,11 @@ def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
         return
 
     write_binary_ply(out_path.tsdf_pcd_path, points, colors, normals)
+
+
+def save_slam_debug(out_path: ArtifactPath, debug: dict[str, np.ndarray]) -> None:
+    out_path.slam_debug_path.parent.mkdir(exist_ok=True, parents=True)
+    np.savez(out_path.slam_debug_path, **debug)
 
 
 def save_artifacts(

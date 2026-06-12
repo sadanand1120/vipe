@@ -28,6 +28,7 @@ pipeline:
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     ba:
       dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
+      pose_smoothness_alpha: 0.02        # Weak adjacent-pose velocity prior in BA; prevents single-step jumps in ambiguous views.
 
   output:
     pcd_max_points: 10000000             # Max saved TSDF PCD points.

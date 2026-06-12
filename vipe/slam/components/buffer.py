@@ -29,7 +29,8 @@ from vipe.streams.base import FrameData
 from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector
-from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm
+from ..ba.kernel import HuberRobustKernel
+from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm, PoseSmoothnessTerm
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, PoseRetractor
 
@@ -144,8 +145,25 @@ class GraphBuffer:
                 intrinsics_factor=8.0,
                 image_size=(self.height // 8, self.width // 8),
                 camera_type=self.camera_type,
-            )
+            ),
+            HuberRobustKernel(),
         )
+
+        pose_smoothness_alpha = float(self.ba_config.pose_smoothness_alpha)
+        if pose_smoothness_alpha > 0.0 and t1 - t0 > 0:
+            smooth_start = t0 if motion_only else max(t0 - 1, 0)
+            if smooth_start < t1 - 1:
+                smooth_i = torch.arange(smooth_start, t1 - 1, dtype=torch.long, device=self.device)
+                smooth_j = smooth_i + 1
+                frame_dt = (self.tstamp[smooth_j] - self.tstamp[smooth_i]).abs().float().clamp_min(1.0)
+                solver.add_term(
+                    PoseSmoothnessTerm(
+                        pose_i_inds=smooth_i,
+                        pose_j_inds=smooth_j,
+                        alpha=pose_smoothness_alpha,
+                        scale=frame_dt.rsqrt(),
+                    )
+                )
 
         solver.set_fixed(
             "pose",

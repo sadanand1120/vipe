@@ -116,7 +116,8 @@ def _write_vipe_manifest(
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
-    required_artifacts = [pose_path, tsdf_pcd_path]
+    slam_debug_path = vipe_output_dir / "debug" / f"{artifact_name}_slam_debug.npz"
+    required_artifacts = [pose_path, tsdf_pcd_path, slam_debug_path]
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
@@ -128,6 +129,7 @@ def _write_vipe_manifest(
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
+        "slam_debug_path": str(slam_debug_path.resolve()),
         "traj_video_path": str((args.work_dir / "traj_videos" / f"{scene}_rgb_traj_firstalign.mp4").resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),

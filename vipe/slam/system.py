@@ -18,6 +18,7 @@ import logging
 import numpy as np
 import torch
 
+from vipe.ext.lietorch.groups import SE3
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
@@ -103,6 +104,12 @@ class SLAMSystem:
         self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device)
         self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device)
         self.inner_filler = InnerFiller(self.droid_net, self.buffer, self.config, device=self.device)
+
+    def _keyframe_debug_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
+        n = self.buffer.n_frames
+        frame_ids = self.buffer.tstamp[:n].detach().cpu().numpy().astype(np.int64)
+        w2c = SE3(self.buffer.poses[:n]).matrix().detach().cpu().numpy().astype(np.float32)
+        return frame_ids, w2c
 
     def _store_buffer_frame(
         self,
@@ -201,6 +208,7 @@ class SLAMSystem:
             self.buffer.n_frames,
             self.frontend.graph.num_factors,
         )
+        pass1_keyframe_indices, pass1_keyframe_w2c = self._keyframe_debug_snapshot()
 
         # Run a global BA over the keyframes.
         backend_active_factors = self.backend.run(self.config.backend_iters)
@@ -210,7 +218,8 @@ class SLAMSystem:
             backend_active_factors,
         )
 
-        keyframe_indices = [int(t) for t in self.buffer.tstamp[: self.buffer.n_frames].detach().cpu().tolist()]
+        backend_keyframe_indices, backend_keyframe_w2c = self._keyframe_debug_snapshot()
+        keyframe_indices = [int(t) for t in backend_keyframe_indices.tolist()]
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.start_after_keyframes(self.buffer.n_frames)
@@ -232,9 +241,22 @@ class SLAMSystem:
 
         # Scale back the intrinsics to the original size.
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics)
+        trajectory = infill_result.poses.inv()
+        final_c2w = trajectory.matrix().detach().cpu().numpy().astype(np.float32)
 
         return SLAMOutput(
-            trajectory=infill_result.poses.inv(),
+            trajectory=trajectory,
             intrinsics=original_intrinsics,
             keyframe_indices=keyframe_indices,
+            debug={
+                "frame_indices": np.arange(total_n_frames, dtype=np.int64),
+                "pass1_keyframe_indices": pass1_keyframe_indices,
+                "pass1_keyframe_w2c": pass1_keyframe_w2c,
+                "backend_keyframe_indices": backend_keyframe_indices,
+                "backend_keyframe_w2c": backend_keyframe_w2c,
+                "final_c2w": final_c2w,
+                "frontend_factor_count": np.array(self.frontend.graph.num_factors, dtype=np.int64),
+                "backend_factor_count": np.array(backend_active_factors, dtype=np.int64),
+                "infill_chunk_size": np.array(int(self.config.infill_chunk_size), dtype=np.int64),
+            },
         )
