@@ -24,10 +24,13 @@ pipeline:
     backend_ba_iters: 8                  # Inner BA solver iterations per backend graph update.
     backend_max_factors_per_keyframe: 16 # Backend factor budget multiplier: max factors = value * keyframes.
     backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
+    sparse_tracks: cuvslam               # "cuvslam" adds cuVSLAM sparse point tracks as an extra BA flow term; "none" disables it.
+    sparse_tracks_fps: 30.0              # Timestamp rate supplied to cuVSLAM when canonical frames have no real timestamps.
     init_disp: 1.0                       # Initial disparity value before external sensor-depth anchors are injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     ba:
       dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
+      sparse_tracks_weight: 0.001        # Weight for sparse-track flow residuals in BA, matching the dense DROID flow scale.
       pose_smoothness_alpha: 0.02        # Weak adjacent-pose velocity prior in BA; prevents single-step jumps in ambiguous views.
 
   output:

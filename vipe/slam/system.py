@@ -29,6 +29,7 @@ from .components.buffer import GraphBuffer
 from .components.frontend import SLAMFrontend
 from .components.inner_filler import InnerFiller
 from .components.motion_filter import MotionFilter, MotionFilterResult
+from .components.sparse_tracks import CuvslamSparseTracks
 from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
 
@@ -87,12 +88,14 @@ class SLAMSystem:
 
     def _build_components(self):
         self.droid_net = DroidNet().to(self.device)
+        self.sparse_tracks = self._build_sparse_tracks()
         self.buffer = GraphBuffer(
             height=self.config.height,
             width=self.config.width,
             buffer_size=self.config.buffer,
             init_disp=self.config.init_disp,
             ba_config=self.config.ba,
+            sparse_tracks=self.sparse_tracks,
             camera_type=self.config.camera_type,
             device=self.device,
         )
@@ -104,6 +107,14 @@ class SLAMSystem:
         self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device)
         self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device)
         self.inner_filler = InnerFiller(self.droid_net, self.buffer, self.config, device=self.device)
+
+    def _build_sparse_tracks(self) -> CuvslamSparseTracks | None:
+        mode = str(self.config.sparse_tracks)
+        if mode == "none":
+            return None
+        if mode == "cuvslam":
+            return CuvslamSparseTracks(fps=float(self.config.sparse_tracks_fps))
+        raise ValueError(f"Unknown sparse_tracks mode: {mode}")
 
     def _keyframe_debug_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
         n = self.buffer.n_frames
@@ -189,6 +200,8 @@ class SLAMSystem:
         for frame_idx, frame_data in pass1_pbar:
             frame_data = self._attach_intrinsics(frame_data, intrinsics, camera_type)
             frame_data = resizer(frame_data)
+            if self.sparse_tracks is not None:
+                self.sparse_tracks.track_frame(frame_idx, frame_data)
             images = self._rgb_bchw(frame_data)
             motion_result = self.motion_filter.check(images)
 

@@ -33,6 +33,7 @@ from ..ba.kernel import HuberRobustKernel
 from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm, PoseSmoothnessTerm
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, PoseRetractor
+from .sparse_tracks import CuvslamSparseTracks
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class GraphBuffer:
         buffer_size: int,
         init_disp: float,
         ba_config,
+        sparse_tracks: CuvslamSparseTracks | None,
         camera_type: CameraType,
         device: torch.device = torch.device("cuda"),
     ):
@@ -55,6 +57,7 @@ class GraphBuffer:
         self.width = width
         self.device = device
         self.ba_config = ba_config
+        self.sparse_tracks = sparse_tracks
         self.camera_type = camera_type
 
         assert self.height % 8 == 0 and self.width % 8 == 0
@@ -124,6 +127,8 @@ class GraphBuffer:
         pose_damping: float,
         pose_ep: float,
         motion_only: bool,
+        sparse_target: torch.Tensor | None,
+        sparse_weight: torch.Tensor | None,
         verbose: bool,
     ):
         assert t0 <= t1
@@ -148,6 +153,23 @@ class GraphBuffer:
             ),
             HuberRobustKernel(),
         )
+
+        sparse_tracks_weight = float(self.ba_config.sparse_tracks_weight)
+        if sparse_tracks_weight > 0.0 and sparse_target is not None and sparse_weight is not None:
+            solver.add_term(
+                DenseDepthFlowTerm(
+                    pose_i_inds=ii,
+                    pose_j_inds=jj,
+                    dense_disp_i_inds=di,
+                    target=sparse_target,
+                    weight=sparse_tracks_weight * sparse_weight,
+                    intrinsics=self.intrinsics,
+                    intrinsics_factor=8.0,
+                    image_size=(self.height // 8, self.width // 8),
+                    camera_type=self.camera_type,
+                ),
+                HuberRobustKernel(),
+            )
 
         pose_smoothness_alpha = float(self.ba_config.pose_smoothness_alpha)
         if pose_smoothness_alpha > 0.0 and t1 - t0 > 0:

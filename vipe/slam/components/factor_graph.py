@@ -49,12 +49,14 @@ class FactorGraph:
         device: torch.device,
         max_factors: int,
         incremental: bool,
+        use_sparse_tracks: bool = False,
     ):
         self.net = net
         self.buffer = buffer
         self.device = device
         self.max_factors = max_factors
         self.incremental = incremental
+        self.use_sparse_tracks = use_sparse_tracks
 
         ht = buffer.height // 8
         wd = buffer.width // 8
@@ -68,6 +70,8 @@ class FactorGraph:
 
         self.target = torch.zeros([1, 0, ht, wd, 2], device=device, dtype=torch.float)
         self.weight = torch.zeros([1, 0, ht, wd, 2], device=device, dtype=torch.float)
+        self.sparse_target = None
+        self.sparse_weight = None
 
         self.corr, self.f_net, self.inp = None, None, None
 
@@ -117,6 +121,7 @@ class FactorGraph:
             target, _ = self.buffer.reproject_dense_disp(ii, jj)
             target = target[None]
             weight = torch.zeros_like(target)
+            sparse_target, sparse_weight = self._compute_sparse_targets(ii, jj)
 
         self.ii = torch.cat([self.ii, ii], 0)
         self.jj = torch.cat([self.jj, jj], 0)
@@ -127,6 +132,37 @@ class FactorGraph:
 
         self.target = torch.cat([self.target, target], 1)
         self.weight = torch.cat([self.weight, weight], 1)
+        self._append_sparse_targets(sparse_target, sparse_weight)
+
+    def _compute_sparse_targets(
+        self,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.use_sparse_tracks or self.buffer.sparse_tracks is None:
+            return None, None
+
+        return self.buffer.sparse_tracks.compute_dense_flow_target_weight(
+            source_frame_inds=self.buffer.tstamp[ii],
+            target_frame_inds=self.buffer.tstamp[jj],
+            image_size=(self.buffer.height, self.buffer.width),
+            dense_disp_size=(self.buffer.height // 8, self.buffer.width // 8),
+            device=self.device,
+        )
+
+    def _append_sparse_targets(
+        self,
+        sparse_target: torch.Tensor | None,
+        sparse_weight: torch.Tensor | None,
+    ) -> None:
+        if sparse_target is None or sparse_weight is None:
+            return
+        if self.sparse_target is None or self.sparse_weight is None:
+            self.sparse_target = sparse_target
+            self.sparse_weight = sparse_weight
+            return
+        self.sparse_target = torch.cat([self.sparse_target, sparse_target], 0)
+        self.sparse_weight = torch.cat([self.sparse_weight, sparse_weight], 0)
 
     @torch.amp.autocast("cuda", enabled=True)
     def rm_factors(self, mask: torch.Tensor):
@@ -143,6 +179,10 @@ class FactorGraph:
 
         self.target = self.target[:, ~mask]
         self.weight = self.weight[:, ~mask]
+        if self.sparse_target is not None:
+            self.sparse_target = self.sparse_target[~mask]
+        if self.sparse_weight is not None:
+            self.sparse_weight = self.sparse_weight[~mask]
 
     @torch.amp.autocast("cuda", enabled=True)
     def rm_second_newest_keyframe(self, ix: int):
@@ -203,6 +243,8 @@ class FactorGraph:
                 pose_damping=1e-3,
                 pose_ep=0.1,
                 motion_only=motion_only,
+                sparse_target=self.sparse_target,
+                sparse_weight=self.sparse_weight,
                 verbose=False,
             )
 
@@ -269,6 +311,8 @@ class FactorGraph:
                 pose_damping=1e-5,
                 pose_ep=1e-2,
                 motion_only=False,
+                sparse_target=self.sparse_target,
+                sparse_weight=self.sparse_weight,
                 verbose=solver_verbose,
             )
 

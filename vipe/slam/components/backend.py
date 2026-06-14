@@ -56,6 +56,7 @@ class SLAMBackend:
             self.device,
             max_factors=self.args.backend_max_factors_per_keyframe * t,
             incremental=False,
+            use_sparse_tracks=True,
         )
 
         graph.add_proximity_factors(
