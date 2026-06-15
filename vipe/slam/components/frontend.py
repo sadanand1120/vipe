@@ -63,6 +63,7 @@ class SLAMFrontend:
         self.frontend_update_iters1 = args.frontend_update_iters1
         self.frontend_update_iters2 = args.frontend_update_iters2
         self.frontend_ba_iters = args.frontend_ba_iters
+        self.max_keyframe_gap = args.max_keyframe_gap
 
     def __init_pose(self):
         assert self.t1 > 1
@@ -104,7 +105,9 @@ class SLAMFrontend:
             beta=self.beta,
             bidirectional=True,
         )
-        if d.max().item() < self.keyframe_thresh:
+        removal_gap = self.video.tstamp[self.t1 - 1] - self.video.tstamp[self.t1 - 3]
+        keep_for_gap = self.max_keyframe_gap > 0 and removal_gap.item() > self.max_keyframe_gap
+        if d.max().item() < self.keyframe_thresh and not keep_for_gap:
             self.graph.rm_second_newest_keyframe(self.t1 - 2)
             self.t1 -= 1
         else:

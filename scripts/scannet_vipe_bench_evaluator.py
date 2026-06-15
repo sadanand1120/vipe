@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 from vipe import get_config_path
-from vipe.bench.gt_pose_checks import filter_scenes_with_large_gt_jumps
+from vipe.bench.gt_pose_checks import filter_scenes_with_bad_gt_pose_data
 from vipe.bench.scannet import AttrDict, ScanNetEvaluator
 from vipe.bench.traj_video import save_trajectory_debug_video
 from vipe.utils.config import load_yaml_config
@@ -271,14 +271,19 @@ def _load_evaluator(args: argparse.Namespace, eval_config: dict[str, Any]):
     )
 
 
-def _skip_large_jump_scenes(args: argparse.Namespace, evaluator) -> list[tuple[str, Any]]:
+def _skip_bad_gt_pose_scenes(args: argparse.Namespace, evaluator) -> list[tuple[str, Any]]:
     dataset = evaluator.datasets["scannet"]
-    kept, skipped = filter_scenes_with_large_gt_jumps(dataset, list(args.scenes))
+    kept, skipped = filter_scenes_with_bad_gt_pose_data(dataset, list(args.scenes))
     args.scenes = kept
     evaluator.scenes_filter = kept
+    if os.environ.get(WORKER_ENV) != "1":
+        _write_json(
+            _metric_dir(args) / "skipped_gt_pose_scenes.json",
+            {scene: report.summary() for scene, report in skipped},
+        )
     if skipped:
-        scene_names = ", ".join(scene for scene, _ in skipped)
-        print(f"[INFO] Skipped {len(skipped)} ScanNet scene(s) with large GT pose jumps: {scene_names}", flush=True)
+        scene_names = "; ".join(f"{scene} ({report.summary()})" for scene, report in skipped)
+        print(f"[INFO] Skipped {len(skipped)} ScanNet scene(s) with bad GT pose data: {scene_names}", flush=True)
     return skipped
 
 
@@ -465,7 +470,7 @@ def main() -> None:
         print_scannet_summary(metrics)
         return
 
-    _skip_large_jump_scenes(args, evaluator)
+    _skip_bad_gt_pose_scenes(args, evaluator)
 
     build_timing = maybe_spawn_workers(args)
     if build_timing is not None:

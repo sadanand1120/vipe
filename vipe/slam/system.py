@@ -205,7 +205,15 @@ class SLAMSystem:
             images = self._rgb_bchw(frame_data)
             motion_result = self.motion_filter.check(images)
 
-            if motion_result.is_keyframe or frame_idx == total_n_frames - 1:
+            max_keyframe_gap = int(self.config.max_keyframe_gap)
+            force_keyframe = False
+            if max_keyframe_gap > 0 and self.buffer.n_frames > 0:
+                last_keyframe_idx = int(self.buffer.tstamp[self.buffer.n_frames - 1].item())
+                force_keyframe = frame_idx - last_keyframe_idx >= max_keyframe_gap
+            if force_keyframe and not motion_result.is_keyframe:
+                motion_result = self.motion_filter.promote_keyframe(images, motion_result.fmap)
+
+            if motion_result.is_keyframe or force_keyframe or frame_idx == total_n_frames - 1:
                 self._add_frontend_keyframe(frame_idx, images, frame_data, motion_result)
 
             self.frontend.run()

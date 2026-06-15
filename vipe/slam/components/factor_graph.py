@@ -50,6 +50,7 @@ class FactorGraph:
         max_factors: int,
         incremental: bool,
         use_sparse_tracks: bool = False,
+        use_depth_geometry: bool = False,
     ):
         self.net = net
         self.buffer = buffer
@@ -57,6 +58,7 @@ class FactorGraph:
         self.max_factors = max_factors
         self.incremental = incremental
         self.use_sparse_tracks = use_sparse_tracks
+        self.use_depth_geometry = use_depth_geometry
 
         ht = buffer.height // 8
         wd = buffer.width // 8
@@ -245,6 +247,7 @@ class FactorGraph:
                 motion_only=motion_only,
                 sparse_target=self.sparse_target,
                 sparse_weight=self.sparse_weight,
+                use_depth_geometry=False,
                 verbose=False,
             )
 
@@ -313,6 +316,7 @@ class FactorGraph:
                 motion_only=False,
                 sparse_target=self.sparse_target,
                 sparse_weight=self.sparse_weight,
+                use_depth_geometry=self.use_depth_geometry,
                 verbose=solver_verbose,
             )
 

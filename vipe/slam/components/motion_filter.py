@@ -61,6 +61,14 @@ class MotionFilter:
 
     @torch.amp.autocast("cuda", enabled=True)
     @torch.no_grad()
+    def promote_keyframe(self, images: torch.Tensor, fmap: torch.Tensor) -> MotionFilterResult:
+        net, inp = self.net.encode_context(images)
+        self.f_net, self.f_inp, self.f_fmap = net, inp, fmap
+        self.last_kf_frame_idx = self.current_frame_idx
+        return MotionFilterResult(True, fmap, net, inp)
+
+    @torch.amp.autocast("cuda", enabled=True)
+    @torch.no_grad()
     def check(self, images: torch.Tensor) -> MotionFilterResult:
         """
         main update operation - run on every frame in video
@@ -101,10 +109,7 @@ class MotionFilter:
 
             # check motion magnitue / add new frame to video
             if dense_motion_score > self.thresh:
-                net, inp = self.net.encode_context(images)
-                self.f_net, self.f_inp, self.f_fmap = net, inp, gmap
-                self.last_kf_frame_idx = self.current_frame_idx
-                return MotionFilterResult(True, gmap, net, inp)
+                return self.promote_keyframe(images, gmap)
 
             else:
                 return MotionFilterResult(False, gmap)

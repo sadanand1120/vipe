@@ -88,7 +88,7 @@ class InnerFiller:
         graph.add_factors(t0, infill_inds)
         graph.add_factors(t1, infill_inds)
 
-        for _ in range(10):
+        for _ in range(int(self.args.infill_update_steps)):
             graph.update(
                 self.start_idx,
                 total_frames,

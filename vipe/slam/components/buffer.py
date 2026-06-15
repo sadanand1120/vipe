@@ -30,7 +30,12 @@ from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector
 from ..ba.kernel import HuberRobustKernel
-from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm, PoseSmoothnessTerm
+from ..ba.terms import (
+    DenseDepthFlowTerm,
+    DispSensRegularizationTerm,
+    PoseSmoothnessTerm,
+    SensorDepthGeometryTerm,
+)
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, PoseRetractor
 from .sparse_tracks import CuvslamSparseTracks
@@ -129,6 +134,7 @@ class GraphBuffer:
         motion_only: bool,
         sparse_target: torch.Tensor | None,
         sparse_weight: torch.Tensor | None,
+        use_depth_geometry: bool,
         verbose: bool,
     ):
         assert t0 <= t1
@@ -156,6 +162,7 @@ class GraphBuffer:
 
         sparse_tracks_weight = float(self.ba_config.sparse_tracks_weight)
         if sparse_tracks_weight > 0.0 and sparse_target is not None and sparse_weight is not None:
+            sparse_weight = self._gate_sparse_weight(target, sparse_target, sparse_weight)
             solver.add_term(
                 DenseDepthFlowTerm(
                     pose_i_inds=ii,
@@ -167,6 +174,25 @@ class GraphBuffer:
                     intrinsics_factor=8.0,
                     image_size=(self.height // 8, self.width // 8),
                     camera_type=self.camera_type,
+                ),
+                HuberRobustKernel(),
+            )
+
+        depth_geom_weight = float(self.ba_config.depth_geom_weight)
+        if use_depth_geometry and depth_geom_weight > 0.0 and len(ii) > 0:
+            solver.add_term(
+                SensorDepthGeometryTerm(
+                    pose_i_inds=ii,
+                    pose_j_inds=jj,
+                    sensor_disps=self.disps_sens,
+                    sensor_weights=self.disps_sens_weight,
+                    intrinsics=self.intrinsics,
+                    intrinsics_factor=8.0,
+                    image_size=(self.height // 8, self.width // 8),
+                    camera_type=self.camera_type,
+                    alpha=depth_geom_weight,
+                    points_per_factor=self.ba_config.depth_geom_points_per_factor,
+                    max_residual_m=self.ba_config.depth_geom_max_residual_m,
                 ),
                 HuberRobustKernel(),
             )
@@ -237,6 +263,26 @@ class GraphBuffer:
             logger.info(f"BA iters = {n_iters}, energy: {ba_energy[0]} -> {ba_energy[-1]}")
 
         self.disps.clamp_(min=0.001)
+
+    def _gate_sparse_weight(
+        self,
+        dense_target: torch.Tensor,
+        sparse_target: torch.Tensor,
+        sparse_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        max_weight = float(self.ba_config.sparse_tracks_max_weight)
+        max_residual = float(self.ba_config.sparse_tracks_max_residual)
+        min_cells = int(self.ba_config.sparse_tracks_min_cells)
+
+        gated_weight = sparse_weight.clamp(max=max_weight) if max_weight > 0.0 else sparse_weight
+        active = gated_weight[..., 0] > 0.0
+        if max_residual > 0.0:
+            residual = torch.linalg.norm(sparse_target - dense_target, dim=-1)
+            active &= residual <= max_residual
+
+        if min_cells > 0:
+            active &= active.sum(dim=1, keepdim=True) >= min_cells
+        return gated_weight * active[..., None].float()
 
     def reproject_dense_disp(self, ii: torch.Tensor, jj: torch.Tensor):
         """Project each source dense-disparity map from frame ii into frame jj."""
