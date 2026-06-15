@@ -25,17 +25,11 @@ pipeline:
     backend_ba_iters: 8                  # Inner BA solver iterations per backend graph update.
     backend_max_factors_per_keyframe: 16 # Backend factor budget multiplier: max factors = value * keyframes.
     backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
-    sparse_tracks: cuvslam               # "cuvslam" adds cuVSLAM sparse point tracks as an extra BA flow term; "none" disables it.
-    sparse_tracks_fps: 30.0              # Timestamp rate supplied to cuVSLAM when canonical frames have no real timestamps.
     init_disp: 1.0                       # Initial disparity value before external sensor-depth anchors are injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     infill_update_steps: 10              # Motion-only graph update calls for non-keyframe pose infilling; 0 uses interpolation only.
     ba:
       dense_disp_alpha: 0.003            # Weight for external sensor-depth regularization in BA.
-      sparse_tracks_weight: 0.001        # Weight for sparse-track flow residuals in BA, matching the dense DROID flow scale.
-      sparse_tracks_min_cells: 16        # Drop a cuVSLAM sparse factor if fewer low-res cells survive gating.
-      sparse_tracks_max_residual: 8.0    # Drop cuVSLAM cells whose target is this many 1/8-res pixels from DROID's current target.
-      sparse_tracks_max_weight: 1.0      # Cap per-cell cuVSLAM sparse weight so clustered tracks cannot dominate BA.
       depth_geom_weight: 0.01            # Backend-only point-to-plane sensor-depth pose term weight.
       depth_geom_points_per_factor: 96   # Max sampled 1/8-res sensor-depth points per backend graph factor.
       depth_geom_max_residual_m: 0.25    # Drop point-to-plane correspondences farther than this many meters.
