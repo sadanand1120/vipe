@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     cli_args = build_parser().parse_args()
     cfg = load_yaml_config(DEFAULT_CONFIG_PATH)
-    seed_everything(cfg.seed)
+    seed_everything(cfg.seed, temporary_determinism=cfg.temporary_determinism)
     logger = configure_logging()
     pipeline = VipePipeline(
         slam=cfg.pipeline.slam,

@@ -1,4 +1,5 @@
-seed: 42                                  # Seed Python/NumPy/Torch/Open3D RNGs for benchmark-side sampling.
+seed: 42                                  # Seed Python/NumPy/Torch/Open3D RNGs and deterministic backend settings where supported.
+temporary_determinism: true               # Reproducibility switch for experiments; turn off for deployment because deterministic kernels hurt speed.
 
 pose:
   device: cuda:0                           # Torch device for pose AUC computation.

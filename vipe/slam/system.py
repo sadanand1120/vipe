@@ -28,6 +28,7 @@ from .components.buffer import GraphBuffer
 from .components.frontend import SLAMFrontend
 from .components.inner_filler import InnerFiller
 from .components.motion_filter import MotionFilter, MotionFilterResult
+from .debug_trace import SLAMDebugTrace
 from .interface import SLAMOutput
 from .networks.droid_net import DroidNet
 
@@ -83,6 +84,8 @@ class SLAMSystem:
     ) -> None:
         self.device = device
         self.config = config.copy()
+        trace = SLAMDebugTrace.from_env()
+        self.trace = trace if trace.enabled else None
 
     def _build_components(self):
         self.droid_net = DroidNet().to(self.device)
@@ -100,8 +103,8 @@ class SLAMSystem:
             thresh=self.config.filter_thresh,
             device=self.device,
         )
-        self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device)
-        self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device)
+        self.frontend = SLAMFrontend(self.droid_net, self.buffer, self.config, device=self.device, trace=self.trace)
+        self.backend = SLAMBackend(self.droid_net, self.buffer, self.config, device=self.device, trace=self.trace)
         self.inner_filler = InnerFiller(self.droid_net, self.buffer, self.config, device=self.device)
 
     def _store_buffer_frame(
@@ -177,6 +180,13 @@ class SLAMSystem:
         )
 
         self._build_components()
+        if self.trace is not None:
+            self.trace.write(
+                "run_start",
+                frames=int(total_n_frames),
+                height=int(frame_size[0]),
+                width=int(frame_size[1]),
+            )
 
         pass1_pbar = pbar(enumerate(frame_stream), desc="SLAM Pass (1/2)", total=total_n_frames)
         for frame_idx, frame_data in pass1_pbar:
@@ -191,12 +201,28 @@ class SLAMSystem:
                 last_keyframe_idx = int(self.buffer.tstamp[self.buffer.n_frames - 1].item())
                 force_keyframe = frame_idx - last_keyframe_idx >= max_keyframe_gap
             if force_keyframe and not motion_result.is_keyframe:
-                motion_result = self.motion_filter.promote_keyframe(images, motion_result.fmap)
+                motion_result = self.motion_filter.promote_keyframe(images, motion_result.fmap, motion_result.motion_score)
 
+            stored_keyframe = False
             if motion_result.is_keyframe or force_keyframe or frame_idx == total_n_frames - 1:
                 self._add_frontend_keyframe(frame_idx, images, frame_data, motion_result)
+                stored_keyframe = True
 
             self.frontend.run()
+            if self.trace is not None:
+                self.trace.write(
+                    "pass1_frame",
+                    frame_idx=int(frame_idx),
+                    motion_score=motion_result.motion_score,
+                    motion_keyframe=bool(motion_result.is_keyframe),
+                    force_keyframe=bool(force_keyframe),
+                    stored_keyframe=bool(stored_keyframe),
+                    keyframes=int(self.buffer.n_frames),
+                    frontend_t1=int(self.frontend.t1),
+                    factors=self.frontend.graph.num_factors,
+                    edge_digest=self.frontend.graph.edge_digest(),
+                    edge_set_digest=self.frontend.graph.edge_set_digest(),
+                )
 
             if hasattr(pass1_pbar, "set_postfix"):
                 pass1_pbar.set_postfix(
@@ -219,6 +245,8 @@ class SLAMSystem:
         )
 
         keyframe_indices = [int(t) for t in self.buffer.tstamp[: self.buffer.n_frames].detach().cpu().tolist()]
+        if self.trace is not None:
+            self.trace.write("keyframes_final", keyframe_indices=keyframe_indices)
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.start_after_keyframes(self.buffer.n_frames)
@@ -242,8 +270,12 @@ class SLAMSystem:
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics)
         trajectory = infill_result.poses.inv()
 
-        return SLAMOutput(
+        output = SLAMOutput(
             trajectory=trajectory,
             intrinsics=original_intrinsics,
             keyframe_indices=keyframe_indices,
         )
+        if self.trace is not None:
+            self.trace.write("run_done", trajectory_frames=int(trajectory.data.shape[0]))
+            self.trace.close()
+        return output

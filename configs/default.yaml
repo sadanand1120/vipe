@@ -1,4 +1,5 @@
-seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels.
+seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs and enable deterministic backend settings where supported.
+temporary_determinism: true  # Reproducibility switch for experiments; turn off for deployment because deterministic kernels hurt speed.
 
 pipeline:
   slam:

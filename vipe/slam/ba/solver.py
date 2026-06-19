@@ -28,6 +28,7 @@ from .terms import SolverTerm
 
 
 logger = logging.getLogger(__name__)
+GROUP_ORDER = ("pose", "dense_disp")
 
 
 def solve_scipy(pi: torch.Tensor, pj: torch.Tensor, lhs: torch.Tensor, rhs: torch.Tensor):
@@ -63,6 +64,13 @@ class Solver:
         self.group_ep: dict[str, float] = {}
         self.group_retractor: dict[str, BaseRetractor] = defaultdict(BaseRetractor)
         self.group_marginalized: dict[str, bool] = defaultdict(lambda: False)
+
+    @staticmethod
+    def _ordered_groups(group_names) -> list[str]:
+        group_set = set(group_names)
+        ordered = [name for name in GROUP_ORDER if name in group_set]
+        ordered.extend(sorted(group_set.difference(GROUP_ORDER)))
+        return ordered
 
     def _warn_if_no_terms(self, group_name: str):
         all_group_names = set.union(*[t.group_names() for t in self.terms])
@@ -125,7 +133,7 @@ class Solver:
             # Compute the newest term formulation
             term.update(self)
             term_return = term.forward(variables, jacobian=True)
-            term_group_names = list(term.group_names().difference(fully_fixed_groups))
+            term_group_names = self._ordered_groups(term.group_names().difference(fully_fixed_groups))
 
             if kernel is not None:
                 term_return.apply_robust_kernel(kernel)
@@ -150,13 +158,15 @@ class Solver:
                         jtwj = term_return.jtwj(group_name_i, group_name_j)
                         lhs[(group_name_i, group_name_j)] += jtwj
 
-        all_group_names = list(rhs.keys())
+        all_group_names = self._ordered_groups(rhs.keys())
         marginalized_group_names = [
             group_name
-            for group_name, marginalized in self.group_marginalized.items()
-            if marginalized and group_name in all_group_names
+            for group_name in all_group_names
+            if self.group_marginalized[group_name]
         ]
-        regular_group_names = list(set(all_group_names).difference(marginalized_group_names))
+        regular_group_names = [
+            group_name for group_name in all_group_names if group_name not in marginalized_group_names
+        ]
 
         for group_name in all_group_names:
             damping = self.group_damping.get(group_name, 0.0)

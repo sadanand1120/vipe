@@ -56,7 +56,7 @@ def run_vipe(scene_dir: Path, pipeline_cfg, output_dir: Path) -> None:
     from vipe.streams.base import FrameDir
     from vipe.utils.logging import configure_logging
 
-    seed_everything(pipeline_cfg.seed)
+    seed_everything(pipeline_cfg.seed, temporary_determinism=pipeline_cfg.temporary_determinism)
     logger = configure_logging()
     pipeline = VipePipeline(
         slam=pipeline_cfg.pipeline.slam,
@@ -440,7 +440,7 @@ def main() -> None:
     args = parser.parse_args()
     pipeline_cfg = load_yaml_config(PIPELINE_CONFIG_PATH)
     eval_config = load_yaml_config(EVAL_CONFIG_PATH)
-    seed_everything(int(eval_config.seed))
+    seed_everything(int(eval_config.seed), temporary_determinism=eval_config.temporary_determinism)
     is_worker = os.environ.get(WORKER_ENV) == "1"
 
     evaluator = _load_evaluator(args, eval_config)

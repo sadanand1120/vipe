@@ -20,10 +20,13 @@
 
 import warnings
 
+import hashlib
 import numpy as np
 import torch
 
 from einops import rearrange
+
+from vipe.utils.determinism import temporary_determinism_enabled
 
 from ..networks.droid_net import AltCorrBlock, CorrBlock, DroidNet
 from .buffer import GraphBuffer
@@ -33,6 +36,8 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
 class FactorGraph:
+    PROXIMITY_SORT_EPS = 1e-3
+
     @staticmethod
     def coords_grid(ht, wd, **kwargs):
         y, x = torch.meshgrid(
@@ -77,6 +82,39 @@ class FactorGraph:
     def num_factors(self) -> int:
         return int(self.ii.shape[0])
 
+    def edge_digest(self) -> str:
+        if self.ii.numel() == 0:
+            return "empty"
+        edges = torch.stack([self.ii, self.jj], dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
+        return hashlib.blake2b(edges.tobytes(), digest_size=8).hexdigest()
+
+    def edge_set_digest(self) -> str:
+        if self.ii.numel() == 0:
+            return "empty"
+        edges = torch.stack([self.ii, self.jj], dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
+        edges = edges[np.lexsort((edges[:, 1], edges[:, 0]))]
+        return hashlib.blake2b(edges.tobytes(), digest_size=8).hexdigest()
+
+    def _oldest_factor_mask(self, num_new_factors: int) -> torch.Tensor:
+        keep_existing = max(self.max_factors - int(num_new_factors), 0)
+        age = self.age.detach().cpu().numpy()
+        order = np.lexsort((np.arange(len(age)), age))
+        drop = order[keep_existing:]
+        mask = torch.zeros(len(age), dtype=torch.bool, device=self.device)
+        if len(drop) > 0:
+            mask[torch.as_tensor(drop, dtype=torch.long, device=self.device)] = True
+        return mask
+
+    def _proximity_order(self, d: torch.Tensor, ii: torch.Tensor, jj: torch.Tensor) -> np.ndarray:
+        dist = d.detach().cpu().numpy()
+        quantized = np.full(dist.shape, np.iinfo(np.int64).max, dtype=np.int64)
+        finite = np.isfinite(dist)
+        quantized[finite] = np.rint(dist[finite] / self.PROXIMITY_SORT_EPS).astype(np.int64)
+        ii_cpu = ii.detach().cpu().numpy().astype(np.int64)
+        jj_cpu = jj.detach().cpu().numpy().astype(np.int64)
+        edge_id = ii_cpu * max(int(self.buffer.n_frames), 1) + jj_cpu
+        return np.lexsort((edge_id, quantized))
+
     def __filter_repeated_edges(self, ii, jj):
         keep = torch.zeros(ii.shape[0], dtype=torch.bool, device=ii.device)
         eset = set((i.item(), j.item()) for i, j in zip(self.ii, self.jj))
@@ -103,8 +141,7 @@ class FactorGraph:
             and self.corr is not None
             and remove
         ):
-            ix = torch.arange(len(self.age))[torch.argsort(self.age).cpu()]
-            self.rm_factors(ix >= self.max_factors - ii.shape[0])
+            self.rm_factors(self._oldest_factor_mask(int(ii.shape[0])))
 
         if self.incremental:
             fmap1 = self.buffer.fmaps[ii][None]
@@ -326,7 +363,7 @@ class FactorGraph:
                 es.append((j, i))
                 _suppress(i, j)
 
-        ix = torch.argsort(d)
+        ix = self._proximity_order(d, ii, jj) if temporary_determinism_enabled() else torch.argsort(d)
         for k in ix:
             if d[k].item() > thresh:
                 continue

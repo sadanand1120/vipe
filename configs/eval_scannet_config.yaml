@@ -1,4 +1,5 @@
-seed: 42                                  # Seed Python/NumPy/Torch/Open3D RNGs for benchmark-side sampling.
+seed: 42                                  # Seed Python/NumPy/Torch/Open3D RNGs and deterministic backend settings where supported.
+temporary_determinism: true               # Reproducibility switch for experiments; turn off for deployment because deterministic kernels hurt speed.
 
 dataset:
   gt_mesh_suffix: _vh_clean_2.ply          # Preferred raw ScanNet GT mesh suffix.

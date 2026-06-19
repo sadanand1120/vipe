@@ -28,12 +28,14 @@ from .factor_graph import FactorGraph
 
 
 class SLAMFrontend:
+    KEYFRAME_DECISION_EPS = 1e-4
+
     """
     Frontend is called given every new frame. Currently it is a no-op for non-keyframe frames.
     For keyframe, it handles the system initialization and partial update logic (i.e. use BA to get pose for this kf).
     """
 
-    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device):
+    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device, trace=None):
         self.video = video
         self.graph = FactorGraph(
             net,
@@ -64,6 +66,7 @@ class SLAMFrontend:
         self.frontend_update_iters2 = args.frontend_update_iters2
         self.frontend_ba_iters = args.frontend_ba_iters
         self.max_keyframe_gap = args.max_keyframe_gap
+        self.trace = trace
 
     def __init_pose(self):
         assert self.t1 > 1
@@ -77,6 +80,7 @@ class SLAMFrontend:
         """add edges, perform update"""
 
         self.t1 += 1
+        update_t1 = self.t1
 
         # t1 - 1 is the new-added frame
         # t1 - 2 is the previous frame
@@ -94,6 +98,15 @@ class SLAMFrontend:
             beta=self.beta,
             remove=True,
         )
+        if self.trace is not None:
+            self.trace.write(
+                "frontend_update_start",
+                t1=update_t1,
+                keyframes=int(self.video.n_frames),
+                factors=self.graph.num_factors,
+                edge_digest=self.graph.edge_digest(),
+                edge_set_digest=self.graph.edge_set_digest(),
+            )
 
         for _ in range(self.frontend_update_iters1):
             self.graph.update(itrs=self.frontend_ba_iters)
@@ -107,12 +120,46 @@ class SLAMFrontend:
         )
         removal_gap = self.video.tstamp[self.t1 - 1] - self.video.tstamp[self.t1 - 3]
         keep_for_gap = self.max_keyframe_gap > 0 and removal_gap.item() > self.max_keyframe_gap
-        if d.max().item() < self.keyframe_thresh and not keep_for_gap:
+        decision_d = float(d.max().item())
+        prune_threshold = self.keyframe_thresh - self.KEYFRAME_DECISION_EPS
+        action = "prune" if decision_d < prune_threshold and not keep_for_gap else "keep"
+        if self.trace is not None:
+            self.trace.write(
+                "frontend_keyframe_decision",
+                t1=update_t1,
+                candidate_ix=int(self.t1 - 2),
+                candidate_frame=int(self.video.tstamp[self.t1 - 2].item()),
+                previous_frame=int(self.video.tstamp[self.t1 - 3].item()),
+                newest_frame=int(self.video.tstamp[self.t1 - 1].item()),
+                distance=decision_d,
+                threshold=float(self.keyframe_thresh),
+                prune_threshold=float(prune_threshold),
+                removal_gap=int(removal_gap.item()),
+                keep_for_gap=bool(keep_for_gap),
+                action=action,
+                keyframes_before=int(self.video.n_frames),
+                factors_before=self.graph.num_factors,
+                edge_digest_before=self.graph.edge_digest(),
+                edge_set_digest_before=self.graph.edge_set_digest(),
+            )
+        if action == "prune":
             self.graph.rm_second_newest_keyframe(self.t1 - 2)
             self.t1 -= 1
         else:
             for _ in range(self.frontend_update_iters2):
                 self.graph.update(itrs=self.frontend_ba_iters)
+
+        if self.trace is not None:
+            self.trace.write(
+                "frontend_update_done",
+                t1=int(self.t1),
+                action=action,
+                keyframes=int(self.video.n_frames),
+                factors=self.graph.num_factors,
+                edge_digest=self.graph.edge_digest(),
+                edge_set_digest=self.graph.edge_set_digest(),
+                tstamp_tail=self.video.tstamp[max(self.video.n_frames - 8, 0) : self.video.n_frames],
+            )
 
         # set pose for next itration
         self.__init_pose()
@@ -124,6 +171,15 @@ class SLAMFrontend:
         self.t1 = self.video.n_frames
 
         self.graph.add_neighborhood_factors(0, self.t1, r=1)
+        if self.trace is not None:
+            self.trace.write(
+                "frontend_initialize_start",
+                t1=int(self.t1),
+                keyframes=int(self.video.n_frames),
+                factors=self.graph.num_factors,
+                edge_digest=self.graph.edge_digest(),
+                edge_set_digest=self.graph.edge_set_digest(),
+            )
         for _ in range(self.frontend_init_updates):
             self.graph.update(t0=1, itrs=self.frontend_ba_iters)
 
@@ -133,6 +189,15 @@ class SLAMFrontend:
         # initialization complete
         self.is_initialized = True
         self.graph.rm_factors(self.graph.ii < self.warmup - 4)
+        if self.trace is not None:
+            self.trace.write(
+                "frontend_initialize_done",
+                t1=int(self.t1),
+                keyframes=int(self.video.n_frames),
+                factors=self.graph.num_factors,
+                edge_digest=self.graph.edge_digest(),
+                edge_set_digest=self.graph.edge_set_digest(),
+            )
 
     def run(self):
         """main update"""
