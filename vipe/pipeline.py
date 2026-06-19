@@ -84,7 +84,6 @@ class VipePipeline:
             pcd_tsdf_num_voxels_per_block_edge=self.out_cfg.pcd_tsdf_num_voxels_per_block_edge,
             pcd_tsdf_depth_sampling_stride=self.out_cfg.pcd_tsdf_depth_sampling_stride,
         )
-        io.save_slam_debug(artifact_path, slam_output.debug)
 
     def run(self, frame_stream: FrameStream) -> SLAMOutput:
         frame_stream, intrinsics = self._initialize(frame_stream)

@@ -756,7 +756,7 @@ Then it builds a small incremental `FactorGraph`:
 graph.add_factors(t0, pending_indices)
 graph.add_factors(t1, pending_indices)
 
-for _ in range(10):
+for _ in range(config.infill_update_steps):
     graph.update(start_idx, total_frames, motion_only=True)
 ```
 

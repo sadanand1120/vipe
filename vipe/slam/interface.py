@@ -15,7 +15,6 @@
 
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from vipe.ext.lietorch.groups import SE3
@@ -26,4 +25,3 @@ class SLAMOutput:
     trajectory: SE3  # (N,)
     intrinsics: torch.Tensor  # (4,)
     keyframe_indices: list[int]
-    debug: dict[str, np.ndarray]

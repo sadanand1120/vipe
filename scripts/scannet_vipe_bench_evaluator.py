@@ -14,7 +14,6 @@ import numpy as np
 from vipe import get_config_path
 from vipe.bench.gt_pose_checks import filter_scenes_with_bad_gt_pose_data
 from vipe.bench.scannet import AttrDict, ScanNetEvaluator
-from vipe.bench.traj_video import save_trajectory_debug_video
 from vipe.utils.config import load_yaml_config
 from vipe.utils.determinism import seed_everything
 
@@ -115,8 +114,7 @@ def _write_vipe_manifest(
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
-    slam_debug_path = vipe_output_dir / "debug" / f"{artifact_name}_slam_debug.npz"
-    required_artifacts = [pose_path, tsdf_pcd_path, slam_debug_path]
+    required_artifacts = [pose_path, tsdf_pcd_path]
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
@@ -128,8 +126,6 @@ def _write_vipe_manifest(
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
-        "slam_debug_path": str(slam_debug_path.resolve()),
-        "traj_video_path": str((args.work_dir / "traj_videos" / f"{scene}_rgb_traj_firstalign.mp4").resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
             "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
@@ -151,16 +147,6 @@ def _write_vipe_manifest(
     print(f"[INFO] Wrote ViPE manifest | {scene} | {manifest_path}", flush=True)
     print(f"[INFO] Writing GT metadata | {scene}", flush=True)
     evaluator._save_gt_meta(str(export_dir), exported_scene_data)
-    print(f"[INFO] Writing trajectory debug video | {scene}", flush=True)
-    traj_video_path = save_trajectory_debug_video(
-        scene=scene,
-        image_files=exported_scene_data.image_files,
-        gt_w2c=exported_scene_data.extrinsics,
-        frame_indices=frame_indices,
-        pred_pose_path=pose_path,
-        out_path=manifest["traj_video_path"],
-    )
-    print(f"[INFO] Wrote trajectory debug video | {scene} | {traj_video_path}", flush=True)
 
     print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
