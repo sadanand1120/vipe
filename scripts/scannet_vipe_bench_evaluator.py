@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import gc
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -38,8 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-root", required=True, type=Path, help="Canonical ViPE ScanNet scene root")
     parser.add_argument("--raw-root", required=True, type=Path, help="Raw ScanNet scans root with GT meshes")
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
+    parser.add_argument("--do-final-eval", action="store_true", help="Run final pose/reconstruction eval after exports")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--total-gpus", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--scene-worker-scene", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--scene-worker-output-dir", type=Path, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -175,6 +180,36 @@ def _write_worker_timing(args: argparse.Namespace, build_timing: dict, metric_ti
     _write_json(_worker_timing_path(args), {"build": build_timing, "metric_eval": metric_timing})
 
 
+def _worker_failures_path(args: argparse.Namespace) -> Path:
+    return _metric_dir(args) / "failed_scenes" / f"scannet_failed_worker_{args.gpu_id}.json"
+
+
+def _write_worker_failures(args: argparse.Namespace, failures: dict) -> None:
+    _write_json(_worker_failures_path(args), failures)
+
+
+def _clear_failure_records(args: argparse.Namespace) -> None:
+    shutil.rmtree(_metric_dir(args) / "failed_scenes", ignore_errors=True)
+    (_metric_dir(args) / "failed_scenes.json").unlink(missing_ok=True)
+
+
+def _clear_final_eval_outputs(args: argparse.Namespace) -> None:
+    for filename in ("scannet_pose.json", "scannet_recon.json"):
+        (_metric_dir(args) / filename).unlink(missing_ok=True)
+
+
+def _cleanup_cuda_runtime() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def _incremental_pose_dir(args: argparse.Namespace) -> Path:
     return _metric_dir(args) / "incremental_pose" / "scannet"
 
@@ -206,11 +241,27 @@ def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[di
     metric_timing = {}
     for gpu_id in range(total_gpus):
         path = _metric_dir(args) / "timing_workers" / f"scannet_timing_worker_{gpu_id}.json"
+        if not path.exists():
+            print(f"[WARN] Missing timing file from ScanNet worker {gpu_id}: {path}", flush=True)
+            continue
         with path.open(encoding="utf-8") as f:
             worker_timing = json.load(f)
         build_timing.update(worker_timing.get("build", {}))
         metric_timing.update(worker_timing.get("metric_eval", {}))
     return build_timing, metric_timing
+
+
+def _load_parallel_failures(args: argparse.Namespace, total_gpus: int) -> dict:
+    failures = {}
+    for gpu_id in range(total_gpus):
+        path = _metric_dir(args) / "failed_scenes" / f"scannet_failed_worker_{gpu_id}.json"
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8") as f:
+            failures.update(json.load(f))
+    if failures:
+        _write_json(_metric_dir(args) / "failed_scenes.json", failures)
+    return failures
 
 
 def _merge_scene_timing(base: dict, extra: dict) -> dict:
@@ -309,12 +360,17 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
         print(f"[INFO] Starting ViPE worker {idx} on GPU {visible_gpu}")
         processes.append(subprocess.Popen(cmd, env=env))
 
-    for process in processes:
+    failed_workers = []
+    for idx, process in enumerate(processes):
         process.wait()
         if process.returncode != 0:
-            raise SystemExit(process.returncode)
+            failed_workers.append((idx, process.returncode))
+
+    if failed_workers:
+        print(f"[WARN] ScanNet worker failures: {failed_workers}. Continuing with completed scene artifacts.", flush=True)
 
     print("[INFO] All ViPE workers completed")
+    _load_parallel_failures(args, len(gpu_list))
     return _load_parallel_timing(args, len(gpu_list))
 
 
@@ -335,6 +391,75 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
     return scenes
 
 
+def _run_scene_subprocess(args: argparse.Namespace, scene: str, vipe_output_dir: Path) -> None:
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--work-dir",
+        str(args.work_dir),
+        "--input-root",
+        str(args.input_root),
+        "--raw-root",
+        str(args.raw_root),
+        "--scene-worker-scene",
+        scene,
+        "--scene-worker-output-dir",
+        str(vipe_output_dir),
+    ]
+    env = os.environ.copy()
+    env[WORKER_ENV] = "1"
+    result = subprocess.run(cmd, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"scene subprocess exited with code {result.returncode}")
+
+
+def _scene_export_manifest_path(args: argparse.Namespace, scene: str) -> Path:
+    return args.work_dir / "model_results" / "scannet" / scene / "recon" / "exports" / "vipe_manifest.json"
+
+
+def _scene_gt_meta_path(args: argparse.Namespace, scene: str) -> Path:
+    return _scene_export_manifest_path(args, scene).with_name("gt_meta.npz")
+
+
+def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path, Path]:
+    artifact_name = _artifact_name(scene_dir)
+    return (
+        vipe_output_dir / "pose" / f"{artifact_name}.npz",
+        vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply",
+    )
+
+
+def _manifest_artifacts_exist(manifest_path: Path) -> bool:
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return False
+    return Path(manifest["pose_path"]).exists() and Path(manifest["tsdf_pcd_path"]).exists()
+
+
+def _scene_export_complete(args: argparse.Namespace, scene: str) -> bool:
+    manifest_path = _scene_export_manifest_path(args, scene)
+    return _manifest_artifacts_exist(manifest_path) and _scene_gt_meta_path(args, scene).exists()
+
+
+def _completed_scenes(args: argparse.Namespace) -> list[str]:
+    return [scene for scene in args.scenes if _scene_export_complete(args, scene)]
+
+
+def _restrict_eval_to_completed_scenes(args: argparse.Namespace, evaluator) -> None:
+    completed = _completed_scenes(args)
+    dropped = [scene for scene in args.scenes if scene not in completed]
+    if dropped:
+        print(
+            f"[WARN] Skipping {len(dropped)} ScanNet scene(s) without complete ViPE artifacts: {', '.join(dropped)}",
+            flush=True,
+        )
+    args.scenes = completed
+    evaluator.scenes_filter = completed
+
+
 def prepare_vipe_benchmark_exports(
     args: argparse.Namespace,
     evaluator,
@@ -342,13 +467,47 @@ def prepare_vipe_benchmark_exports(
 ) -> tuple[dict, dict]:
     build_timing = {}
     metric_timing = {}
+    failures = {}
     for scene in _scenes_for_worker(args, evaluator):
         start_scene = time.perf_counter()
         scene_dir = _scene_dir(args, scene)
         vipe_output_dir = _resolve_vipe_output_dir(args, scene)
         full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(evaluator, scene)
+        pose_path, tsdf_pcd_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
+        if _scene_export_complete(args, scene):
+            print(f"[INFO] Reusing existing ViPE artifacts | {scene}", flush=True)
+            inc_path = _incremental_pose_dir(args) / f"{scene}.json"
+            if not inc_path.exists():
+                _write_incremental_pose_metric(args, evaluator, scene)
+            continue
+        if pose_path.exists() and tsdf_pcd_path.exists():
+            print(f"[INFO] Reusing existing ViPE build outputs and refreshing manifest | {scene}", flush=True)
+            _write_vipe_manifest(
+                args,
+                evaluator,
+                scene,
+                full_scene_data,
+                frame_indices,
+                kept_scene_indices,
+                vipe_output_dir,
+                _artifact_name(scene_dir),
+                pipeline_cfg,
+            )
+            inc_path = _incremental_pose_dir(args) / f"{scene}.json"
+            if not inc_path.exists():
+                _write_incremental_pose_metric(args, evaluator, scene)
+            continue
         start_build = time.perf_counter()
-        run_vipe(scene_dir, pipeline_cfg, vipe_output_dir)
+        try:
+            _run_scene_subprocess(args, scene, vipe_output_dir)
+        except Exception as exc:
+            failures[scene] = str(exc)
+            print(f"[WARN] Skipping ScanNet scene after ViPE failure | {scene} | {exc}", flush=True)
+            shutil.rmtree(vipe_output_dir, ignore_errors=True)
+            shutil.rmtree(args.work_dir / "model_results" / "scannet" / scene, ignore_errors=True)
+            _write_worker_failures(args, failures)
+            _cleanup_cuda_runtime()
+            continue
         build_seconds = time.perf_counter() - start_build
         _write_vipe_manifest(
             args,
@@ -366,6 +525,9 @@ def prepare_vipe_benchmark_exports(
         build_timing[scene] = _timing_entry(frames, build_seconds)
         metric_timing[scene] = _timing_entry(frames, metric_seconds)
         _write_incremental_pose_metric(args, evaluator, scene)
+        _cleanup_cuda_runtime()
+    if failures:
+        _write_worker_failures(args, failures)
     return build_timing, metric_timing
 
 
@@ -435,6 +597,18 @@ def print_scannet_summary(metrics) -> None:
     print(f"{'Metric Eval':<{col1}}{_fmt_fps(_get_nested(timing, 'metric_eval', 'mean_fps')):<{col2}}")
 
 
+def _finish_without_final_eval(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
+    _clear_final_eval_outputs(args)
+    timing = _write_timing(args, build_timing, metric_timing)
+    completed = len(_completed_scenes(args))
+    print(
+        f"[INFO] Skipping final ScanNet eval (--do-final-eval not set). "
+        f"Completed artifacts: {completed}/{len(args.scenes)} | "
+        f"build_fps={timing['build']['mean_fps']:.2f}",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -442,6 +616,12 @@ def main() -> None:
     eval_config = load_yaml_config(EVAL_CONFIG_PATH)
     seed_everything(int(eval_config.seed), temporary_determinism=eval_config.temporary_determinism)
     is_worker = os.environ.get(WORKER_ENV) == "1"
+
+    if args.scene_worker_scene is not None:
+        if args.scene_worker_output_dir is None:
+            raise ValueError("--scene-worker-output-dir is required with --scene-worker-scene")
+        run_vipe(_scene_dir(args, args.scene_worker_scene), pipeline_cfg, args.scene_worker_output_dir)
+        return
 
     evaluator = _load_evaluator(args, eval_config)
     if args.scenes is None:
@@ -457,10 +637,18 @@ def main() -> None:
         return
 
     _skip_bad_gt_pose_scenes(args, evaluator)
+    if not is_worker:
+        _clear_failure_records(args)
+        if not args.do_final_eval:
+            _clear_final_eval_outputs(args)
 
     build_timing = maybe_spawn_workers(args)
     if build_timing is not None:
         build_scene_timing, metric_scene_timing = build_timing
+        if not args.do_final_eval:
+            _finish_without_final_eval(args, build_scene_timing, metric_scene_timing)
+            return
+        _restrict_eval_to_completed_scenes(args, evaluator)
         metrics = evaluator.eval()
         metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
         metrics["scannet_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
@@ -471,6 +659,10 @@ def main() -> None:
     if is_worker:
         _write_worker_timing(args, build_scene_timing, metric_scene_timing)
         return
+    if not args.do_final_eval:
+        _finish_without_final_eval(args, build_scene_timing, metric_scene_timing)
+        return
+    _restrict_eval_to_completed_scenes(args, evaluator)
     metrics = evaluator.eval()
     metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
     metrics["scannet_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)

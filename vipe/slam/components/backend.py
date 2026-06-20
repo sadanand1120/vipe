@@ -30,12 +30,11 @@ class SLAMBackend:
     Mainly used to run a pretty dense bundle adjustment for all the frames in the graph.
     """
 
-    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device, trace=None):
+    def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device):
         self.net = net
         self.video = video
         self.args = args
         self.device = device
-        self.trace = trace
 
     def _iterate(self, graph: FactorGraph, steps: int):
         graph.update_batch(
@@ -66,14 +65,6 @@ class SLAMBackend:
             thresh=self.args.backend_thresh,
             beta=self.args.beta,
         )
-        if self.trace is not None:
-            self.trace.write(
-                "backend_graph_built",
-                keyframes=int(t),
-                factors=graph.num_factors,
-                edge_digest=graph.edge_digest(),
-                edge_set_digest=graph.edge_set_digest(),
-            )
 
         if len(graph.ii) > 0:
             self._iterate(graph, steps)
@@ -83,15 +74,6 @@ class SLAMBackend:
                 self.video.disps_sens[0] > 0,
                 self.video.disps_sens[0],
                 self.video.disps[0],
-            )
-
-        if self.trace is not None:
-            self.trace.write(
-                "backend_done",
-                keyframes=int(t),
-                factors=graph.num_factors,
-                edge_digest=graph.edge_digest(),
-                edge_set_digest=graph.edge_set_digest(),
             )
 
         return graph.num_factors

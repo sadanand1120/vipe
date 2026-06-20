@@ -20,7 +20,6 @@
 
 import warnings
 
-import hashlib
 import numpy as np
 import torch
 
@@ -81,19 +80,6 @@ class FactorGraph:
     @property
     def num_factors(self) -> int:
         return int(self.ii.shape[0])
-
-    def edge_digest(self) -> str:
-        if self.ii.numel() == 0:
-            return "empty"
-        edges = torch.stack([self.ii, self.jj], dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
-        return hashlib.blake2b(edges.tobytes(), digest_size=8).hexdigest()
-
-    def edge_set_digest(self) -> str:
-        if self.ii.numel() == 0:
-            return "empty"
-        edges = torch.stack([self.ii, self.jj], dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
-        edges = edges[np.lexsort((edges[:, 1], edges[:, 0]))]
-        return hashlib.blake2b(edges.tobytes(), digest_size=8).hexdigest()
 
     def _oldest_factor_mask(self, num_new_factors: int) -> torch.Tensor:
         keep_existing = max(self.max_factors - int(num_new_factors), 0)

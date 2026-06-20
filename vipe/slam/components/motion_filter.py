@@ -31,7 +31,6 @@ class MotionFilterResult:
     fmap: torch.Tensor
     net: torch.Tensor | None = None
     inp: torch.Tensor | None = None
-    motion_score: float | None = None
 
 
 class MotionFilter:
@@ -62,11 +61,11 @@ class MotionFilter:
 
     @torch.amp.autocast("cuda", enabled=True)
     @torch.no_grad()
-    def promote_keyframe(self, images: torch.Tensor, fmap: torch.Tensor, motion_score: float | None = None) -> MotionFilterResult:
+    def promote_keyframe(self, images: torch.Tensor, fmap: torch.Tensor) -> MotionFilterResult:
         net, inp = self.net.encode_context(images)
         self.f_net, self.f_inp, self.f_fmap = net, inp, fmap
         self.last_kf_frame_idx = self.current_frame_idx
-        return MotionFilterResult(True, fmap, net, inp, motion_score)
+        return MotionFilterResult(True, fmap, net, inp)
 
     @torch.amp.autocast("cuda", enabled=True)
     @torch.no_grad()
@@ -92,7 +91,7 @@ class MotionFilter:
             self.current_frame_idx = 0
             self.last_kf_frame_idx = 0
             self.initialized = True
-            return MotionFilterResult(True, gmap, net, inp, None)
+            return MotionFilterResult(True, gmap, net, inp)
 
         ### only add new frame if there is enough motion ###
         else:
@@ -110,7 +109,7 @@ class MotionFilter:
 
             # check motion magnitue / add new frame to video
             if dense_motion_score > self.thresh:
-                return self.promote_keyframe(images, gmap, dense_motion_score)
+                return self.promote_keyframe(images, gmap)
 
             else:
-                return MotionFilterResult(False, gmap, motion_score=dense_motion_score)
+                return MotionFilterResult(False, gmap)

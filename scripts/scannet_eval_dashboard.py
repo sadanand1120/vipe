@@ -45,11 +45,23 @@ def _unavailable_scenes(after_root: Path):
         after_root / "metric_results" / "skipped_gt_pose_scenes.json",
         Path("tmpouts/scannet_gt_unavailable.json"),
     ]
+    unavailable = {}
     for path in paths:
         data = _load_json(path)
         if isinstance(data, dict):
-            return {str(scene): str(reason) for scene, reason in data.items()}
-    return {}
+            unavailable.update({str(scene): str(reason) for scene, reason in data.items()})
+    return unavailable
+
+
+def _failed_scenes(after_root: Path):
+    failed = {}
+    paths = [after_root / "metric_results" / "failed_scenes.json"]
+    paths.extend(sorted((after_root / "metric_results" / "failed_scenes").glob("*.json")))
+    for path in paths:
+        data = _load_json(path)
+        if isinstance(data, dict):
+            failed.update({str(scene): str(reason) for scene, reason in data.items()})
+    return failed
 
 
 def _mean_pose_metrics(scene_metrics: dict[str, dict]) -> dict[str, float]:
@@ -102,9 +114,18 @@ def _metric(data, scene, key):
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def _scene_status(after_root: Path, input_root: Path, scene: str, has_metric: bool, unavailable: dict[str, str]):
+def _scene_status(
+    after_root: Path,
+    input_root: Path,
+    scene: str,
+    has_metric: bool,
+    failed: dict[str, str],
+    unavailable: dict[str, str],
+):
     if has_metric:
         return "done"
+    if scene in failed:
+        return "failed"
     if scene in unavailable:
         return "unavailable"
     if (after_root / "metric_results" / "scannet_pose.json").exists():
@@ -123,13 +144,14 @@ def build_payload(before_root: Path, after_root: Path, input_root: Path):
     before_pose = _load_json(before_pose_path)
     after_pose, after_pose_mtime, after_pose_source = _load_pose_metrics(after_root)
     unavailable = _unavailable_scenes(after_root)
+    failed = _failed_scenes(after_root)
 
-    scenes = _scene_keys(before_pose, after_pose)
+    scenes = sorted(set(_scene_keys(before_pose, after_pose)) | set(unavailable) | set(failed))
     rows = []
     for scene in scenes:
         after_auc3 = _metric(after_pose, scene, "auc03")
         after_auc30 = _metric(after_pose, scene, "auc30")
-        status = _scene_status(after_root, input_root, scene, after_auc30 is not None, unavailable)
+        status = _scene_status(after_root, input_root, scene, after_auc30 is not None, failed, unavailable)
         rows.append(
             {
                 "scene": scene,
@@ -144,11 +166,12 @@ def build_payload(before_root: Path, after_root: Path, input_root: Path):
                 if after_auc30 is None
                 else after_auc30 - (_metric(before_pose, scene, "auc30") or 0.0),
                 "status": status,
-                "unavailable_reason": unavailable.get(scene),
+                "unavailable_reason": unavailable.get(scene) or failed.get(scene),
             }
         )
 
-    available_rows = [row for row in rows if row["status"] != "unavailable"]
+    excluded_statuses = {"failed", "unavailable"}
+    available_rows = [row for row in rows if row["status"] not in excluded_statuses]
     complete = sum(1 for row in available_rows if row["after_auc30"] is not None)
     completed_rows = [
         row
@@ -194,7 +217,8 @@ def build_payload(before_root: Path, after_root: Path, input_root: Path):
         "before_error": before_pose.get("_error") if isinstance(before_pose, dict) else None,
         "after_error": after_pose.get("_error") if isinstance(after_pose, dict) else None,
         "total": len(available_rows),
-        "unavailable": len(rows) - len(available_rows),
+        "failed": sum(1 for row in rows if row["status"] == "failed"),
+        "unavailable": sum(1 for row in rows if row["status"] == "unavailable"),
         "complete": complete,
         "mean_row": mean_row,
         "rows": rows,
@@ -320,6 +344,7 @@ HTML = r"""<!doctype html>
     .done { color: var(--good); border-color: rgba(129,211,156,0.38); }
     .running { color: var(--blue); border-color: rgba(140,199,255,0.35); }
     .pending { color: var(--warn); border-color: rgba(231,198,106,0.35); }
+    .failed { color: var(--bad); border-color: rgba(240,127,111,0.42); }
     .unavailable { color: #858a82; border-color: rgba(133,138,130,0.28); }
     .low-before {
       color: var(--warn);
@@ -331,6 +356,8 @@ HTML = r"""<!doctype html>
       color: #858a82;
     }
     tr.row-unavailable:hover td { background: rgba(0, 0, 0, 0.42); }
+    tr.row-failed td { background: rgba(240, 127, 111, 0.16); }
+    tr.row-failed:hover td { background: rgba(240, 127, 111, 0.23); }
     @media (max-width: 850px) {
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px; }
       header, main { padding-left: 12px; padding-right: 12px; }
@@ -349,7 +376,7 @@ HTML = r"""<!doctype html>
     </div>
   </header>
   <section class="cards">
-    <div class="card"><div class="label">Scenes complete</div><div class="value" id="complete">NA</div><div class="small" id="completeSmall">after pose metrics available; unavailable excluded</div></div>
+    <div class="card"><div class="label">Scenes complete</div><div class="value" id="complete">NA</div><div class="small" id="completeSmall">after pose metrics available; failed/unavailable excluded</div></div>
     <div class="card"><div class="label">Before mean AUC30</div><div class="value" id="beforeMean30">NA</div><div class="small" id="beforeRootSmall">baseline run</div></div>
     <div class="card"><div class="label">After mean AUC30</div><div class="value" id="afterMean30">NA</div><div class="small" id="afterRootSmall">new run</div></div>
     <div class="card"><div class="label">After pose JSON</div><div class="value" id="afterMtime">NA</div><div class="small">last write time</div></div>
@@ -357,7 +384,7 @@ HTML = r"""<!doctype html>
   <main>
     <div class="toolbar">
       <input id="search" placeholder="Filter scenes, e.g. scene0012">
-      <select id="status"><option value="">all statuses</option><option>pending</option><option>running</option><option>done</option><option>unavailable</option></select>
+      <select id="status"><option value="">all statuses</option><option>pending</option><option>running</option><option>done</option><option>failed</option><option>unavailable</option></select>
       <select id="sort"><option value="scene">sort: scene</option><option value="before_auc30">sort: before AUC30</option><option value="after_auc30">sort: after AUC30</option><option value="delta_auc30">sort: delta AUC30</option></select>
       <span class="small"><span class="low-before">*</span> baseline AUC30 &lt; 0.6</span>
     </div>
@@ -381,6 +408,7 @@ HTML = r"""<!doctype html>
     };
     const rowClass = r => {
       if (r.after_auc3 === null || r.after_auc3 === undefined || r.after_auc30 === null || r.after_auc30 === undefined) return '';
+      if (r.status === 'failed') return 'row-failed';
       if (r.status === 'unavailable') return 'row-unavailable';
       if (r.delta_auc3 >= 0 && r.delta_auc30 >= 0) return 'row-good';
       if (r.delta_auc3 < 0 && r.delta_auc30 < 0) return 'row-bad';
@@ -404,7 +432,7 @@ HTML = r"""<!doctype html>
       document.getElementById('beforeRootSmall').textContent = beforeRoot;
       document.getElementById('afterRootSmall').textContent = afterRoot;
       document.getElementById('complete').textContent = `${payload.complete}/${payload.total}`;
-      document.getElementById('completeSmall').textContent = `unavailable excluded: ${payload.unavailable || 0}`;
+      document.getElementById('completeSmall').textContent = `failed: ${payload.failed || 0}; unavailable: ${payload.unavailable || 0}`;
       const mean = payload.mean_row || {};
       document.getElementById('beforeMean30').innerHTML = fmt(mean.before_auc30);
       document.getElementById('afterMean30').innerHTML = fmt(mean.after_auc30);
@@ -421,7 +449,7 @@ HTML = r"""<!doctype html>
         return bv - av;
       });
       const tableRows = rows.map(r => `
-        <tr class="${r.status === 'unavailable' ? 'row-unavailable' : rowClass(r)}">
+        <tr class="${r.status === 'failed' ? 'row-failed' : (r.status === 'unavailable' ? 'row-unavailable' : rowClass(r))}">
           <td>${sceneName(r)}</td><td>${pill(r.status)}</td>
           <td>${fmt(r.before_auc3)}</td><td>${fmt(r.after_auc3)}</td><td>${delta(r.delta_auc3)}</td>
           <td>${fmt(r.before_auc30)}</td><td>${fmt(r.after_auc30)}</td><td>${delta(r.delta_auc30)}</td>
