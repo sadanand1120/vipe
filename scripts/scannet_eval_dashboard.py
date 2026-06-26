@@ -141,7 +141,7 @@ def _scene_status(
 
 def build_payload(before_root: Path, after_root: Path, input_root: Path):
     before_pose_path = before_root / "metric_results" / "scannet_pose.json"
-    before_pose = _load_json(before_pose_path)
+    before_pose, before_pose_mtime, before_pose_source = _load_pose_metrics(before_root)
     after_pose, after_pose_mtime, after_pose_source = _load_pose_metrics(after_root)
     unavailable = _unavailable_scenes(after_root)
     failed = _failed_scenes(after_root)
@@ -209,7 +209,8 @@ def build_payload(before_root: Path, after_root: Path, input_root: Path):
         "before_root": str(before_root),
         "after_root": str(after_root),
         "input_root": str(input_root),
-        "before_pose_mtime": _fmt_time(_mtime(before_pose_path)),
+        "before_pose_mtime": _fmt_time(before_pose_mtime),
+        "before_pose_source": before_pose_source,
         "after_pose_mtime": _fmt_time(after_pose_mtime),
         "after_pose_source": after_pose_source,
         "before_mean": before_pose.get("mean") if isinstance(before_pose, dict) else None,

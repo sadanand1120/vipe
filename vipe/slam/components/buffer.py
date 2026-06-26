@@ -68,9 +68,6 @@ class GraphBuffer:
         # Frame index in the original stream.
         self.tstamp = torch.zeros(buffer_size, device=device, dtype=torch.int)
 
-        # RGB image at resized SLAM resolution, shape: (frame, channel, height, width).
-        self.images = torch.zeros(buffer_size, 3, self.height, self.width, device=device, dtype=torch.float16)
-
         # World-to-camera pose for each buffered frame.
         self.poses = torch.zeros(buffer_size, 7, device=device, dtype=torch.float)
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=device)
@@ -91,7 +88,6 @@ class GraphBuffer:
     def remove_second_newest(self, ix: int):
         assert ix == self.n_frames - 2
         self.tstamp[ix] = self.tstamp[ix + 1]
-        self.images[ix] = self.images[ix + 1]
         self.poses[ix] = self.poses[ix + 1]
         self.disps[ix] = self.disps[ix + 1]
         self.disps_sens[ix] = self.disps_sens[ix + 1]

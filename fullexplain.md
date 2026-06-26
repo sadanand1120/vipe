@@ -288,11 +288,10 @@ FrameData(
     image_valid_mask=None,
     pose=None,
     intrinsics=None,
-    metric_depth=None,
 )
 ```
 
-`sensor_depth` is input data. `metric_depth` is filled later in Stage 5 when the final output frame is assembled.
+`sensor_depth` is input data. The optimized SLAM loop reads RGB-only frames for motion filtering and loads this depth only when a frame is retained as a keyframe. Stage 5 reads sensor depth directly into CPU `ArtifactFrame` records.
 
 ### Required External Intrinsics
 
@@ -783,6 +782,7 @@ SLAMOutput(
     trajectory=<camera-to-world SE3 for every canonical frame>,
     intrinsics=<original-resolution pinhole [fx,fy,cx,cy]>,
     keyframe_indices=<canonical frame indices of optimized SLAM keyframes>,
+    timing=<nested SLAM stage timing>,
 )
 ```
 
@@ -794,42 +794,48 @@ Stage 5 always runs in the current `run.py` and benchmark path.
 
 ```mermaid
 flowchart TD
-    A[SLAMOutput] --> B[replay FrameDir lazily]
-    B --> C[attach final c2w pose]
-    C --> D[attach recovered original-resolution intrinsics]
-    D --> E[metric_depth = valid sensor_depth]
-    E --> F[append pose]
-    E --> G[integrate TSDF frame]
-    G --> H[extract native TSDF surface and write final PLY]
+    A[SLAMOutput] --> B[precompute pose, w2c, intrinsics arrays]
+    B --> C[bounded CPU RGB-D artifact prefetch]
+    C --> D[ArtifactFrame: color, depth, c2w, w2c, intrinsics]
+    D --> E[append pose]
+    D --> F[integrate TSDF frame]
+    F --> G[extract native TSDF surface]
+    G --> H[native binary PLY writer]
+    E --> I[pose NPZ writer]
+    H --> J[timing JSON writer]
+    I --> J
 ```
 
-`VipePipeline._final_frames` re-reads frames lazily:
+`VipePipeline._make_artifact_frame_loader` builds a CPU artifact loader from the final SLAM output:
 
 ```python
-for frame_idx in range(len(frame_stream)):
-    frame = frame_stream[frame_idx]
-    frame.pose = slam_output.trajectory[frame_idx]
-    frame.intrinsics = slam_output.intrinsics
-    frame.camera_type = CameraType.PINHOLE
+intrinsics = slam_output.intrinsics[:4].cpu().numpy().astype("float32")
+pose_mats = slam_output.trajectory.matrix().cpu().numpy().astype("float32")
+w2c_mats = slam_output.trajectory.inv().matrix().cpu().numpy().astype("float32")
 
-    sensor_depth = frame.sensor_depth.float()
-    valid = isfinite(sensor_depth) & (sensor_depth > 0)
-    if frame.image_valid_mask is not None:
-        valid &= frame.image_valid_mask
-    frame.metric_depth = where(valid, sensor_depth, 0)
-    yield frame
+def load(frame_idx):
+    color, depth = frame_stream.artifact_arrays(frame_idx)
+    return ArtifactFrame(
+        frame_idx=frame_idx,
+        color=color,
+        depth=depth,
+        pose_matrix=pose_mats[frame_idx],
+        w2c_matrix=w2c_mats[frame_idx],
+        intrinsics=intrinsics,
+    )
 ```
 
-This means the TSDF PCD is built from the provided sensor depth. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
+`FrameDir.artifact_arrays` decodes RGB and depth on CPU. Depth is converted from millimeters to meters and nonpositive values are set to zero. This means the TSDF PCD is built from the provided sensor depth. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
 
 ### Saved Artifacts
 
-`vipe/utils/io.py::save_artifacts` consumes final frames in one streaming pass.
+`vipe/utils/io.py::save_artifacts` consumes final artifact frames in one streaming pass with bounded thread prefetch. Prefetch overlaps CPU PNG decode with TSDF integration, but frames are still yielded and integrated in canonical frame order.
 
 | Artifact | Path | Contents |
 | --- | --- | --- |
 | Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: sequential canonical frame indices. |
 | TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points with `nx/ny/nz` normals and `normals_red/green/blue` normal colors sampled from the native TSDF zero-crossing surface. |
+| Timing JSON | `timing/<artifact_name>.json` | Nested build timing for initialization, SLAM, artifact loading, TSDF integration/extraction/write, and total runtime. |
 
 `artifact_name` is `frame_stream.name()`, which is the input scene directory name unless explicitly overridden.
 
@@ -864,11 +870,10 @@ rgb    : float32 running average color in 0..255 space
 Per frame, the artifact writer prepares the exact arrays that the native extension receives:
 
 ```python
-depth = metric_depth.astype(np.float32)
-depth[invalid_or_masked] = 0
+depth = artifact_depth_m_float32
 color = rgb_uint8
 intrinsics = np.array([fx, fy, cx, cy], dtype=np.float32)
-w2c = frame.pose.inv().matrix()
+w2c = slam_output.trajectory[frame_idx].inv().matrix()
 volume.integrate(depth, color, intrinsics, w2c, pcd_tsdf_depth_trunc_m)
 ```
 
@@ -926,7 +931,7 @@ After all frames, the extension extracts the zero-crossing surface directly as a
 Normals are computed from the fused implicit surface, not from per-frame depth maps. At each voxel corner, the extension estimates the TSDF gradient with central differences when both neighbors exist and one-sided differences near sparse-volume boundaries. A zero-crossing vertex interpolates endpoint gradients along the crossing edge and normalizes the result. A sampled point interpolates its triangle vertex normals barycentrically and normalizes again. This writes smooth surface normals tied to the fused TSDF geometry.
 
 ```python
-points, colors, normals = volume.extract_point_cloud(pcd_max_points)
+points, colors, normals = volume.extract_point_cloud_tensors(pcd_max_points)
 write_binary_ply(...)
 ```
 
@@ -942,8 +947,8 @@ Important output knobs in `configs/default.yaml`:
 | `pipeline.output.pcd_tsdf_voxel_edge_m` | TSDF voxel edge length in meters. |
 | `pipeline.output.pcd_tsdf_sdf_trunc_m` | Signed-distance truncation band in meters. |
 | `pipeline.output.pcd_tsdf_depth_trunc_m` | Ignore depth samples beyond this many meters. |
-| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge. |
-| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks. |
+| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `8`. |
+| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `128`. |
 
 ## ScanNet Benchmark Adapter
 
@@ -952,7 +957,7 @@ The benchmark uses the same `VipePipeline` and `FrameDir` construction as `run.p
 Command:
 
 ```bash
-python3 scripts/scannet_vipe_bench_evaluator.py --scenes scene0000_00 scene0011_00 scene0378_00 --work-dir ./workspace/evaluation_scannet_default --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans
+python3 scripts/scannet_vipe_bench_evaluator.py --scenes scene0000_00 scene0011_00 scene0378_00 --work-dir ./workspace/evaluation_scannet_default --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans --do-final-eval
 ```
 
 Benchmark data loading is canonical-only:
@@ -972,7 +977,7 @@ For every scene, the adapter:
 2. Runs `VipePipeline` on `--input-root/<scene>`.
 3. Writes `vipe_manifest.json` under the benchmark workspace.
 4. Writes `gt_meta.npz` containing the exact evaluated GT frame subset.
-5. Runs pose and reconstruction metrics.
+5. Runs pose and reconstruction metrics when `--do-final-eval` is supplied. Without that flag, it stops after exports and incremental pose metric JSONs.
 
 ViPE artifacts for benchmark runs are written under:
 
@@ -996,6 +1001,7 @@ Manifest contents include:
 | `vipe_output_dir` | Absolute path to ViPE output directory. |
 | `pose_path` | Absolute path to ViPE pose NPZ. |
 | `tsdf_pcd_path` | Absolute path to ViPE TSDF PLY. |
+| `timing_path` | Absolute path to ViPE build timing JSON, when present. |
 | `output` | TSDF output parameters used for this run. |
 | `frame_indices` | Sequential canonical frame indices. |
 
@@ -1047,13 +1053,13 @@ If `CUDA_VISIBLE_DEVICES` contains multiple GPUs and the process is not already 
 scenes = [scene for idx, scene in enumerate(all_scenes) if idx % total_gpus == gpu_id]
 ```
 
-Each worker writes timing JSON under:
+Each build worker writes timing JSON under:
 
 ```text
 <work-dir>/metric_results/timing_workers/
 ```
 
-The parent process merges build timing, runs metric evaluation, writes `scannet_timing.json`, and prints the final summary.
+The parent process merges build timing. If `--do-final-eval` is present and multiple GPUs are visible, it then spawns final-eval workers with one visible GPU each, each worker evaluates its scene shard without writing aggregate metric JSONs, and the parent merges worker payloads into `scannet_pose.json`, `scannet_recon.json`, and `scannet_timing.json`. If a scene build failed or is incomplete, the final eval restricts itself to completed scenes and records failed scenes under `metric_results/failed_scenes/`.
 
 ## Runtime Config Boundaries
 
@@ -1071,8 +1077,10 @@ Important runtime config values:
 
 | Config | Role |
 | --- | --- |
-| `seed` | Seeds Python/NumPy/Torch/Open3D RNGs without forcing slower deterministic kernels. |
+| `seed` | Seeds Python/NumPy/Torch/Open3D RNGs. |
+| `temporary_determinism` | Enables deterministic experiment behavior; disable only for deployment-speed experiments. |
 | `pipeline.slam.buffer` | Max number of keyframes kept in the graph buffer. |
+| `pipeline.slam.resize_target_pixels` | SLAM working image area before the 8px-aligned resize/crop. |
 | `pipeline.slam.filter_thresh` | Motion threshold for keyframe creation. |
 | `pipeline.slam.ba.dense_disp_alpha` | Weight for external sensor-depth disparity regularization. |
 | `pipeline.slam.infill_chunk_size` | Non-keyframe pose infill chunk size. |
@@ -1104,13 +1112,13 @@ This is the key invariant: if a path reaches `run.py` or the ScanNet benchmark, 
 | `metadata.json` | Canonical scene manifest and frame-order authority. |
 | `FrameDir` | Lazy canonical scene reader for RGB, depth, metadata, and pinhole intrinsics. |
 | `SensorCamera` | Loaded undistorted pinhole RGB/color calibration metadata. |
-| `FrameData.sensor_depth` | External input depth in meters, already aligned to RGB frame by extraction. |
-| `FrameData.metric_depth` | Final output depth, assigned from valid `sensor_depth` in Stage 5. |
+| `FrameData.sensor_depth` | Optional external input depth in meters, loaded for keyframes and direct frame reads. |
+| `ArtifactFrame` | CPU artifact-export record containing RGB, sensor depth, final pose, inverse pose, and intrinsics for one frame. |
 | `StandardResizeFrameProcessor` | Resize/crop logic used before DROID/SLAM, plus inverse intrinsics recovery. |
 | `GraphBuffer` | Persistent SLAM state table: keyframe poses, disparities, sensor-depth anchors, DROID features. |
 | `FactorGraph` | Edge/factor manager that refreshes learned DROID targets and invokes BA. |
 | `frontend.graph` | Persistent incremental factor graph used during pass 1. |
 | Backend graph | Fresh non-incremental factor graph created once in Stage 3. |
 | `InnerFiller` | Motion-only pose optimizer for non-keyframe frames. |
-| `SLAMOutput` | Final handoff object containing full trajectory, original-resolution intrinsics, and keyframe indices. |
-| `ArtifactPath` | Output naming wrapper for `pose/<scene>.npz` and `pcd/<scene>_tsdf.ply`. |
+| `SLAMOutput` | Final handoff object containing full trajectory, original-resolution intrinsics, keyframe indices, and SLAM timing. |
+| `ArtifactPath` | Output naming wrapper for `pose/<scene>.npz`, `pcd/<scene>_tsdf.ply`, and `timing/<scene>.json`. |

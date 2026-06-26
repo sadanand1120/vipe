@@ -6,6 +6,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,6 +64,30 @@ struct SurfaceTriangle {
     SurfaceVertex c;
     double area;
 };
+
+#pragma pack(push, 1)
+struct PlyVertex {
+    float x;
+    float y;
+    float z;
+    float nx;
+    float ny;
+    float nz;
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint8_t normals_red;
+    uint8_t normals_green;
+    uint8_t normals_blue;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(PlyVertex) == 30, "PLY vertex layout must match the Python structured dtype");
+
+static uint8_t clamp_ply_color(float value) {
+    value = std::min(255.0f, std::max(0.0f, value));
+    return static_cast<uint8_t>(std::round(value));
+}
 
 struct Matrix4f {
     float v[16];
@@ -659,6 +685,80 @@ class TSDFVolume {
     std::unordered_map<BlockKey, std::vector<Voxel>, BlockKeyHash> all_blocks_;
 };
 
+static void write_binary_ply(
+        const std::string &path,
+        torch::Tensor points,
+        torch::Tensor colors,
+        torch::Tensor normals) {
+    points = points.contiguous();
+    colors = colors.contiguous();
+    normals = normals.contiguous();
+    TORCH_CHECK(points.device().is_cpu(), "points must be a CPU tensor");
+    TORCH_CHECK(colors.device().is_cpu(), "colors must be a CPU tensor");
+    TORCH_CHECK(normals.device().is_cpu(), "normals must be a CPU tensor");
+    TORCH_CHECK(points.scalar_type() == at::ScalarType::Float, "points must be float32");
+    TORCH_CHECK(colors.scalar_type() == at::ScalarType::Byte, "colors must be uint8");
+    TORCH_CHECK(normals.scalar_type() == at::ScalarType::Float, "normals must be float32");
+    TORCH_CHECK(points.dim() == 2 && points.size(1) == 3, "points must have shape Nx3");
+    TORCH_CHECK(colors.dim() == 2 && colors.size(1) == 3, "colors must have shape Nx3");
+    TORCH_CHECK(normals.dim() == 2 && normals.size(1) == 3, "normals must have shape Nx3");
+    TORCH_CHECK(colors.size(0) == points.size(0) && normals.size(0) == points.size(0),
+                "points/colors/normals must have matching lengths");
+
+    const int64_t n = points.size(0);
+    if (n == 0) {
+        return;
+    }
+
+    const float *points_ptr = points.data_ptr<float>();
+    const uint8_t *colors_ptr = colors.data_ptr<uint8_t>();
+    const float *normals_ptr = normals.data_ptr<float>();
+    std::vector<PlyVertex> vertices(static_cast<size_t>(n));
+
+    at::parallel_for(0, n, 4096, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const float nx = normals_ptr[i * 3 + 0];
+            const float ny = normals_ptr[i * 3 + 1];
+            const float nz = normals_ptr[i * 3 + 2];
+            vertices[static_cast<size_t>(i)] = {
+                    points_ptr[i * 3 + 0],
+                    points_ptr[i * 3 + 1],
+                    points_ptr[i * 3 + 2],
+                    nx,
+                    ny,
+                    nz,
+                    colors_ptr[i * 3 + 0],
+                    colors_ptr[i * 3 + 1],
+                    colors_ptr[i * 3 + 2],
+                    clamp_ply_color((nx * 0.5f + 0.5f) * 255.0f),
+                    clamp_ply_color((ny * 0.5f + 0.5f) * 255.0f),
+                    clamp_ply_color((nz * 0.5f + 0.5f) * 255.0f),
+            };
+        }
+    });
+
+    std::ofstream ply_file(path, std::ios::binary);
+    TORCH_CHECK(ply_file.good(), "Could not open PLY for writing: ", path);
+    ply_file << "ply\n"
+             << "format binary_little_endian 1.0\n"
+             << "element vertex " << n << "\n"
+             << "property float x\n"
+             << "property float y\n"
+             << "property float z\n"
+             << "property float nx\n"
+             << "property float ny\n"
+             << "property float nz\n"
+             << "property uchar red\n"
+             << "property uchar green\n"
+             << "property uchar blue\n"
+             << "property uchar normals_red\n"
+             << "property uchar normals_green\n"
+             << "property uchar normals_blue\n"
+             << "end_header\n";
+    ply_file.write(reinterpret_cast<const char *>(vertices.data()), static_cast<std::streamsize>(vertices.size() * sizeof(PlyVertex)));
+    TORCH_CHECK(ply_file.good(), "Failed while writing PLY: ", path);
+}
+
 }  // namespace tsdf_ext
 
 void pybind_tsdf_ext(py::module &m) {
@@ -670,4 +770,6 @@ void pybind_tsdf_ext(py::module &m) {
                  py::call_guard<py::gil_scoped_release>())
             .def("extract_point_cloud", &tsdf_ext::TSDFVolume::extract_point_cloud, py::arg("max_points"),
                  py::call_guard<py::gil_scoped_release>());
+    m.def("write_binary_ply", &tsdf_ext::write_binary_ply, py::arg("path"), py::arg("points"),
+          py::arg("colors"), py::arg("normals"), py::call_guard<py::gil_scoped_release>());
 }

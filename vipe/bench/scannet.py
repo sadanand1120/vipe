@@ -886,23 +886,23 @@ class ScanNetEvaluator:
             return [scene for scene in dataset.SCENES if scene in self.scenes_filter]
         return list(dataset.SCENES)
 
-    def eval(self) -> dict[str, dict]:
+    def eval(self, dump: bool = True) -> dict[str, dict]:
         self._metric_eval_seconds_by_scene = {}
         self._metric_eval_frames_by_scene = {}
         summary: dict[str, dict] = {}
         print(f"\n{'=' * 60}")
         print(f"Evaluating POSE for {self.DATASET_LABEL}")
         print(f"{'=' * 60}")
-        for data, result in self._eval_pose():
+        for data, result in self._eval_pose(dump=dump):
             summary[f"{data}_pose"] = result
         print(f"\n{'=' * 60}")
         print(f"Evaluating RECON for {self.DATASET_LABEL}")
         print(f"{'=' * 60}")
-        for key, result in self._eval_reconstruction():
+        for key, result in self._eval_reconstruction(dump=dump):
             summary[key] = result
         return summary
 
-    def _eval_pose(self):
+    def _eval_pose(self, dump: bool = True):
         os.makedirs(self._metric_dir, exist_ok=True)
         dataset = self.datasets[self.DATASET_KEY]
         dataset_results = AttrDict()
@@ -934,10 +934,11 @@ class ScanNetEvaluator:
 
         if dataset_results:
             dataset_results["mean"] = self._mean_of_dicts(dataset_results.values())
-        self._dump_json(os.path.join(self._metric_dir, f"{self.DATASET_KEY}_pose.json"), dataset_results)
+        if dump:
+            self._dump_json(os.path.join(self._metric_dir, f"{self.DATASET_KEY}_pose.json"), dataset_results)
         yield self.DATASET_KEY, dataset_results
 
-    def _eval_reconstruction(self):
+    def _eval_reconstruction(self, dump: bool = True):
         os.makedirs(self._metric_dir, exist_ok=True)
         dataset = self.datasets[self.DATASET_KEY]
         scenes = self._get_scenes(dataset)
@@ -956,7 +957,8 @@ class ScanNetEvaluator:
 
         dataset_results["mean"] = self._mean_of_dicts(dataset_results.values())
         key = f"{self.DATASET_KEY}_recon"
-        self._dump_json(os.path.join(self._metric_dir, f"{key}.json"), dataset_results)
+        if dump:
+            self._dump_json(os.path.join(self._metric_dir, f"{key}.json"), dataset_results)
         yield key, dataset_results
 
     def _save_gt_meta(self, export_dir: str, scene_data: AttrDict) -> None:

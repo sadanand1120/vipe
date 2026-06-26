@@ -10,8 +10,6 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from scripts import scannet_vipe_bench_evaluator as bench
 from vipe.utils.config import load_yaml_config
 from vipe.utils.determinism import seed_everything
@@ -71,71 +69,7 @@ def _load_timing(work_dir: Path, scene: str, build_timing: dict, metric_timing: 
     }
 
 
-def _run_vipe_pose_only(scene_dir: Path, pipeline_cfg, output_dir: Path) -> str:
-    from vipe.pipeline import VipePipeline
-    from vipe.streams.base import FrameDir
-    from vipe.utils.logging import configure_logging
-
-    seed_everything(pipeline_cfg.seed, temporary_determinism=pipeline_cfg.temporary_determinism)
-    logger = configure_logging()
-    pipeline = VipePipeline(
-        slam=pipeline_cfg.pipeline.slam,
-        output=pipeline_cfg.pipeline.output,
-        output_dir=output_dir,
-    )
-    stream = FrameDir(path=scene_dir)
-    logger.info(f"Running pose-only ViPE on {stream.name()}")
-    frame_stream, intrinsics = pipeline._initialize(stream)
-    old_trace_path = os.environ.get("VIPE_SLAM_DEBUG_TRACE_PATH")
-    os.environ["VIPE_SLAM_DEBUG_TRACE_PATH"] = str(output_dir / "debug_trace.jsonl")
-    try:
-        slam_output = pipeline._run_slam(frame_stream, intrinsics)
-    finally:
-        if old_trace_path is None:
-            os.environ.pop("VIPE_SLAM_DEBUG_TRACE_PATH", None)
-        else:
-            os.environ["VIPE_SLAM_DEBUG_TRACE_PATH"] = old_trace_path
-
-    pose_path = output_dir / "pose" / f"{stream.name()}.npz"
-    pose_path.parent.mkdir(parents=True, exist_ok=True)
-    poses = slam_output.trajectory.matrix().detach().cpu().numpy().astype(np.float32)
-    inds = np.arange(len(poses), dtype=np.int64)
-    np.savez(pose_path, data=poses, inds=inds)
-    return stream.name()
-
-
-def _write_pose_only_manifest(
-    args: argparse.Namespace,
-    evaluator,
-    scene: str,
-    full_scene_data,
-    frame_indices: list[int],
-    kept_scene_indices: list[int],
-    vipe_output_dir: Path,
-    artifact_name: str,
-) -> None:
-    pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
-    if not pose_path.exists():
-        raise FileNotFoundError(f"Missing ViPE pose artifact: {pose_path}")
-
-    manifest = {
-        "format": "vipe_pose_only_v1",
-        "scene": scene,
-        "artifact_name": artifact_name,
-        "vipe_output_dir": str(vipe_output_dir.resolve()),
-        "pose_path": str(pose_path.resolve()),
-        "frame_indices": [int(idx) for idx in frame_indices],
-    }
-
-    exported_scene_data = bench._subset_scene_data(full_scene_data, kept_scene_indices)
-    export_dir = Path(evaluator._export_dir("scannet", scene))
-    exports_dir = export_dir / "exports"
-    exports_dir.mkdir(parents=True, exist_ok=True)
-    (exports_dir / "vipe_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    evaluator._save_gt_meta(str(export_dir), exported_scene_data)
-
-
-def _prepare_pose_only_exports(
+def _prepare_full_build_exports(
     args: argparse.Namespace,
     evaluator,
     pipeline_cfg,
@@ -148,9 +82,10 @@ def _prepare_pose_only_exports(
         vipe_output_dir = args.work_dir / "vipe_outputs" / scene
         full_scene_data, frame_indices, kept_scene_indices = bench._benchmark_frame_request(evaluator, scene)
         start_build = time.perf_counter()
-        artifact_name = _run_vipe_pose_only(scene_dir, pipeline_cfg, vipe_output_dir)
+        bench.run_vipe(scene_dir, pipeline_cfg, vipe_output_dir)
         build_seconds = time.perf_counter() - start_build
-        _write_pose_only_manifest(
+        artifact_name = bench._artifact_name(scene_dir)
+        bench._write_vipe_manifest(
             args,
             evaluator,
             scene,
@@ -159,10 +94,12 @@ def _prepare_pose_only_exports(
             kept_scene_indices,
             vipe_output_dir,
             artifact_name,
+            pipeline_cfg,
         )
         frames = len(frame_indices)
         metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
-        build_timing[scene] = bench._timing_entry(frames, build_seconds)
+        stage_timing = bench._load_build_stage_timing(scene_dir, vipe_output_dir)
+        build_timing[scene] = bench._timing_entry(frames, build_seconds, stage_timing)
         metric_timing[scene] = bench._timing_entry(frames, metric_seconds)
         bench._write_incremental_pose_metric(args, evaluator, scene)
     return build_timing, metric_timing
@@ -196,7 +133,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         evaluator = bench._load_evaluator(scene_args, eval_config)
         evaluator.scenes_filter = [scene]
         try:
-            build_timing, metric_timing = _prepare_pose_only_exports(scene_args, evaluator, pipeline_cfg)
+            build_timing, metric_timing = _prepare_full_build_exports(scene_args, evaluator, pipeline_cfg)
             metrics = _load_pose_metric(work_dir, scene)
             if metrics is None:
                 raise RuntimeError(f"missing incremental pose metric for {scene}")
@@ -271,6 +208,12 @@ def _aggregate(run_dir: Path, scenes: list[str]) -> dict:
             summary["build_fps"] = frames / seconds
             summary["build_frames"] = frames
             summary["build_seconds"] = seconds
+        build_scene_timing = {
+            item["scene"]: item["timing"]["build"]
+            for item in done
+            if isinstance(item.get("timing", {}).get("build"), dict)
+        }
+        summary["build_stage_summary"] = bench._stage_summary(build_scene_timing)
     _atomic_write_json(run_dir / "summary.json", summary)
     return summary
 

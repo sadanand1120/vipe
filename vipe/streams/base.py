@@ -49,21 +49,20 @@ class FrameData:
     - raw_frame_idx: The sequential frame index from metadata.json.
     - rgb: The RGB image of the frame. The shape is (H, W, 3), RGB, with range 0-1.
     - sensor_depth: Loaded external sensor/GT depth. This is input data, not the pipeline output depth.
+      It is optional for RGB-only SLAM reads and required for keyframes/artifact export.
     - pose: The pose of the camera at the time the frame was captured (c2w aka. Twc, opencv convention).
     - camera_type: The downstream camera model. The current pipeline always uses pinhole.
     - intrinsics: Pinhole intrinsics torch Tensor of shape (4,), [fx, fy, cx, cy].
-    - metric_depth: The final depth map of the frame. The shape is (H, W). Value is in metric scale.
     - image_valid_mask: Optional input-image validity mask. False means this output pixel has no valid source RGB.
     - information: Additional information about the frame
     """
 
     raw_frame_idx: int
     rgb: torch.Tensor
-    sensor_depth: torch.Tensor
+    sensor_depth: torch.Tensor | None = None
     pose: SE3 | None = None
     camera_type: CameraType | None = None
     intrinsics: torch.Tensor | None = None
-    metric_depth: torch.Tensor | None = None
     image_valid_mask: torch.Tensor | None = None
     information: str = ""
 
@@ -83,7 +82,9 @@ class FrameData:
             .permute(1, 2, 0)
         )
 
-        new_sensor_depth = torch.nn.functional.interpolate(self.sensor_depth[None, None], size, mode="nearest")[0, 0]
+        new_sensor_depth = None
+        if self.sensor_depth is not None:
+            new_sensor_depth = torch.nn.functional.interpolate(self.sensor_depth[None, None], size, mode="nearest")[0, 0]
 
         new_image_valid_mask = None
         if self.image_valid_mask is not None:
@@ -117,7 +118,7 @@ class FrameData:
         right = self.size()[1] - right
 
         new_rgb = self.rgb[top:bottom, left:right]
-        new_sensor_depth = self.sensor_depth[top:bottom, left:right]
+        new_sensor_depth = None if self.sensor_depth is None else self.sensor_depth[top:bottom, left:right]
 
         new_image_valid_mask = None
         if self.image_valid_mask is not None:
@@ -161,6 +162,15 @@ class FrameStream:
         raise NotImplementedError
 
     def __getitem__(self, index: int) -> FrameData:
+        raise NotImplementedError
+
+    def rgb_frame(self, index: int) -> FrameData:
+        return self[index]
+
+    def sensor_depth(self, index: int) -> torch.Tensor:
+        raise NotImplementedError
+
+    def artifact_arrays(self, index: int) -> tuple[np.ndarray, np.ndarray]:
         raise NotImplementedError
 
 
@@ -232,7 +242,7 @@ class FrameDir(FrameStream):
     def __len__(self) -> int:
         return len(self.frame_files)
 
-    def __getitem__(self, index: int) -> FrameData:
+    def _read_frame(self, index: int, *, load_depth: bool) -> FrameData:
         n_frames = len(self)
         if index < 0:
             index += n_frames
@@ -248,21 +258,54 @@ class FrameDir(FrameStream):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_rgb = torch.as_tensor(frame).float().cuda() / 255.0
 
+        sensor_depth = None
+        if not load_depth:
+            return FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb, sensor_depth=sensor_depth)
+
+        sensor = self._read_sensor_depth(index, frame.shape[:2])
+        sensor_depth = torch.as_tensor(sensor).float().cuda()
+
+        return FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb, sensor_depth=sensor_depth)
+
+    def _read_sensor_depth(self, index: int, rgb_shape: tuple[int, int] | None = None) -> np.ndarray:
         depth_path = self.depth_files[index]
         raw_depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
         if raw_depth is None:
             raise ValueError(f"Could not read sensor depth: {depth_path}")
-        if raw_depth.shape[:2] != frame.shape[:2]:
+        if rgb_shape is not None and raw_depth.shape[:2] != rgb_shape:
             raise ValueError(
                 f"Depth size {raw_depth.shape[1]}x{raw_depth.shape[0]} does not match RGB "
-                f"{frame.shape[1]}x{frame.shape[0]} for {depth_path}"
+                f"{rgb_shape[1]}x{rgb_shape[0]} for {depth_path}"
             )
         sensor = raw_depth.astype(np.float32) / 1000.0
-        sensor[~np.isfinite(sensor)] = 0.0
         sensor[sensor <= 0.0] = 0.0
-        sensor_depth = torch.as_tensor(sensor).float().cuda()
+        return sensor
 
-        return FrameData(raw_frame_idx=frame_idx, rgb=frame_rgb, sensor_depth=sensor_depth)
+    def sensor_depth(self, index: int) -> torch.Tensor:
+        return torch.as_tensor(self._read_sensor_depth(index, self.frame_size())).float().cuda()
+
+    def __getitem__(self, index: int) -> FrameData:
+        return self._read_frame(index, load_depth=True)
+
+    def rgb_frame(self, index: int) -> FrameData:
+        return self._read_frame(index, load_depth=False)
+
+    def artifact_arrays(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        n_frames = len(self)
+        if index < 0:
+            index += n_frames
+        if index < 0 or index >= n_frames:
+            raise IndexError(index)
+
+        frame_path = self.frame_files[index]
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise ValueError(f"Could not read frame: {frame_path}")
+        color = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        sensor = self._read_sensor_depth(index, frame.shape[:2])
+
+        return color, sensor
 
     def __iter__(self) -> Iterator[FrameData]:
         for frame_idx in range(len(self)):

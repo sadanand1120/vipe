@@ -4,6 +4,7 @@ temporary_determinism: true  # Reproducibility switch for experiments; turn off 
 pipeline:
   slam:
     buffer: 1024                         # Max number of keyframes kept in the SLAM graph buffer.
+    resize_target_pixels: 196608         # SLAM working image area before 8px-aligned crop; 196608 = 384*512.
     beta: 0.3                            # Translation/rotation blend for graph proximity scoring.
     filter_thresh: 2.4                   # Dense motion threshold for deciding whether to add a keyframe.
     warmup: 8                            # Keyframes collected before initializing the frontend graph.
@@ -41,5 +42,5 @@ pipeline:
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
     pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
-    pcd_tsdf_num_voxels_per_block_edge: 16 # Number of voxels along each sparse TSDF block edge.
-    pcd_tsdf_depth_sampling_stride: 4     # Sample every Nth depth pixel when opening TSDF voxel blocks.
+    pcd_tsdf_num_voxels_per_block_edge: 8 # Sparse TSDF block edge voxels; original before speedify: 16.
+    pcd_tsdf_depth_sampling_stride: 128   # Depth-pixel stride for opening TSDF blocks; original before speedify: 4.

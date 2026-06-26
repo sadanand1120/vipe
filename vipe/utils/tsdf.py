@@ -39,18 +39,42 @@ class TSDFVolume:
         points, colors, normals = self.volume.extract_point_cloud(int(max_points))
         return points.numpy(), colors.numpy(), normals.numpy()
 
+    def extract_point_cloud_tensors(self, max_points: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.volume.extract_point_cloud(int(max_points))
+
 
 def _cpu_tensor(value: np.ndarray | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
-        return value.detach().to(device="cpu", dtype=dtype)
-    return torch.as_tensor(np.ascontiguousarray(value), dtype=dtype, device="cpu")
+        value = value.detach()
+        if value.device.type != "cpu" or value.dtype != dtype:
+            value = value.to(device="cpu", dtype=dtype)
+        return value
+
+    value = np.asarray(value)
+    if not value.flags.c_contiguous:
+        value = np.ascontiguousarray(value)
+    return torch.as_tensor(value, dtype=dtype, device="cpu")
 
 
-def write_binary_ply(path: Path, points: np.ndarray, colors: np.ndarray, normals: np.ndarray) -> None:
+def write_binary_ply(
+    path: Path,
+    points: np.ndarray | torch.Tensor,
+    colors: np.ndarray | torch.Tensor,
+    normals: np.ndarray | torch.Tensor,
+) -> None:
     if len(points) == 0:
         return
 
     path.parent.mkdir(exist_ok=True, parents=True)
+    if isinstance(points, torch.Tensor):
+        tsdf_ext.write_binary_ply(
+            str(path),
+            _cpu_tensor(points, torch.float32).contiguous(),
+            _cpu_tensor(colors, torch.uint8).contiguous(),
+            _cpu_tensor(normals, torch.float32).contiguous(),
+        )
+        return
+
     colors = np.clip(colors, 0, 255).astype(np.uint8, copy=False)
     normals = normals.astype(np.float32, copy=False)
     normal_colors = np.clip(np.rint((normals * 0.5 + 0.5) * 255.0), 0, 255).astype(np.uint8)

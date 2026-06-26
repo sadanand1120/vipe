@@ -13,6 +13,8 @@ pip3 install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://do
 pip3 install --no-build-isolation -e .
 ```
 
+The editable install builds the native ViPE extension, including the TSDF code path. The default CUDA arch list covers sm75, sm86, sm87, and sm90/PTX; rerun `pip3 install --no-build-isolation -e .` after changing `setup.py` or `csrc/`.
+
 ## Input Layout
 
 `--input-dir` must point to the canonical scene root:
@@ -44,13 +46,14 @@ python run.py \
 Useful output knobs in `configs/default.yaml`:
 
 - `pipeline.output.pcd_max_points=10000000`: cap saved TSDF point cloud points.
-- `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=16`: TSDF voxel block edge size.
-- `pipeline.output.pcd_tsdf_depth_sampling_stride=4`: sample every Nth depth pixel when opening TSDF voxel blocks.
+- `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=8`: TSDF voxel block edge size.
+- `pipeline.output.pcd_tsdf_depth_sampling_stride=128`: sample every Nth depth pixel when opening TSDF voxel blocks.
 
 Saved artifacts:
 
 - `pose/<scene>.npz`: camera-to-world pose per selected frame.
 - `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
+- `timing/<scene>.json`: per-scene build timing for initialization, SLAM pass 1, backend BA, pass 2, artifact loading, TSDF integration, TSDF extraction/write, and total runtime.
 
 ## ScanNet Benchmark
 
@@ -59,9 +62,21 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
   --scenes scene0000_00 scene0011_00 scene0378_00 \
   --work-dir ./workspace/evaluation_scannet_vipe_external_depth \
   --input-root data/scannet \
-  --raw-root /robodata/smodak/datasets/scannet_v2/scans
+  --raw-root /robodata/smodak/datasets/scannet_v2/scans \
+  --do-final-eval
 ```
 
-The benchmark adapter assumes `--input-root/<scene>` is already canonical. It runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py`. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
+The benchmark adapter assumes `--input-root/<scene>` is already canonical. It runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py` when `--do-final-eval` is supplied. Without `--do-final-eval`, it stops after ViPE exports and incremental pose metrics, which is useful for fast build/debug loops. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
 For benchmark runs, `--work-dir` owns the outputs: ViPE artifacts are written under `<work-dir>/vipe_outputs/<scene>`, benchmark manifests/caches under `<work-dir>/model_results/...`, and metric JSONs under `<work-dir>/metric_results/...`.
+If multiple GPUs are visible through `CUDA_VISIBLE_DEVICES`, the benchmark splits scene builds across them and also parallelizes final eval workers. Completed scene artifacts are reused on rerun, and failed scenes are recorded under `metric_results/failed_scenes/`.
 Runtime knobs live in `configs/default.yaml`; ScanNet-specific benchmark knobs live in `configs/eval_scannet_config.yaml`. Dataset roots stay explicit CLI inputs via `--input-dir`, `--input-root`, and `--raw-root`.
+
+## Eval Dashboard
+
+Use the dashboard to compare two ScanNet eval workspaces:
+
+```bash
+python3 scripts/scannet_eval_dashboard.py --before-root workspace/evaluation_scannet_default_full8 --after-root workspace/evaluation_scannet_default_full_new --input-root data/scannet --host 127.0.0.1 --port 18799
+```
+
+The dashboard reads aggregate and incremental pose JSONs, marks filtered/unavailable/failed scenes, excludes unavailable scenes from means, and refreshes every 30 seconds.

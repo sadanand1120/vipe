@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--total-gpus", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--final-eval-worker", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -165,6 +166,10 @@ def _worker_timing_path(args: argparse.Namespace) -> Path:
     return _metric_dir(args) / "timing_workers" / f"replica_timing_worker_{args.gpu_id}.json"
 
 
+def _final_eval_worker_path(args: argparse.Namespace) -> Path:
+    return _metric_dir(args) / "final_eval_workers" / f"replica_final_eval_worker_{args.gpu_id}.json"
+
+
 def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
     frames = int(frames)
     seconds = float(seconds)
@@ -186,6 +191,47 @@ def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[di
         build_timing.update(worker_timing.get("build", {}))
         metric_timing.update(worker_timing.get("metric_eval", {}))
     return build_timing, metric_timing
+
+
+def _clear_final_eval_worker_outputs(args: argparse.Namespace) -> None:
+    import shutil
+
+    shutil.rmtree(_metric_dir(args) / "final_eval_workers", ignore_errors=True)
+
+
+def _mean_metric_dict(scene_metrics: dict[str, dict]) -> dict[str, float]:
+    metrics = [item for item in scene_metrics.values() if isinstance(item, dict)]
+    if not metrics:
+        return {}
+    keys = metrics[0].keys()
+    return {key: float(np.mean([float(item[key]) for item in metrics]).item()) for key in keys}
+
+
+def _merge_metric_section(worker_payloads: list[dict], section: str) -> dict:
+    merged = {}
+    for payload in worker_payloads:
+        section_metrics = payload.get("metrics", {}).get(section, {})
+        if not isinstance(section_metrics, dict):
+            continue
+        for scene, metrics in section_metrics.items():
+            if scene == "mean":
+                continue
+            merged[scene] = metrics
+    if merged:
+        merged["mean"] = _mean_metric_dict(merged)
+    return merged
+
+
+def _load_final_eval_worker_outputs(args: argparse.Namespace, total_gpus: int) -> list[dict]:
+    payloads = []
+    for gpu_id in range(total_gpus):
+        path = _metric_dir(args) / "final_eval_workers" / f"replica_final_eval_worker_{gpu_id}.json"
+        if not path.exists():
+            print(f"[WARN] Missing final eval file from Replica worker {gpu_id}: {path}", flush=True)
+            continue
+        with path.open(encoding="utf-8") as f:
+            payloads.append(json.load(f))
+    return payloads
 
 
 def _merge_scene_timing(base: dict, extra: dict) -> dict:
@@ -252,17 +298,21 @@ def _append_common_cli_args(cmd: list[str], args: argparse.Namespace) -> list[st
     return cmd
 
 
+def _cuda_visible_gpu_list() -> list[str]:
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_devices is not None and cuda_devices.strip():
+        return [gpu.strip() for gpu in cuda_devices.split(",") if gpu.strip()]
+
+    import torch
+
+    return [str(i) for i in range(torch.cuda.device_count())]
+
+
 def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
     if args.print_only or os.environ.get(WORKER_ENV) == "1":
         return None
 
-    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_devices is not None and cuda_devices.strip():
-        gpu_list = [gpu.strip() for gpu in cuda_devices.split(",") if gpu.strip()]
-    else:
-        import torch
-
-        gpu_list = [str(i) for i in range(torch.cuda.device_count())]
+    gpu_list = _cuda_visible_gpu_list()
 
     if len(gpu_list) <= 1:
         return None
@@ -303,6 +353,63 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
     scenes = [scene for idx, scene in enumerate(all_scenes) if idx % args.total_gpus == args.gpu_id]
     print(f"[INFO] ViPE worker {args.gpu_id}/{args.total_gpus}: {len(scenes)}/{len(all_scenes)} scenes")
     return scenes
+
+
+def _run_final_eval_worker(args: argparse.Namespace, evaluator) -> None:
+    args.scenes = _scenes_for_worker(args, evaluator)
+    evaluator.scenes_filter = args.scenes
+    metrics = evaluator.eval(dump=False)
+    _write_json(
+        _final_eval_worker_path(args),
+        {
+            "metrics": metrics,
+            "metric_eval": evaluator.metric_eval_timing(),
+        },
+    )
+
+
+def _run_final_eval(args: argparse.Namespace, evaluator) -> tuple[dict, dict]:
+    gpu_list = _cuda_visible_gpu_list()
+    if len(gpu_list) <= 1 or os.environ.get(WORKER_ENV) == "1":
+        metrics = evaluator.eval()
+        return metrics, evaluator.metric_eval_timing()
+
+    _clear_final_eval_worker_outputs(args)
+    base_cmd = _append_common_cli_args(
+        [sys.executable, os.path.abspath(__file__), "--final-eval-worker"],
+        args,
+    )
+
+    print(f"[INFO] Detected {len(gpu_list)} GPUs for Replica final eval: {gpu_list}")
+    processes = []
+    for idx, visible_gpu in enumerate(gpu_list):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = visible_gpu
+        env[WORKER_ENV] = "1"
+        cmd = base_cmd + ["--gpu-id", str(idx), "--total-gpus", str(len(gpu_list))]
+        print(f"[INFO] Starting Replica final eval worker {idx} on GPU {visible_gpu}")
+        processes.append(subprocess.Popen(cmd, env=env))
+
+    failed_workers = []
+    for idx, process in enumerate(processes):
+        process.wait()
+        if process.returncode != 0:
+            failed_workers.append((idx, process.returncode))
+    if failed_workers:
+        print(f"[WARN] Replica final eval worker failures: {failed_workers}. Merging completed worker outputs.", flush=True)
+
+    payloads = _load_final_eval_worker_outputs(args, len(gpu_list))
+    metrics = {
+        "replica_pose": _merge_metric_section(payloads, "replica_pose"),
+        "replica_recon": _merge_metric_section(payloads, "replica_recon"),
+    }
+    _write_json(_metric_dir(args) / "replica_pose.json", metrics["replica_pose"])
+    _write_json(_metric_dir(args) / "replica_recon.json", metrics["replica_recon"])
+
+    metric_timing = {}
+    for payload in payloads:
+        metric_timing = _merge_scene_timing(metric_timing, payload.get("metric_eval", {}))
+    return metrics, metric_timing
 
 
 def prepare_vipe_benchmark_exports(
@@ -426,12 +533,15 @@ def main() -> None:
         return
 
     _skip_bad_gt_pose_scenes(args, evaluator)
+    if args.final_eval_worker:
+        _run_final_eval_worker(args, evaluator)
+        return
 
     build_timing = maybe_spawn_workers(args)
     if build_timing is not None:
         build_scene_timing, metric_scene_timing = build_timing
-        metrics = evaluator.eval()
-        metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
+        metrics, final_metric_timing = _run_final_eval(args, evaluator)
+        metric_scene_timing = _merge_scene_timing(metric_scene_timing, final_metric_timing)
         metrics["replica_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
         print_replica_summary(metrics)
         return
@@ -440,8 +550,8 @@ def main() -> None:
     if is_worker:
         _write_worker_timing(args, build_scene_timing, metric_scene_timing)
         return
-    metrics = evaluator.eval()
-    metric_scene_timing = _merge_scene_timing(metric_scene_timing, evaluator.metric_eval_timing())
+    metrics, final_metric_timing = _run_final_eval(args, evaluator)
+    metric_scene_timing = _merge_scene_timing(metric_scene_timing, final_metric_timing)
     metrics["replica_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
     print_replica_summary(metrics)
 
