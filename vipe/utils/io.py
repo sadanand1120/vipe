@@ -47,6 +47,10 @@ class ArtifactPath:
     def timing_path(self) -> Path:
         return self.base_path / "timing" / f"{self.artifact_name}.json"
 
+    @property
+    def ba_trace_path(self) -> Path:
+        return self.base_path / "ba_trace" / f"{self.artifact_name}.jsonl"
+
 
 @dataclass(slots=True)
 class ArtifactFrame:

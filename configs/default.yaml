@@ -16,20 +16,21 @@ pipeline:
     frontend_nms: 1                      # Non-max suppression radius for frontend proximity edges.
     frontend_max_factors: 48             # Max active factors kept in the incremental frontend graph.
     frontend_max_age: 25                 # Delete active frontend factors after this many graph updates.
-    frontend_init_updates: 8             # Graph update calls during frontend warmup initialization.
-    frontend_update_iters1: 4            # First graph update loop after adding a new frontend keyframe.
+    frontend_init_updates: 2             # Graph update calls during frontend warmup initialization.
+    frontend_update_iters1: 3            # First graph update loop after adding a new frontend keyframe.
     frontend_update_iters2: 2            # Extra graph update loop when the candidate keyframe is retained.
-    frontend_ba_iters: 3                 # Inner BA solver iterations per frontend graph update.
+    frontend_ba_iters: 2                 # Inner BA solver iterations per frontend graph update.
     backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
     backend_radius: 2                    # Local radius for forced backend graph edges.
     backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
-    backend_iters: 31                    # Global backend BA iteration steps.
-    backend_ba_iters: 8                  # Inner BA solver iterations per backend graph update.
+    backend_iters: 17                    # Global backend BA iteration steps.
+    backend_ba_iters: 5                  # Inner BA solver iterations per backend graph update.
     backend_max_factors_per_keyframe: 16 # Backend factor budget multiplier: max factors = value * keyframes.
     backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
     init_disp: 1.0                       # Initial disparity value before external sensor-depth anchors are injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
-    infill_update_steps: 10              # Motion-only graph update calls for non-keyframe pose infilling; 0 uses interpolation only.
+    infill_update_steps: 4              # Motion-only graph update calls for non-keyframe pose infilling; 0 uses interpolation only.
+    infill_ba_iters: 2                   # Inner BA solver iterations per infill graph update.
     ba:
       dense_disp_alpha: 0.009            # Weight for external sensor-depth regularization in BA.
       depth_geom_weight: 0.01            # Backend-only point-to-plane sensor-depth pose term weight.

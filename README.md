@@ -54,6 +54,7 @@ Saved artifacts:
 - `pose/<scene>.npz`: camera-to-world pose per selected frame.
 - `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
 - `timing/<scene>.json`: per-scene build timing for initialization, SLAM pass 1, backend BA, pass 2, artifact loading, TSDF integration, TSDF extraction/write, and total runtime.
+- `ba_trace/<scene>.jsonl`: per-solver-cycle BA loss trace with pre/post loss, loss delta, nested outer/inner labels, and keyframe/chunk metadata.
 
 ## ScanNet Benchmark
 

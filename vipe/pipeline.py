@@ -42,12 +42,12 @@ class VipePipeline:
         )
         return frame_stream, intrinsics
 
-    def _run_slam(self, frame_stream: FrameStream, intrinsics: torch.Tensor) -> SLAMOutput:
+    def _run_slam(self, frame_stream: FrameStream, intrinsics: torch.Tensor, ba_trace_path: Path) -> SLAMOutput:
         slam_pipeline = SLAMSystem(
             device=torch.device("cuda"),
             config=self.slam_cfg,
         )
-        return slam_pipeline.run(frame_stream, intrinsics, camera_type=CameraType.PINHOLE)
+        return slam_pipeline.run(frame_stream, intrinsics, camera_type=CameraType.PINHOLE, ba_trace_path=ba_trace_path)
 
     def _make_artifact_frame_loader(self, frame_stream: FrameStream, slam_output: SLAMOutput):
         intrinsics = slam_output.intrinsics[:4].detach().cpu().numpy().astype("float32")
@@ -96,7 +96,7 @@ class VipePipeline:
 
         artifact_path = io.ArtifactPath(self.out_path, frame_stream.name())
         slam_start = time.perf_counter()
-        slam_output = self._run_slam(frame_stream, intrinsics)
+        slam_output = self._run_slam(frame_stream, intrinsics, artifact_path.ba_trace_path)
         timing["slam_s"] = time.perf_counter() - slam_start
         timing["slam"] = slam_output.timing
 

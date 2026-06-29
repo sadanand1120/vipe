@@ -42,6 +42,17 @@ class SLAMBackend:
             steps=steps,
             batch_size=self.args.backend_batch_size,
             solver_verbose=True,
+            ba_trace_context_fn=lambda outer_iter: {
+                "stage": "backend",
+                "event": "global_ba",
+                "phase": "backend",
+                "outer_iter": outer_iter,
+                "outer_total": int(steps),
+                "ba_iters": int(self.args.backend_ba_iters),
+                "cycle_base": (outer_iter - 1) * int(self.args.backend_ba_iters),
+                "keyframes": int(self.video.n_frames),
+                "num_factors": graph.num_factors,
+            },
         )
 
     @torch.no_grad()

@@ -16,9 +16,12 @@
 import logging
 import time
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
+from vipe.slam.ba_trace import BATraceLogger
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
@@ -93,7 +96,7 @@ class SLAMSystem:
         self.device = device
         self.config = config.copy()
 
-    def _build_components(self):
+    def _build_components(self, ba_trace_logger=None):
         self.droid_net = DroidNet().to(self.device)
         self.buffer = GraphBuffer(
             height=self.config.height,
@@ -103,6 +106,7 @@ class SLAMSystem:
             ba_config=self.config.ba,
             camera_type=self.config.camera_type,
             device=self.device,
+            ba_trace_logger=ba_trace_logger,
         )
         self.motion_filter = MotionFilter(
             self.droid_net,
@@ -174,9 +178,11 @@ class SLAMSystem:
         frame_stream: FrameStream,
         intrinsics: torch.Tensor,
         camera_type: CameraType = CameraType.PINHOLE,
+        ba_trace_path: Path | None = None,
     ) -> SLAMOutput:
         timing: dict[str, float | int] = {}
         total_start = time.perf_counter()
+        ba_trace_logger = BATraceLogger(ba_trace_path) if ba_trace_path is not None else None
 
         setup_start = time.perf_counter()
         resizer = StandardResizeFrameProcessor(self.config.resize_target_pixels)
@@ -191,7 +197,7 @@ class SLAMSystem:
             }
         )
 
-        self._build_components()
+        self._build_components(ba_trace_logger=ba_trace_logger)
         timing["setup_s"] = time.perf_counter() - setup_start
 
         pass1_start = time.perf_counter()
@@ -277,6 +283,9 @@ class SLAMSystem:
         trajectory = infill_result.poses.inv()
         timing["finalize_s"] = time.perf_counter() - finalize_start
         timing["total_s"] = time.perf_counter() - total_start
+        if ba_trace_logger is not None:
+            ba_trace_logger.close()
+            timing["ba_trace_path"] = str(ba_trace_path)
 
         output = SLAMOutput(
             trajectory=trajectory,

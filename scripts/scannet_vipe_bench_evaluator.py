@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from vipe.utils.determinism import seed_everything
 
 
 WORKER_ENV = "_VIPE_SCANNET_BENCH_WORKER"
+SCENE_QUEUE_ENV = "_VIPE_SCANNET_DYNAMIC_SCENE_QUEUE"
 PIPELINE_CONFIG_PATH = get_config_path() / "default.yaml"
 EVAL_CONFIG_PATH = get_config_path() / "eval_scannet_config.yaml"
 
@@ -126,7 +128,8 @@ def _write_vipe_manifest(
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
     timing_path = vipe_output_dir / "timing" / f"{artifact_name}.json"
-    required_artifacts = [pose_path, tsdf_pcd_path]
+    ba_trace_path = vipe_output_dir / "ba_trace" / f"{artifact_name}.jsonl"
+    required_artifacts = [pose_path, tsdf_pcd_path, ba_trace_path]
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
@@ -139,6 +142,7 @@ def _write_vipe_manifest(
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
         "timing_path": str(timing_path.resolve()) if timing_path.exists() else None,
+        "ba_trace_path": str(ba_trace_path.resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
             "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
@@ -171,6 +175,10 @@ def _metric_dir(args: argparse.Namespace) -> Path:
 def _write_json(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=4) + "\n", encoding="utf-8")
+
+
+def _write_scene_queue(path: Path, scenes: list[str]) -> None:
+    _write_json(path, {"next_index": 0, "scenes": scenes})
 
 
 def _worker_timing_path(args: argparse.Namespace) -> Path:
@@ -441,6 +449,8 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
         return None
 
     base_cmd = _append_common_cli_args([sys.executable, os.path.abspath(__file__)], args)
+    scene_queue_path = _metric_dir(args) / "dynamic_scene_queue.json"
+    _write_scene_queue(scene_queue_path, list(args.scenes))
 
     print(f"[INFO] Detected {len(gpu_list)} GPUs for ViPE ScanNet benchmark: {gpu_list}")
     processes = []
@@ -448,6 +458,7 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = visible_gpu
         env[WORKER_ENV] = "1"
+        env[SCENE_QUEUE_ENV] = str(scene_queue_path)
         cmd = base_cmd + ["--gpu-id", str(idx), "--total-gpus", str(len(gpu_list))]
         print(f"[INFO] Starting ViPE worker {idx} on GPU {visible_gpu}")
         processes.append(subprocess.Popen(cmd, env=env))
@@ -466,7 +477,42 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
     return _load_parallel_timing(args, len(gpu_list))
 
 
-def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
+def _claim_scene_from_queue(queue_path: Path) -> tuple[int, int, str | None]:
+    import fcntl
+
+    with queue_path.open("r+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        state = json.load(f)
+        scenes = state["scenes"]
+        next_index = int(state["next_index"])
+        if next_index >= len(scenes):
+            scene = None
+        else:
+            scene = scenes[next_index]
+            state["next_index"] = next_index + 1
+            f.seek(0)
+            json.dump(state, f, indent=4)
+            f.write("\n")
+            f.truncate()
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return next_index, len(scenes), scene
+
+
+def _dynamic_scenes_for_worker(args: argparse.Namespace) -> Iterable[str]:
+    queue_path = Path(os.environ[SCENE_QUEUE_ENV])
+    while True:
+        scene_idx, total_scenes, scene = _claim_scene_from_queue(queue_path)
+        if scene is None:
+            print(f"[INFO] ViPE worker {args.gpu_id}/{args.total_gpus}: dynamic queue empty", flush=True)
+            return
+        print(
+            f"[INFO] ViPE worker {args.gpu_id}/{args.total_gpus}: claimed {scene_idx + 1}/{total_scenes} {scene}",
+            flush=True,
+        )
+        yield scene
+
+
+def _scenes_for_worker(args: argparse.Namespace, evaluator) -> Iterable[str]:
     dataset = evaluator.datasets["scannet"]
     known_scenes = set(evaluator._get_scenes(dataset))
     missing = sorted(set(args.scenes) - known_scenes)
@@ -477,6 +523,10 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> list[str]:
     if args.total_gpus <= 1:
         print(f"[INFO] Total ViPE benchmark scenes: {len(all_scenes)}")
         return all_scenes
+
+    if os.environ.get(SCENE_QUEUE_ENV):
+        print(f"[INFO] ViPE worker {args.gpu_id}/{args.total_gpus}: using dynamic scene queue")
+        return _dynamic_scenes_for_worker(args)
 
     scenes = [scene for idx, scene in enumerate(all_scenes) if idx % args.total_gpus == args.gpu_id]
     print(f"[INFO] ViPE worker {args.gpu_id}/{args.total_gpus}: {len(scenes)}/{len(all_scenes)} scenes")
@@ -513,11 +563,12 @@ def _scene_gt_meta_path(args: argparse.Namespace, scene: str) -> Path:
     return _scene_export_manifest_path(args, scene).with_name("gt_meta.npz")
 
 
-def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path, Path]:
+def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path, Path, Path]:
     artifact_name = _artifact_name(scene_dir)
     return (
         vipe_output_dir / "pose" / f"{artifact_name}.npz",
         vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply",
+        vipe_output_dir / "ba_trace" / f"{artifact_name}.jsonl",
     )
 
 
@@ -528,7 +579,11 @@ def _manifest_artifacts_exist(manifest_path: Path) -> bool:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
         return False
-    return Path(manifest["pose_path"]).exists() and Path(manifest["tsdf_pcd_path"]).exists()
+    return (
+        Path(manifest["pose_path"]).exists()
+        and Path(manifest["tsdf_pcd_path"]).exists()
+        and Path(manifest["ba_trace_path"]).exists()
+    )
 
 
 def _scene_export_complete(args: argparse.Namespace, scene: str) -> bool:
@@ -624,7 +679,7 @@ def prepare_vipe_benchmark_exports(
         scene_dir = _scene_dir(args, scene)
         vipe_output_dir = _resolve_vipe_output_dir(args, scene)
         full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(evaluator, scene)
-        pose_path, tsdf_pcd_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
+        pose_path, tsdf_pcd_path, ba_trace_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
         if _scene_export_complete(args, scene):
             print(f"[INFO] Reusing existing ViPE artifacts | {scene}", flush=True)
             inc_path = _incremental_pose_dir(args) / f"{scene}.json"
@@ -634,7 +689,7 @@ def prepare_vipe_benchmark_exports(
             if stage_timing is not None:
                 build_timing[scene] = _timing_entry(len(frame_indices), float(stage_timing.get("total_s", 0.0)), stage_timing)
             continue
-        if pose_path.exists() and tsdf_pcd_path.exists():
+        if pose_path.exists() and tsdf_pcd_path.exists() and ba_trace_path.exists():
             print(f"[INFO] Reusing existing ViPE build outputs and refreshing manifest | {scene}", flush=True)
             _write_vipe_manifest(
                 args,

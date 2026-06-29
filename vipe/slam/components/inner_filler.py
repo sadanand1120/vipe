@@ -88,11 +88,32 @@ class InnerFiller:
         graph.add_factors(t0, infill_inds)
         graph.add_factors(t1, infill_inds)
 
-        for _ in range(int(self.args.infill_update_steps)):
+        chunk_idx = len(self.filled_poses) + 1
+        frame_start = int(m_tstamp[0].item()) if len(m_tstamp) > 0 else None
+        frame_end = int(m_tstamp[-1].item()) if len(m_tstamp) > 0 else None
+        infill_ba_iters = int(self.args.infill_ba_iters)
+        for outer_iter in range(1, int(self.args.infill_update_steps) + 1):
             graph.update(
                 self.start_idx,
                 total_frames,
+                itrs=infill_ba_iters,
                 motion_only=True,
+                ba_trace_context={
+                    "stage": "infill",
+                    "event": "chunk",
+                    "phase": "motion_only",
+                    "chunk_idx": chunk_idx,
+                    "chunk_start_buffer_idx": int(self.start_idx),
+                    "chunk_end_buffer_idx_exclusive": int(total_frames),
+                    "chunk_frames": int(total_frames - self.start_idx),
+                    "frame_start": frame_start,
+                    "frame_end": frame_end,
+                    "outer_iter": outer_iter,
+                    "outer_total": int(self.args.infill_update_steps),
+                    "ba_iters": infill_ba_iters,
+                    "cycle_base": (outer_iter - 1) * infill_ba_iters,
+                    "num_factors": graph.num_factors,
+                },
             )
 
         current_poses = SE3(self.video.poses[self.start_idx : total_frames].clone())

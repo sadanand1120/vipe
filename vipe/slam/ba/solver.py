@@ -106,6 +106,16 @@ class Solver:
         self.group_damping[group_name] = damping
         self.group_ep[group_name] = ep
 
+    def energy(self, variables: dict[str, Any]) -> float:
+        energy = 0.0
+        for term, kernel in zip(self.terms, self.kernels):
+            term.update(self)
+            term_return = term.forward(variables, jacobian=False)
+            if kernel is not None:
+                term_return.apply_robust_kernel(kernel)
+            energy += term_return.residual().sum().item()
+        return float(energy)
+
     def _solve(self, lhs: SparseMatrixSubview, rhs: SparseVectorSubview) -> SparseVectorSubview:
         assert lhs.row_group_names == lhs.col_group_names == rhs.group_names
 
