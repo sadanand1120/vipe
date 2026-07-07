@@ -118,9 +118,7 @@ def _write_vipe_manifest(
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
-    timing_path = vipe_output_dir / "timing" / f"{artifact_name}.json"
-    ba_trace_path = vipe_output_dir / "ba_trace" / f"{artifact_name}.jsonl"
-    required_artifacts = [pose_path, tsdf_pcd_path, ba_trace_path]
+    required_artifacts = [pose_path, tsdf_pcd_path]
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
@@ -132,8 +130,6 @@ def _write_vipe_manifest(
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
-        "timing_path": str(timing_path.resolve()) if timing_path.exists() else None,
-        "ba_trace_path": str(ba_trace_path.resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
             "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),

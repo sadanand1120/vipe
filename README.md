@@ -53,8 +53,6 @@ Saved artifacts:
 
 - `pose/<scene>.npz`: camera-to-world pose per selected frame.
 - `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
-- `timing/<scene>.json`: per-scene build timing for initialization, SLAM pass 1, backend BA, pass 2, artifact loading, TSDF integration, TSDF extraction/write, and total runtime.
-- `ba_trace/<scene>.jsonl`: per-solver-cycle BA loss trace with pre/post loss, loss delta, nested outer/inner labels, and keyframe/chunk metadata.
 
 ## ScanNet Benchmark
 
@@ -77,7 +75,7 @@ Runtime knobs live in `configs/default.yaml`; ScanNet-specific benchmark knobs l
 Use the dashboard to compare two ScanNet eval workspaces:
 
 ```bash
-python3 scripts/scannet_eval_dashboard.py --before-root workspace/evaluation_scannet_default_full8 --after-root workspace/evaluation_scannet_default_full_new --input-root data/scannet --host 127.0.0.1 --port 18799
+python3 scripts/scannet_eval_dashboard.py --before-root workspace/evaluation_scannet_default_old --after-root workspace/evaluation_scannet_default_new --input-root data/scannet --host 127.0.0.1 --port 18799
 ```
 
 The dashboard reads aggregate and incremental pose JSONs, marks filtered/unavailable/failed scenes, excludes unavailable scenes from means, and refreshes every 30 seconds.

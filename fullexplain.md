@@ -835,8 +835,6 @@ def load(frame_idx):
 | --- | --- | --- |
 | Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: sequential canonical frame indices. |
 | TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points with `nx/ny/nz` normals and `normals_red/green/blue` normal colors sampled from the native TSDF zero-crossing surface. |
-| Timing JSON | `timing/<artifact_name>.json` | Nested build timing for initialization, SLAM, artifact loading, TSDF integration/extraction/write, and total runtime. |
-| BA Trace JSONL | `ba_trace/<artifact_name>.jsonl` | One row per BA solver cycle with stage, outer update, inner BA iteration, nested label, per-event cycle, per-stage cycle, pre-step loss, post-step loss, loss delta, and keyframe/chunk metadata. |
 
 `artifact_name` is `frame_stream.name()`, which is the input scene directory name unless explicitly overridden.
 
@@ -1002,8 +1000,6 @@ Manifest contents include:
 | `vipe_output_dir` | Absolute path to ViPE output directory. |
 | `pose_path` | Absolute path to ViPE pose NPZ. |
 | `tsdf_pcd_path` | Absolute path to ViPE TSDF PLY. |
-| `timing_path` | Absolute path to ViPE build timing JSON, when present. |
-| `ba_trace_path` | Absolute path to per-cycle BA loss trace JSONL, when present. |
 | `output` | TSDF output parameters used for this run. |
 | `frame_indices` | Sequential canonical frame indices. |
 
@@ -1080,7 +1076,7 @@ Important runtime config values:
 | Config | Role |
 | --- | --- |
 | `seed` | Seeds Python/NumPy/Torch/Open3D RNGs. |
-| `temporary_determinism` | Enables deterministic experiment behavior; disable only for deployment-speed experiments. |
+| `temporary_determinism` | Enables deterministic ordering/kernels so repeated runs on the same machine are reproducible. |
 | `pipeline.slam.buffer` | Max number of keyframes kept in the graph buffer. |
 | `pipeline.slam.resize_target_pixels` | SLAM working image area before the 8px-aligned resize/crop. |
 | `pipeline.slam.filter_thresh` | Motion threshold for keyframe creation. |
@@ -1124,5 +1120,5 @@ This is the key invariant: if a path reaches `run.py` or the ScanNet benchmark, 
 | `frontend.graph` | Persistent incremental factor graph used during pass 1. |
 | Backend graph | Fresh non-incremental factor graph created once in Stage 3. |
 | `InnerFiller` | Motion-only pose optimizer for non-keyframe frames. |
-| `SLAMOutput` | Final handoff object containing full trajectory, original-resolution intrinsics, keyframe indices, and SLAM timing. |
-| `ArtifactPath` | Output naming wrapper for `pose/<scene>.npz`, `pcd/<scene>_tsdf.ply`, `timing/<scene>.json`, and `ba_trace/<scene>.jsonl`. |
+| `SLAMOutput` | Final handoff object containing full trajectory, original-resolution intrinsics, and keyframe indices. |
+| `ArtifactPath` | Output naming wrapper for `pose/<scene>.npz` and `pcd/<scene>_tsdf.ply`. |

@@ -67,37 +67,6 @@ class SLAMFrontend:
         self.frontend_ba_iters = args.frontend_ba_iters
         self.max_keyframe_gap = args.max_keyframe_gap
 
-    def _trace_context(
-        self,
-        *,
-        event: str,
-        phase: str,
-        outer_iter: int,
-        cycle_base: int,
-        kf_idx: int | None,
-        frame_idx: int | None,
-        extra: dict | None = None,
-    ) -> dict:
-        context = {
-            "stage": "frontend",
-            "event": event,
-            "phase": phase,
-            "outer_iter": outer_iter,
-            "outer_total": self.frontend_init_updates if phase == "init" else (
-                self.frontend_update_iters1 if phase == "update_iters1" else self.frontend_update_iters2
-            ),
-            "ba_iters": self.frontend_ba_iters,
-            "cycle_base": cycle_base,
-            "kf_idx": kf_idx,
-            "frame_idx": frame_idx,
-            "t0": None,
-            "t1": int(self.t1),
-            "num_factors": self.graph.num_factors,
-        }
-        if extra:
-            context.update(extra)
-        return context
-
     def __init_pose(self):
         assert self.t1 > 1
         p1 = SE3(self.video.poses[self.t1 - 2])
@@ -129,22 +98,10 @@ class SLAMFrontend:
             remove=True,
         )
 
-        new_kf_idx = self.t1 - 1
-        new_frame_idx = int(self.video.tstamp[new_kf_idx].item())
-        cycle_base = 0
-        for outer_iter in range(1, self.frontend_update_iters1 + 1):
+        for _ in range(self.frontend_update_iters1):
             self.graph.update(
                 itrs=self.frontend_ba_iters,
-                ba_trace_context=self._trace_context(
-                    event="keyframe",
-                    phase="update_iters1",
-                    outer_iter=outer_iter,
-                    cycle_base=cycle_base,
-                    kf_idx=new_kf_idx,
-                    frame_idx=new_frame_idx,
-                ),
             )
-            cycle_base += self.frontend_ba_iters
 
         # remove frame t1-2 if it is too close to t1-3, so the new keyframes will be [t1-3, t1-1]
         d = self.video.frame_distance_dense_disp(
@@ -162,26 +119,10 @@ class SLAMFrontend:
             self.graph.rm_second_newest_keyframe(self.t1 - 2)
             self.t1 -= 1
         else:
-            decision = {
-                "decision": action,
-                "decision_distance": decision_d,
-                "prune_threshold": prune_threshold,
-                "keep_for_gap": bool(keep_for_gap),
-            }
-            for outer_iter in range(1, self.frontend_update_iters2 + 1):
+            for _ in range(self.frontend_update_iters2):
                 self.graph.update(
                     itrs=self.frontend_ba_iters,
-                    ba_trace_context=self._trace_context(
-                        event="keyframe",
-                        phase="update_iters2",
-                        outer_iter=outer_iter,
-                        cycle_base=cycle_base,
-                        kf_idx=new_kf_idx,
-                        frame_idx=new_frame_idx,
-                        extra=decision,
-                    ),
                 )
-                cycle_base += self.frontend_ba_iters
 
         # set pose for next itration
         self.__init_pose()
@@ -193,22 +134,11 @@ class SLAMFrontend:
         self.t1 = self.video.n_frames
 
         self.graph.add_neighborhood_factors(0, self.t1, r=1)
-        cycle_base = 0
-        for outer_iter in range(1, self.frontend_init_updates + 1):
+        for _ in range(self.frontend_init_updates):
             self.graph.update(
                 t0=1,
                 itrs=self.frontend_ba_iters,
-                ba_trace_context=self._trace_context(
-                    event="warmup_init",
-                    phase="init",
-                    outer_iter=outer_iter,
-                    cycle_base=cycle_base,
-                    kf_idx=None,
-                    frame_idx=int(self.video.tstamp[self.t1 - 1].item()),
-                    extra={"kf_count": int(self.t1)},
-                ),
             )
-            cycle_base += self.frontend_ba_iters
 
         self.__init_pose()
         self.video.disps[self.t1] = self.video.disps[self.t1 - 4 : self.t1].mean()

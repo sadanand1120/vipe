@@ -107,11 +107,6 @@ def _artifact_name(scene_dir: Path) -> str:
     return scene_dir.name
 
 
-def _scene_timing_path(scene_dir: Path, vipe_output_dir: Path) -> Path:
-    artifact_name = _artifact_name(scene_dir)
-    return vipe_output_dir / "timing" / f"{artifact_name}.json"
-
-
 def _write_vipe_manifest(
     args: argparse.Namespace,
     evaluator,
@@ -127,9 +122,7 @@ def _write_vipe_manifest(
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
-    timing_path = vipe_output_dir / "timing" / f"{artifact_name}.json"
-    ba_trace_path = vipe_output_dir / "ba_trace" / f"{artifact_name}.jsonl"
-    required_artifacts = [pose_path, tsdf_pcd_path, ba_trace_path]
+    required_artifacts = [pose_path, tsdf_pcd_path]
     missing_artifacts = [path for path in required_artifacts if not path.exists()]
     if missing_artifacts:
         raise FileNotFoundError("Missing ViPE artifacts:\n" + "\n".join(str(path) for path in missing_artifacts))
@@ -141,8 +134,6 @@ def _write_vipe_manifest(
         "vipe_output_dir": str(vipe_output_dir.resolve()),
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
-        "timing_path": str(timing_path.resolve()) if timing_path.exists() else None,
-        "ba_trace_path": str(ba_trace_path.resolve()),
         "output": {
             "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
             "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
@@ -189,47 +180,11 @@ def _final_eval_worker_path(args: argparse.Namespace) -> Path:
     return _metric_dir(args) / "final_eval_workers" / f"scannet_final_eval_worker_{args.gpu_id}.json"
 
 
-def _timing_entry(frames: int, seconds: float, stages: dict | None = None) -> dict[str, Any]:
+def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
     frames = int(frames)
     seconds = float(seconds)
     fps = frames / seconds if seconds > 0.0 else 0.0
-    entry = {"frames": frames, "seconds": seconds, "fps": fps}
-    if stages is not None:
-        entry["stages"] = stages
-    return entry
-
-
-def _load_build_stage_timing(scene_dir: Path, vipe_output_dir: Path) -> dict | None:
-    path = _scene_timing_path(scene_dir, vipe_output_dir)
-    if not path.exists():
-        return None
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _flatten_stage_seconds(value: Any, prefix: str = "") -> dict[str, float]:
-    flat = {}
-    if not isinstance(value, dict):
-        return flat
-    for key, item in value.items():
-        name = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(item, dict):
-            flat.update(_flatten_stage_seconds(item, name))
-        elif name.endswith("_s") and isinstance(item, (int, float)):
-            flat[name] = float(item)
-    return flat
-
-
-def _stage_summary(scene_timing: dict) -> dict[str, dict[str, float]]:
-    totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
-    for entry in scene_timing.values():
-        stages = entry.get("stages") if isinstance(entry, dict) else None
-        for key, seconds in _flatten_stage_seconds(stages).items():
-            totals[key] = totals.get(key, 0.0) + seconds
-            counts[key] = counts.get(key, 0) + 1
-    means = {key: totals[key] / counts[key] for key in totals if counts[key] > 0}
-    return {"total_seconds": totals, "mean_seconds": means}
+    return {"frames": frames, "seconds": seconds, "fps": fps}
 
 
 def _write_worker_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
@@ -382,7 +337,6 @@ def _write_timing(args: argparse.Namespace, build_timing: dict, metric_timing: d
     timing = {
         "build": {
             "mean_fps": _mean_fps(build_timing),
-            "stage_summary": _stage_summary(build_timing),
             "scenes": build_timing,
         },
         "metric_eval": {
@@ -563,12 +517,11 @@ def _scene_gt_meta_path(args: argparse.Namespace, scene: str) -> Path:
     return _scene_export_manifest_path(args, scene).with_name("gt_meta.npz")
 
 
-def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path, Path, Path]:
+def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path, Path]:
     artifact_name = _artifact_name(scene_dir)
     return (
         vipe_output_dir / "pose" / f"{artifact_name}.npz",
         vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply",
-        vipe_output_dir / "ba_trace" / f"{artifact_name}.jsonl",
     )
 
 
@@ -582,7 +535,6 @@ def _manifest_artifacts_exist(manifest_path: Path) -> bool:
     return (
         Path(manifest["pose_path"]).exists()
         and Path(manifest["tsdf_pcd_path"]).exists()
-        and Path(manifest["ba_trace_path"]).exists()
     )
 
 
@@ -679,17 +631,14 @@ def prepare_vipe_benchmark_exports(
         scene_dir = _scene_dir(args, scene)
         vipe_output_dir = _resolve_vipe_output_dir(args, scene)
         full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(evaluator, scene)
-        pose_path, tsdf_pcd_path, ba_trace_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
+        pose_path, tsdf_pcd_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
         if _scene_export_complete(args, scene):
             print(f"[INFO] Reusing existing ViPE artifacts | {scene}", flush=True)
             inc_path = _incremental_pose_dir(args) / f"{scene}.json"
             if not inc_path.exists():
                 _write_incremental_pose_metric(args, evaluator, scene)
-            stage_timing = _load_build_stage_timing(scene_dir, vipe_output_dir)
-            if stage_timing is not None:
-                build_timing[scene] = _timing_entry(len(frame_indices), float(stage_timing.get("total_s", 0.0)), stage_timing)
             continue
-        if pose_path.exists() and tsdf_pcd_path.exists() and ba_trace_path.exists():
+        if pose_path.exists() and tsdf_pcd_path.exists():
             print(f"[INFO] Reusing existing ViPE build outputs and refreshing manifest | {scene}", flush=True)
             _write_vipe_manifest(
                 args,
@@ -705,9 +654,6 @@ def prepare_vipe_benchmark_exports(
             inc_path = _incremental_pose_dir(args) / f"{scene}.json"
             if not inc_path.exists():
                 _write_incremental_pose_metric(args, evaluator, scene)
-            stage_timing = _load_build_stage_timing(scene_dir, vipe_output_dir)
-            if stage_timing is not None:
-                build_timing[scene] = _timing_entry(len(frame_indices), float(stage_timing.get("total_s", 0.0)), stage_timing)
             continue
         start_build = time.perf_counter()
         try:
@@ -734,8 +680,7 @@ def prepare_vipe_benchmark_exports(
         )
         frames = len(frame_indices)
         metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
-        stage_timing = _load_build_stage_timing(scene_dir, vipe_output_dir)
-        build_timing[scene] = _timing_entry(frames, build_seconds, stage_timing)
+        build_timing[scene] = _timing_entry(frames, build_seconds)
         metric_timing[scene] = _timing_entry(frames, metric_seconds)
         _write_incremental_pose_metric(args, evaluator, scene)
         _cleanup_cuda_runtime()

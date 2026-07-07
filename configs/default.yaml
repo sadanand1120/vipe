@@ -1,5 +1,5 @@
 seed: 42              # Seed Python/NumPy/Torch/Open3D RNGs and enable deterministic backend settings where supported.
-temporary_determinism: true  # Reproducibility switch for experiments; turn off for deployment because deterministic kernels hurt speed.
+temporary_determinism: true  # Enforce deterministic ordering/kernels; disable only if knowingly trading reproducibility for throughput.
 
 pipeline:
   slam:
@@ -43,5 +43,5 @@ pipeline:
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
     pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
-    pcd_tsdf_num_voxels_per_block_edge: 8 # Sparse TSDF block edge voxels; original before speedify: 16.
-    pcd_tsdf_depth_sampling_stride: 128   # Depth-pixel stride for opening TSDF blocks; original before speedify: 4.
+    pcd_tsdf_num_voxels_per_block_edge: 8 # Sparse TSDF block edge voxels.
+    pcd_tsdf_depth_sampling_stride: 128   # Depth-pixel stride for opening TSDF blocks.

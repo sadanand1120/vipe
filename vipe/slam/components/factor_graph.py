@@ -20,9 +20,6 @@
 
 import warnings
 
-from collections.abc import Callable
-from typing import Any
-
 import numpy as np
 import torch
 
@@ -188,7 +185,6 @@ class FactorGraph:
         t1: int | None = None,
         itrs: int = 3,
         motion_only: bool = False,
-        ba_trace_context: dict[str, Any] | None = None,
     ):
         assert self.incremental
         assert self.corr is not None and self.inp is not None and self.f_net is not None
@@ -234,7 +230,6 @@ class FactorGraph:
                 motion_only=motion_only,
                 use_depth_geometry=False,
                 verbose=False,
-                ba_trace_context=ba_trace_context,
             )
 
         self.age += 1
@@ -246,7 +241,6 @@ class FactorGraph:
         steps: int,
         batch_size: int,
         solver_verbose: bool = False,
-        ba_trace_context_fn: Callable[[int], dict[str, Any]] | None = None,
     ):
         if self.incremental:
             warnings.warn("Calling update_batch with incremental=True could be slow.")
@@ -255,7 +249,7 @@ class FactorGraph:
         t = self.buffer.n_frames
         corr_op = AltCorrBlock(self.buffer.fmaps[None])
 
-        for step_idx in range(1, steps + 1):
+        for _ in range(steps):
             with torch.cuda.amp.autocast(enabled=False):
                 coords1, _ = self.buffer.reproject_dense_disp(self.ii, self.jj)
                 coords1 = coords1[None]
@@ -303,7 +297,6 @@ class FactorGraph:
                 motion_only=False,
                 use_depth_geometry=self.use_depth_geometry,
                 verbose=solver_verbose,
-                ba_trace_context=ba_trace_context_fn(step_idx) if ba_trace_context_fn is not None else None,
             )
 
     def add_neighborhood_factors(self, t0, t1, r: int = 3):

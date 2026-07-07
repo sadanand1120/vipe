@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import logging
-import time
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -43,14 +42,6 @@ class ArtifactPath:
     def tsdf_pcd_path(self) -> Path:
         return self.base_path / "pcd" / f"{self.artifact_name}_tsdf.ply"
 
-    @property
-    def timing_path(self) -> Path:
-        return self.base_path / "timing" / f"{self.artifact_name}.json"
-
-    @property
-    def ba_trace_path(self) -> Path:
-        return self.base_path / "ba_trace" / f"{self.artifact_name}.jsonl"
-
 
 @dataclass(slots=True)
 class ArtifactFrame:
@@ -62,23 +53,18 @@ class ArtifactFrame:
     intrinsics: np.ndarray
 
 
-def _add_timing(timing: dict[str, float | int], key: str, seconds: float) -> None:
-    timing[key] = float(timing.get(key, 0.0)) + float(seconds)
-
-
 def _prefetch_frames(
     load_frame: Callable[[int], ArtifactFrame],
     n_frames: int,
     max_prefetch: int = 16,
     num_workers: int = 4,
-) -> Iterator[tuple[ArtifactFrame, float]]:
-    def load(frame_idx: int) -> tuple[ArtifactFrame, float]:
-        start = time.perf_counter()
-        return load_frame(frame_idx), time.perf_counter() - start
+) -> Iterator[ArtifactFrame]:
+    def load(frame_idx: int) -> ArtifactFrame:
+        return load_frame(frame_idx)
 
     with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="vipe-artifact-load") as pool:
         next_submit = 0
-        pending: dict[int, Future[tuple[ArtifactFrame, float]]] = {}
+        pending: dict[int, Future[ArtifactFrame]] = {}
 
         def submit_ready() -> None:
             nonlocal next_submit
@@ -88,9 +74,9 @@ def _prefetch_frames(
 
         submit_ready()
         for frame_idx in range(n_frames):
-            frame_data, load_seconds = pending.pop(frame_idx).result()
+            frame_data = pending.pop(frame_idx).result()
             submit_ready()
-            yield frame_data, load_seconds
+            yield frame_data
 
 
 def _make_tsdf_volume(
@@ -111,30 +97,20 @@ def _integrate_tsdf_frame(
     volume,
     frame_data: ArtifactFrame,
     depth_trunc: float,
-    timing: dict[str, float | int],
 ) -> None:
-    prep_start = time.perf_counter()
     depth = frame_data.depth
     color = frame_data.color
     intrinsics = frame_data.intrinsics
-    _add_timing(timing, "tsdf_prepare_s", time.perf_counter() - prep_start)
 
-    integrate_start = time.perf_counter()
     volume.integrate(depth, color, intrinsics, frame_data.w2c_matrix, depth_trunc)
-    _add_timing(timing, "tsdf_integrate_s", time.perf_counter() - integrate_start)
 
 
-def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int, timing: dict[str, float | int]) -> None:
-    extract_start = time.perf_counter()
+def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
     points, colors, normals = volume.extract_point_cloud_tensors(max_points)
-    timing["tsdf_extract_s"] = time.perf_counter() - extract_start
-    timing["tsdf_points"] = int(len(points))
     if len(points) == 0:
         return
 
-    write_start = time.perf_counter()
     write_binary_ply(out_path.tsdf_pcd_path, points, colors, normals)
-    timing["tsdf_ply_write_s"] = time.perf_counter() - write_start
 
 
 def save_artifacts(
@@ -147,13 +123,11 @@ def save_artifacts(
     pcd_tsdf_depth_trunc_m: float = 5.0,
     pcd_tsdf_num_voxels_per_block_edge: int = 16,
     pcd_tsdf_depth_sampling_stride: int = 4,
-) -> dict[str, float | int]:
+) -> None:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
     """
 
-    total_start = time.perf_counter()
-    timing: dict[str, float | int] = {"frames": int(n_frames)}
     pose_list = []
     tsdf_volume = _make_tsdf_volume(
         pcd_tsdf_voxel_edge_m,
@@ -164,27 +138,20 @@ def save_artifacts(
 
     frame_iter = _prefetch_frames(load_frame, n_frames)
     for _ in pbar(range(n_frames), desc="Saving artifacts"):
-        wait_start = time.perf_counter()
         try:
-            frame_data, load_seconds = next(frame_iter)
+            frame_data = next(frame_iter)
         except StopIteration as exc:
             raise ValueError("Final frame iterator ended before n_frames") from exc
         assert isinstance(frame_data, ArtifactFrame)
-        _add_timing(timing, "frame_prefetch_wait_s", time.perf_counter() - wait_start)
-        _add_timing(timing, "frame_load_attach_s", load_seconds)
 
         pose_list.append((frame_data.frame_idx, frame_data.pose_matrix))
 
-        _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc_m, timing)
+        _integrate_tsdf_frame(tsdf_volume, frame_data, pcd_tsdf_depth_trunc_m)
 
     if len(pose_list) > 0:
-        pose_write_start = time.perf_counter()
         pose_data = np.stack([pose for _, pose in pose_list], axis=0)
         pose_inds = np.array([frame_idx for frame_idx, _ in pose_list])
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
         np.savez(out_path.pose_path, data=pose_data, inds=pose_inds)
-        timing["pose_npz_write_s"] = time.perf_counter() - pose_write_start
 
-    _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points, timing)
-    timing["total_s"] = time.perf_counter() - total_start
-    return timing
+    _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)

@@ -20,8 +20,6 @@
 
 import logging
 
-from typing import Any
-
 import torch
 
 from einops import rearrange
@@ -55,7 +53,6 @@ class GraphBuffer:
         ba_config,
         camera_type: CameraType,
         device: torch.device = torch.device("cuda"),
-        ba_trace_logger=None,
     ):
         self.n_frames: int = 0
 
@@ -64,7 +61,6 @@ class GraphBuffer:
         self.device = device
         self.ba_config = ba_config
         self.camera_type = camera_type
-        self.ba_trace_logger = ba_trace_logger
 
         assert self.height % 8 == 0 and self.width % 8 == 0
         dd_height, dd_width = self.height // 8, self.width // 8
@@ -131,7 +127,6 @@ class GraphBuffer:
         motion_only: bool,
         use_depth_geometry: bool,
         verbose: bool,
-        ba_trace_context: dict[str, Any] | None = None,
     ):
         assert t0 <= t1
         weight_dense_disp = 0.001
@@ -140,7 +135,6 @@ class GraphBuffer:
         di_unique = torch.unique(di)
         pose_i_unique = torch.unique(ii)
 
-        trace_enabled = self.ba_trace_logger is not None and ba_trace_context is not None
         solver = Solver(compute_energy=verbose)
         solver.add_term(
             DenseDepthFlowTerm(
@@ -233,20 +227,12 @@ class GraphBuffer:
             "dense_disp": disps_flattened,
         }
         ba_energy = []
-        ba_trace_losses = []
-        pre_trace_energy = solver.energy(variables) if trace_enabled else None
         for _ in range(n_iters):
             cur_energy = solver.run_inplace(variables)
-            if trace_enabled:
-                cur_energy = solver.energy(variables)
-                ba_trace_losses.append((pre_trace_energy, cur_energy))
-                pre_trace_energy = cur_energy
             ba_energy.append(cur_energy)
 
         if verbose:
             logger.info(f"BA iters = {n_iters}, energy: {ba_energy[0]} -> {ba_energy[-1]}")
-        if trace_enabled:
-            self.ba_trace_logger.record_losses(ba_trace_context, ba_trace_losses)
 
         self.disps.clamp_(min=0.001)
         return ba_energy

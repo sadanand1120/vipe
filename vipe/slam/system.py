@@ -14,14 +14,10 @@
 # limitations under the License.
 
 import logging
-import time
-
-from pathlib import Path
 
 import numpy as np
 import torch
 
-from vipe.slam.ba_trace import BATraceLogger
 from vipe.streams.base import FrameData, FrameStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
@@ -96,7 +92,7 @@ class SLAMSystem:
         self.device = device
         self.config = config.copy()
 
-    def _build_components(self, ba_trace_logger=None):
+    def _build_components(self):
         self.droid_net = DroidNet().to(self.device)
         self.buffer = GraphBuffer(
             height=self.config.height,
@@ -106,7 +102,6 @@ class SLAMSystem:
             ba_config=self.config.ba,
             camera_type=self.config.camera_type,
             device=self.device,
-            ba_trace_logger=ba_trace_logger,
         )
         self.motion_filter = MotionFilter(
             self.droid_net,
@@ -178,13 +173,7 @@ class SLAMSystem:
         frame_stream: FrameStream,
         intrinsics: torch.Tensor,
         camera_type: CameraType = CameraType.PINHOLE,
-        ba_trace_path: Path | None = None,
     ) -> SLAMOutput:
-        timing: dict[str, float | int] = {}
-        total_start = time.perf_counter()
-        ba_trace_logger = BATraceLogger(ba_trace_path) if ba_trace_path is not None else None
-
-        setup_start = time.perf_counter()
         resizer = StandardResizeFrameProcessor(self.config.resize_target_pixels)
         frame_size = resizer.update_frame_size(frame_stream.frame_size())
         total_n_frames = len(frame_stream)
@@ -197,10 +186,8 @@ class SLAMSystem:
             }
         )
 
-        self._build_components(ba_trace_logger=ba_trace_logger)
-        timing["setup_s"] = time.perf_counter() - setup_start
+        self._build_components()
 
-        pass1_start = time.perf_counter()
         pass1_fmaps: list[torch.Tensor | None] = [None] * total_n_frames
         pass1_pbar = pbar(range(total_n_frames), desc="SLAM Pass (1/2)", total=total_n_frames)
         for frame_idx in pass1_pbar:
@@ -236,9 +223,6 @@ class SLAMSystem:
                     kf=self.buffer.n_frames,
                     act_fac=self.frontend.graph.num_factors,
                 )
-        timing["pass1_s"] = time.perf_counter() - pass1_start
-        timing["keyframes"] = int(self.buffer.n_frames)
-        timing["frontend_active_factors"] = int(self.frontend.graph.num_factors)
 
         logger.info(
             "SLAM pass 1 complete: keyframes=%d act_fac=%d",
@@ -247,10 +231,7 @@ class SLAMSystem:
         )
 
         # Run a global BA over the keyframes.
-        backend_start = time.perf_counter()
         backend_active_factors = self.backend.run(self.config.backend_iters)
-        timing["backend_s"] = time.perf_counter() - backend_start
-        timing["backend_active_factors"] = int(backend_active_factors)
         logger.info(
             "SLAM backend complete: keyframes=%d act_fac=%d",
             self.buffer.n_frames,
@@ -260,7 +241,6 @@ class SLAMSystem:
         keyframe_indices = [int(t) for t in self.buffer.tstamp[: self.buffer.n_frames].detach().cpu().tolist()]
 
         # Infill poses and attributes for non-keyframe frames.
-        pass2_start = time.perf_counter()
         self.inner_filler.start_after_keyframes(self.buffer.n_frames)
         for frame_idx in pbar(range(total_n_frames), desc="SLAM Pass (2/2)", total=total_n_frames):
             fmap = pass1_fmaps[frame_idx]
@@ -269,9 +249,7 @@ class SLAMSystem:
             self._add_infill_frame(frame_idx, fmap)
             if self.inner_filler.chunk_ready() or frame_idx == total_n_frames - 1:
                 self.inner_filler.fill_pending_chunk()
-        timing["pass2_s"] = time.perf_counter() - pass2_start
 
-        finalize_start = time.perf_counter()
         infill_result = self.inner_filler.get_result()
 
         # This means the iterator is exhausted early than expected in the above loop.
@@ -281,16 +259,10 @@ class SLAMSystem:
         # Scale back the intrinsics to the original size.
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics)
         trajectory = infill_result.poses.inv()
-        timing["finalize_s"] = time.perf_counter() - finalize_start
-        timing["total_s"] = time.perf_counter() - total_start
-        if ba_trace_logger is not None:
-            ba_trace_logger.close()
-            timing["ba_trace_path"] = str(ba_trace_path)
 
         output = SLAMOutput(
             trajectory=trajectory,
             intrinsics=original_intrinsics,
             keyframe_indices=keyframe_indices,
-            timing=timing,
         )
         return output

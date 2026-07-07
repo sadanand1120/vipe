@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -25,4 +25,3 @@ class SLAMOutput:
     trajectory: SE3  # (N,)
     intrinsics: torch.Tensor  # (4,)
     keyframe_indices: list[int]
-    timing: dict[str, float | int] = field(default_factory=dict)
