@@ -516,10 +516,10 @@ Important frontend config values are in `configs/default.yaml`:
 | `frontend_nms` | `1` | Non-max suppression radius for proximity factors. |
 | `frontend_max_factors` | `48` | Max active frontend factors. |
 | `frontend_max_age` | `25` | Delete active factors after this many graph updates. |
-| `frontend_init_updates` | `8` | Graph update calls during warmup initialization. |
-| `frontend_update_iters1` | `4` | First update loop after adding a keyframe. |
+| `frontend_init_updates` | `2` | Graph update calls during warmup initialization. |
+| `frontend_update_iters1` | `3` | First update loop after adding a keyframe. |
 | `frontend_update_iters2` | `2` | Extra update loop when candidate keyframe is retained. |
-| `frontend_ba_iters` | `3` | Inner BA solver iterations per frontend graph update. |
+| `frontend_ba_iters` | `2` | Inner BA solver iterations per frontend graph update. |
 
 The frontend graph is active only over keyframes. Non-keyframes do not get stored until Stage 4.
 
@@ -664,8 +664,8 @@ Backend config values:
 | `backend_thresh` | `22.0` | Distance threshold for global backend proximity edges. |
 | `backend_radius` | `2` | Forced local edge radius. |
 | `backend_nms` | `3` | Suppression radius for backend proximity edge selection. |
-| `backend_iters` | `31` | Outer backend `update_batch` steps. |
-| `backend_ba_iters` | `8` | Inner BA solver iterations per backend outer step. |
+| `backend_iters` | `17` | Outer backend `update_batch` steps. |
+| `backend_ba_iters` | `5` | Inner BA solver iterations per backend outer step. |
 | `backend_max_factors_per_keyframe` | `16` | Factor budget multiplier, so max factors is `16 * n_keyframes`. |
 | `backend_batch_size` | `8` | Source-keyframe-index batch size for DROID correlation/update. |
 | `beta` | `0.3` | Translation/rotation blend for graph proximity scoring. |
@@ -673,10 +673,10 @@ Backend config values:
 With the default values, backend performs:
 
 ```text
-31 outer update_batch steps
+17 outer update_batch steps
 1 full DROID target/weight refresh over all backend edges per outer step
-8 inner BA solver iterations per outer step
-248 total inner BA solver iterations
+5 inner BA solver iterations per outer step
+85 total inner BA solver iterations
 ```
 
 Backend state changes by cadence:
@@ -758,6 +758,8 @@ graph.add_factors(t1, pending_indices)
 for _ in range(config.infill_update_steps):
     graph.update(start_idx, total_frames, motion_only=True)
 ```
+
+The defaults run `4` graph updates with `2` inner BA solver iterations each, for `8` solver iterations per chunk.
 
 Because `motion_only=True`, the BA call fixes dense disparities:
 
