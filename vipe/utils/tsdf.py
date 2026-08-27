@@ -28,12 +28,20 @@ class TSDFVolume:
         intrinsics: np.ndarray | torch.Tensor,
         extrinsic_w2c: np.ndarray | torch.Tensor,
         depth_trunc: float,
+        bilinear_color: bool,
     ) -> None:
         depth_t = _cpu_tensor(depth, torch.float32).contiguous()
         color_t = _cpu_tensor(color, torch.uint8).contiguous()
         intrinsics_t = _cpu_tensor(intrinsics, torch.float32).contiguous()
         extrinsic_t = _cpu_tensor(extrinsic_w2c, torch.float32).contiguous()
-        self.volume.integrate(depth_t, color_t, intrinsics_t, extrinsic_t, float(depth_trunc))
+        self.volume.integrate(
+            depth_t,
+            color_t,
+            intrinsics_t,
+            extrinsic_t,
+            float(depth_trunc),
+            bool(bilinear_color),
+        )
 
     def extract_point_cloud(self, max_points: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         points, colors, normals = self.volume.extract_point_cloud(int(max_points))

@@ -825,7 +825,7 @@ def load(frame_idx):
     )
 ```
 
-`FrameDir.artifact_arrays` decodes RGB and depth on CPU. Depth is converted from millimeters to meters and nonpositive values are set to zero. This means the TSDF PCD is built from the provided sensor depth. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
+`FrameDir.artifact_arrays` decodes RGB and depth on CPU. Depth is converted from millimeters to meters and nonpositive values are set to zero. If `pcd_tsdf_depth_filter` is enabled, the artifact writer computes centered horizontal and vertical depth gradients, divides their magnitude by depth, and zeroes valid pixels whose relative gradient exceeds `pcd_tsdf_depth_filter_thresh`. The current default disables this optional filter, so the TSDF PCD is built from the provided sensor depth after only invalid-value and distance rejection. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
 
 ### Saved Artifacts
 
@@ -870,10 +870,19 @@ Per frame, the artifact writer prepares the exact arrays that the native extensi
 
 ```python
 depth = artifact_depth_m_float32
+if pcd_tsdf_depth_filter:
+    depth = relative_gradient_filter(depth, threshold=pcd_tsdf_depth_filter_thresh)
 color = rgb_uint8
 intrinsics = np.array([fx, fy, cx, cy], dtype=np.float32)
 w2c = slam_output.trajectory[frame_idx].inv().matrix()
-volume.integrate(depth, color, intrinsics, w2c, pcd_tsdf_depth_trunc_m)
+volume.integrate(
+    depth,
+    color,
+    intrinsics,
+    w2c,
+    pcd_tsdf_depth_trunc_m,
+    bilinear_color=pcd_tsdf_bilinear_color,
+)
 ```
 
 Inside native integration, the first pass determines which voxel blocks are touched by the current depth image. It lifts every `pcd_tsdf_depth_sampling_stride` depth pixel with valid depth `d <= pcd_tsdf_depth_trunc_m` into world coordinates, and opens every voxel block intersecting that point's `pcd_tsdf_sdf_trunc_m` neighborhood.
@@ -911,7 +920,7 @@ The square-root term converts optical-axis depth difference into approximate Euc
 \min\left(1,\frac{s}{\text{sdf\_trunc}}\right).
 ```
 
-The voxel stores a running weighted average:
+RGB is bilinearly sampled at the projected floating-point pixel coordinate when `pcd_tsdf_bilinear_color=true`; only image-border samples that cannot form a 2x2 neighborhood fall back to nearest-pixel RGB. The voxel stores a running weighted average:
 
 ```math
 \operatorname{tsdf}
@@ -946,8 +955,11 @@ Important output knobs in `configs/default.yaml`:
 | `pipeline.output.pcd_tsdf_voxel_edge_m` | TSDF voxel edge length in meters. |
 | `pipeline.output.pcd_tsdf_sdf_trunc_m` | Signed-distance truncation band in meters. |
 | `pipeline.output.pcd_tsdf_depth_trunc_m` | Ignore depth samples beyond this many meters. |
-| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `8`. |
-| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `128`. |
+| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `16`. |
+| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `4`. |
+| `pipeline.output.pcd_tsdf_depth_filter` | Enable relative depth-gradient filtering before TSDF integration; current default is `false`. |
+| `pipeline.output.pcd_tsdf_depth_filter_thresh` | Relative depth-gradient cutoff; current default is `0.1`. |
+| `pipeline.output.pcd_tsdf_bilinear_color` | Bilinearly sample RGB at projected subpixel coordinates. |
 
 ## ScanNet Benchmark Adapter
 

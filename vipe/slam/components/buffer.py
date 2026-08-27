@@ -34,7 +34,6 @@ from ..ba.terms import (
     DenseDepthFlowTerm,
     DispSensRegularizationTerm,
     PoseSmoothnessTerm,
-    SensorDepthGeometryTerm,
 )
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, PoseRetractor
@@ -125,7 +124,6 @@ class GraphBuffer:
         pose_damping: float,
         pose_ep: float,
         motion_only: bool,
-        use_depth_geometry: bool,
         verbose: bool,
     ):
         assert t0 <= t1
@@ -150,25 +148,6 @@ class GraphBuffer:
             ),
             HuberRobustKernel(),
         )
-
-        depth_geom_weight = float(self.ba_config.depth_geom_weight)
-        if use_depth_geometry and depth_geom_weight > 0.0 and len(ii) > 0:
-            solver.add_term(
-                SensorDepthGeometryTerm(
-                    pose_i_inds=ii,
-                    pose_j_inds=jj,
-                    sensor_disps=self.disps_sens,
-                    sensor_weights=self.disps_sens_weight,
-                    intrinsics=self.intrinsics,
-                    intrinsics_factor=8.0,
-                    image_size=(self.height // 8, self.width // 8),
-                    camera_type=self.camera_type,
-                    alpha=depth_geom_weight,
-                    points_per_factor=self.ba_config.depth_geom_points_per_factor,
-                    max_residual_m=self.ba_config.depth_geom_max_residual_m,
-                ),
-                HuberRobustKernel(),
-            )
 
         pose_smoothness_alpha = float(self.ba_config.pose_smoothness_alpha)
         if pose_smoothness_alpha > 0.0 and t1 - t0 > 0:

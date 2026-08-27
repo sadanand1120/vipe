@@ -8,7 +8,7 @@ pipeline:
     beta: 0.3                            # Translation/rotation blend for graph proximity scoring.
     filter_thresh: 2.4                   # Dense motion threshold for deciding whether to add a keyframe.
     warmup: 8                            # Keyframes collected before initializing the frontend graph.
-    max_keyframe_gap: 16                 # Force a keyframe after this many input frames even if dense motion is weak; <=0 disables.
+    max_keyframe_gap: 8                  # Force a keyframe after this many input frames even if dense motion is weak; <=0 disables.
     keyframe_thresh: 4.0                 # Frontend threshold for pruning redundant keyframes.
     frontend_thresh: 16.0                # Proximity threshold for frontend graph edge creation.
     frontend_window: 25                  # Number of recent keyframes considered by frontend optimization.
@@ -16,32 +16,32 @@ pipeline:
     frontend_nms: 1                      # Non-max suppression radius for frontend proximity edges.
     frontend_max_factors: 48             # Max active factors kept in the incremental frontend graph.
     frontend_max_age: 25                 # Delete active frontend factors after this many graph updates.
-    frontend_init_updates: 2             # Graph update calls during frontend warmup initialization.
-    frontend_update_iters1: 3            # First graph update loop after adding a new frontend keyframe.
+    frontend_init_updates: 8             # Graph update calls during frontend warmup initialization.
+    frontend_update_iters1: 4            # First graph update loop after adding a new frontend keyframe.
     frontend_update_iters2: 2            # Extra graph update loop when the candidate keyframe is retained.
-    frontend_ba_iters: 2                 # Inner BA solver iterations per frontend graph update.
+    frontend_ba_iters: 3                 # Inner BA solver iterations per frontend graph update.
     backend_thresh: 22.0                 # Proximity threshold for global backend graph edges.
     backend_radius: 2                    # Local radius for forced backend graph edges.
     backend_nms: 3                       # Non-max suppression radius for backend proximity edges.
-    backend_iters: 17                    # Global backend BA iteration steps.
-    backend_ba_iters: 5                  # Inner BA solver iterations per backend graph update.
+    backend_iters: 31                    # Global backend BA iteration steps.
+    backend_ba_iters: 8                  # Inner BA solver iterations per backend graph update.
     backend_max_factors_per_keyframe: 16 # Backend factor budget multiplier: max factors = value * keyframes.
     backend_batch_size: 8                # Keyframe-index batch size for backend DROID update/correlation.
     init_disp: 1.0                       # Initial disparity value before external sensor-depth anchors are injected.
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
-    infill_update_steps: 4              # Motion-only graph update calls for non-keyframe pose infilling; 0 uses interpolation only.
-    infill_ba_iters: 2                   # Inner BA solver iterations per infill graph update.
+    infill_update_steps: 10              # Motion-only graph update calls for non-keyframe pose infilling; 0 uses interpolation only.
+    infill_ba_iters: 3                   # Inner BA solver iterations per infill graph update.
     ba:
-      dense_disp_alpha: 0.009            # Weight for external sensor-depth regularization in BA.
-      depth_geom_weight: 0.01            # Backend-only point-to-plane sensor-depth pose term weight.
-      depth_geom_points_per_factor: 96   # Max sampled 1/8-res sensor-depth points per backend graph factor.
-      depth_geom_max_residual_m: 0.25    # Drop point-to-plane correspondences farther than this many meters.
-      pose_smoothness_alpha: 0.02        # Weak adjacent-pose velocity prior in BA; prevents single-step jumps in ambiguous views.
+      dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
+      pose_smoothness_alpha: 0.0         # Pose smoothness prior weight; zero disables it.
 
   output:
     pcd_max_points: 10000000             # Max saved TSDF PCD points.
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
     pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
-    pcd_tsdf_num_voxels_per_block_edge: 8 # Sparse TSDF block edge voxels.
-    pcd_tsdf_depth_sampling_stride: 128   # Depth-pixel stride for opening TSDF blocks.
+    pcd_tsdf_num_voxels_per_block_edge: 16 # Sparse TSDF block edge voxels.
+    pcd_tsdf_depth_sampling_stride: 4    # Depth-pixel stride for opening TSDF blocks.
+    pcd_tsdf_depth_filter: false         # Remove high-gradient depth pixels before fusion.
+    pcd_tsdf_depth_filter_thresh: 0.1    # Relative depth-gradient threshold for the pre-fusion filter.
+    pcd_tsdf_bilinear_color: true        # Bilinearly sample RGB at projected subpixel coordinates.

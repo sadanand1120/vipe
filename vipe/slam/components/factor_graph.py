@@ -53,14 +53,12 @@ class FactorGraph:
         device: torch.device,
         max_factors: int,
         incremental: bool,
-        use_depth_geometry: bool = False,
     ):
         self.net = net
         self.buffer = buffer
         self.device = device
         self.max_factors = max_factors
         self.incremental = incremental
-        self.use_depth_geometry = use_depth_geometry
 
         ht = buffer.height // 8
         wd = buffer.width // 8
@@ -228,7 +226,6 @@ class FactorGraph:
                 pose_damping=1e-3,
                 pose_ep=0.1,
                 motion_only=motion_only,
-                use_depth_geometry=False,
                 verbose=False,
             )
 
@@ -295,7 +292,6 @@ class FactorGraph:
                 pose_damping=1e-5,
                 pose_ep=1e-2,
                 motion_only=False,
-                use_depth_geometry=self.use_depth_geometry,
                 verbose=solver_verbose,
             )
 
