@@ -1,0 +1,88 @@
+{
+  "account": "IRI26004",
+  "base_image": "pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel",
+  "cluster": "stampede3",
+  "conda_env_file": null,
+  "detected_context": {
+    "active_python": {
+      "conda_default_env": null,
+      "conda_prefix": null,
+      "executable": "/home/smodak/.local/share/uv/tools/tacc-cli/bin/python",
+      "machine": "x86_64",
+      "platform": "Linux-5.15.0-1101-nvidia-x86_64-with-glibc2.35",
+      "scope": "tacc-cli process; not necessarily the target repo runtime environment",
+      "version": "3.14.6",
+      "virtual_env": null
+    },
+    "decision_questions": [],
+    "dockerfiles": [],
+    "git_remote": "git@github.com:sadanand1120/vipe.git",
+    "git_sha": "2cf899c",
+    "inside_container": false,
+    "manifests": [
+      {
+        "kind": "pyproject",
+        "path": "pyproject.toml",
+        "size_bytes": 577
+      },
+      {
+        "kind": "pyproject",
+        "path": "setup.py",
+        "size_bytes": 4991
+      }
+    ],
+    "notes": [
+      "This is a facts-only fingerprint. Agent/human chooses env_source/base_image/install_commands explicitly.",
+      "For TACC GPU work, verify CUDA/driver/framework compatibility with a smoke job on the target queue."
+    ],
+    "project_memory": {
+      "context": {
+        "exists": true,
+        "path": ".tacc/dockerify-context.json"
+      },
+      "dockerfile": {
+        "exists": false,
+        "path": ".tacc/docker/Dockerfile.tacc"
+      },
+      "exists": true,
+      "plan": {
+        "exists": false,
+        "path": ".tacc/tacc-dockerify-plan.json"
+      },
+      "reusable": false,
+      "reuse_hint": "Existing .tacc directory found, but reusable Dockerfile+plan are incomplete. Inspect before regenerating.",
+      "slurm_files": []
+    },
+    "repo_dir": "/robodata/smodak/repos/vipe",
+    "repo_name": "vipe",
+    "suggested_env_source": "pyproject"
+  },
+  "dockerfile": ".tacc/docker/Dockerfile.tacc",
+  "env_source": "pyproject",
+  "git_remote": "git@github.com:sadanand1120/vipe.git",
+  "git_sha": "2cf899c",
+  "image": "ghcr.io/sadanand1120/vipe-tacc:2cf899c",
+  "install_commands": [],
+  "install_script": null,
+  "notes": [
+    "CLI layer is deterministic: it records env facts and renders files from explicit flags; agent/human must choose ambiguous env/base-image decisions.",
+    "Build Docker image locally or on a non-TACC builder, push to GHCR, then pull to .sif from a TACC compute-node job.",
+    "Do not run apptainer pull/build/exec on TACC login nodes; use the generated pull/smoke Slurm scripts or an idev allocation.",
+    "Slurm jobs run the synced remote repo under $WORK/projects/<project> and put active outputs under $SCRATCH/runs.",
+    "Default PyTorch base targets NVIDIA driver 580+ with CUDA 12.8 for Turing/Ampere/Hopper/Blackwell coverage; smoke-test before real jobs."
+  ],
+  "plan_schema_version": 2,
+  "project_name": "vipe-tacc",
+  "pyproject_file": "pyproject.toml",
+  "queue": "h100",
+  "remote_project_dir": "$WORK/projects/vipe-tacc",
+  "repo_dir": "/robodata/smodak/repos/vipe",
+  "requirements_file": null,
+  "run_command": "python3 /opt/vipe/scripts/scannet_vipe_bench_evaluator.py --work-dir \"$RUN_DIR\" --input-root \"$SCRATCH/datasets/scannet_v2/vipe_format\" --raw-root \"$SCRATCH/datasets/scannet_v2/scans\" --do-final-eval",
+  "sif_path": "$WORK/images/vipe-2cf899c-cu128.sif",
+  "slurm_pull": ".tacc/slurm/pull_image_stampede3.slurm",
+  "slurm_run": ".tacc/slurm/run_full_tacc_h100.slurm",
+  "slurm_smoke": ".tacc/slurm/smoke_h100.slurm",
+  "smoke_command": "python3 -c \"import torch, open3d, vipe_ext; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())\"",
+  "source_dockerfile": null
+}

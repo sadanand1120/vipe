@@ -1,0 +1,54 @@
+{
+  "active_python": {
+    "conda_default_env": null,
+    "conda_prefix": null,
+    "executable": "/home/smodak/.local/share/uv/tools/tacc-cli/bin/python",
+    "machine": "x86_64",
+    "platform": "Linux-5.15.0-1101-nvidia-x86_64-with-glibc2.35",
+    "scope": "tacc-cli process; not necessarily the target repo runtime environment",
+    "version": "3.14.6",
+    "virtual_env": null
+  },
+  "decision_questions": [],
+  "dockerfiles": [],
+  "git_remote": "git@github.com:sadanand1120/vipe.git",
+  "git_sha": "2cf899c",
+  "inside_container": false,
+  "manifests": [
+    {
+      "kind": "pyproject",
+      "path": "pyproject.toml",
+      "size_bytes": 577
+    },
+    {
+      "kind": "pyproject",
+      "path": "setup.py",
+      "size_bytes": 4991
+    }
+  ],
+  "notes": [
+    "This is a facts-only fingerprint. Agent/human chooses env_source/base_image/install_commands explicitly.",
+    "For TACC GPU work, verify CUDA/driver/framework compatibility with a smoke job on the target queue."
+  ],
+  "project_memory": {
+    "context": {
+      "exists": true,
+      "path": ".tacc/dockerify-context.json"
+    },
+    "dockerfile": {
+      "exists": false,
+      "path": ".tacc/docker/Dockerfile.tacc"
+    },
+    "exists": true,
+    "plan": {
+      "exists": false,
+      "path": ".tacc/tacc-dockerify-plan.json"
+    },
+    "reusable": false,
+    "reuse_hint": "Existing .tacc directory found, but reusable Dockerfile+plan are incomplete. Inspect before regenerating.",
+    "slurm_files": []
+  },
+  "repo_dir": "/robodata/smodak/repos/vipe",
+  "repo_name": "vipe",
+  "suggested_env_source": "pyproject"
+}

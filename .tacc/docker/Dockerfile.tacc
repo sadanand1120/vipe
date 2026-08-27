@@ -1,0 +1,40 @@
+ARG BASE_IMAGE=pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+FROM ${BASE_IMAGE}
+
+ARG VIPE_GIT_SHA=2cf899c83e7018c1257733537d80ceb2bceb3a72
+LABEL org.opencontainers.image.source="https://github.com/sadanand1120/vipe" \
+      org.opencontainers.image.revision="${VIPE_GIT_SHA}"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    CONDA_PREFIX=/opt/conda/envs/vipe-manual \
+    PATH=/opt/conda/envs/vipe-manual/bin:${PATH} \
+    TORCH_HOME=/opt/vipe-cache/torch \
+    TORCH_CUDA_ARCH_LIST="7.5;8.6;8.7;9.0+PTX"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash build-essential ca-certificates git libgl1 libglib2.0-0 libgomp1 \
+      openssh-client pkg-config rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN conda create -y -n vipe-manual python=3.10 pip \
+    && conda clean -afy
+
+COPY .tacc/requirements-tacc.txt /tmp/requirements-tacc.txt
+RUN python -m pip install --upgrade pip==26.0.1 setuptools==70.2.0 wheel==0.47.0 \
+    && python -m pip install \
+      torch==2.7.0+cu128 torchvision==0.22.0+cu128 \
+      --index-url https://download.pytorch.org/whl/cu128 \
+    && python -m pip install -r /tmp/requirements-tacc.txt
+
+RUN mkdir -p "${TORCH_HOME}/hub/droid_slam" \
+    && python -c "import gdown; gdown.download(id='1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh', output='${TORCH_HOME}/hub/droid_slam/droid.pth')" \
+    && echo "46476ef64cde45a97504910d6f3de2eef7b398ec1c6e4e668815c29076024526  ${TORCH_HOME}/hub/droid_slam/droid.pth" | sha256sum -c -
+
+COPY . /opt/vipe
+WORKDIR /opt/vipe
+RUN python -m pip install --no-build-isolation --no-deps -e . \
+    && python -c "import torch, vipe, vipe_ext; assert torch.__version__ == '2.7.0+cu128'; print(vipe.__version__, vipe_ext.__file__)"
+
+CMD ["bash"]
