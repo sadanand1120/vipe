@@ -16,6 +16,8 @@ WORKSPACE="${SCRATCH_ROOT}/runs/vipe/${RUN_NAME}"
 INPUT_ROOT="${SCRATCH_ROOT}/datasets/scannet_v2/vipe_format"
 RAW_ROOT="${SCRATCH_ROOT}/datasets/scannet_v2/scans"
 REFERENCE=/opt/vipe/.tacc/full13_reference.json
+VIPE_GIT_SHA=${VIPE_GIT_SHA:-unknown}
+VIPE_IMAGE=${VIPE_IMAGE:-unknown}
 
 export CUDA_VISIBLE_DEVICES="${GPU_LIST}"
 export PYTHONHASHSEED=42
@@ -34,20 +36,20 @@ elif [[ "${MODE}" != "full" ]]; then
 fi
 mkdir -p "${WORKSPACE}"
 
-python3 - "${WORKSPACE}" "${RUN_NAME}" "${MODE}" <<'PY'
+python3 - "${WORKSPACE}" "${RUN_NAME}" "${MODE}" "${VIPE_GIT_SHA}" "${VIPE_IMAGE}" <<'PY'
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-workspace, run_name, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+workspace, run_name, mode, git_sha, image = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 metadata = {
     "status": "running",
     "run_name": run_name,
     "mode": mode,
-    "git_sha": "2cf899c83e7018c1257733537d80ceb2bceb3a72",
-    "image": "ghcr.io/sadanand1120/vipe-tacc:2cf899c",
+    "git_sha": git_sha,
+    "image": image,
     "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     "slurm_partition": os.environ.get("SLURM_JOB_PARTITION"),
     "slurm_node": os.environ.get("SLURMD_NODENAME"),

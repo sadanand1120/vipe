@@ -31,19 +31,19 @@ python3 "${PROJECT_DIR}/.tacc/validate_eval.py" \
     --reference "${PROJECT_DIR}/.tacc/full13_reference.json" \
     --write-success
 
-python3 - "${PARTIAL_DIR}" "${SOURCE_DIR}" <<'PY'
+python3 - "${PARTIAL_DIR}" "${SOURCE_DIR}" "${VIPE_GIT_SHA:-unknown}" <<'PY'
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-destination, source = Path(sys.argv[1]), sys.argv[2]
+destination, source, git_sha = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 payload = {
     "source": source,
     "archived_at": datetime.now(timezone.utc).isoformat(),
     "archive_job_id": os.environ.get("SLURM_JOB_ID"),
-    "git_sha": "2cf899c83e7018c1257733537d80ceb2bceb3a72",
+    "git_sha": git_sha,
 }
 (destination / "_ARCHIVE_COMPLETE.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
