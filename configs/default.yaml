@@ -8,7 +8,7 @@ pipeline:
     beta: 0.3                            # Translation/rotation blend for graph proximity scoring.
     filter_thresh: 2.4                   # Dense motion threshold for deciding whether to add a keyframe.
     warmup: 8                            # Keyframes collected before initializing the frontend graph.
-    max_keyframe_gap: 8                  # Force a keyframe after this many input frames even if dense motion is weak; <=0 disables.
+    max_keyframe_gap: 16                 # Force a keyframe after this many input frames even if dense motion is weak; <=0 disables.
     keyframe_thresh: 4.0                 # Frontend threshold for pruning redundant keyframes.
     frontend_thresh: 16.0                # Proximity threshold for frontend graph edge creation.
     frontend_window: 25                  # Number of recent keyframes considered by frontend optimization.
@@ -40,8 +40,8 @@ pipeline:
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
     pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
-    pcd_tsdf_num_voxels_per_block_edge: 16 # Sparse TSDF block edge voxels.
-    pcd_tsdf_depth_sampling_stride: 4    # Depth-pixel stride for opening TSDF blocks.
+    pcd_tsdf_num_voxels_per_block_edge: 8 # Sparse TSDF block edge voxels.
+    pcd_tsdf_depth_sampling_stride: 8    # Depth-pixel stride for opening TSDF blocks.
     pcd_tsdf_depth_filter: false         # Remove high-gradient depth pixels before fusion.
     pcd_tsdf_depth_filter_thresh: 0.1    # Relative depth-gradient threshold for the pre-fusion filter.
     pcd_tsdf_bilinear_color: true        # Bilinearly sample RGB at projected subpixel coordinates.
