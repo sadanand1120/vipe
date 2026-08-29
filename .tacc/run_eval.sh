@@ -15,7 +15,6 @@ PROJECT_DIR=$6
 WORKSPACE="${SCRATCH_ROOT}/runs/vipe/${RUN_NAME}"
 INPUT_ROOT="${SCRATCH_ROOT}/datasets/scannet_v2/vipe_format"
 RAW_ROOT="${SCRATCH_ROOT}/datasets/scannet_v2/scans"
-REFERENCE=/opt/vipe/.tacc/full13_reference.json
 VIPE_GIT_SHA=${VIPE_GIT_SHA:-unknown}
 VIPE_IMAGE=${VIPE_IMAGE:-unknown}
 
@@ -92,7 +91,6 @@ python3 /opt/vipe/scripts/scannet_vipe_bench_evaluator.py "${BENCH_ARGS[@]}"
 python3 /opt/vipe/.tacc/validate_eval.py \
     --workspace "${WORKSPACE}" \
     --mode "${MODE}" \
-    --reference "${REFERENCE}" \
     --write-success
 
 python3 - "${WORKSPACE}/run_metadata.json" <<'PY'

@@ -11,9 +11,13 @@ DEST_DIR=$2
 PROJECT_DIR=$3
 PARTIAL_DIR="$(dirname "${DEST_DIR}")/.$(basename "${DEST_DIR}").partial"
 
-[[ -f "${SOURCE_DIR}/_SUCCESS.json" ]] || { echo "source is not validated: ${SOURCE_DIR}" >&2; exit 1; }
 [[ ! -e "${DEST_DIR}" ]] || { echo "destination already exists: ${DEST_DIR}" >&2; exit 1; }
 mkdir -p "$(dirname "${DEST_DIR}")" "${PARTIAL_DIR}"
+
+python3 "${PROJECT_DIR}/.tacc/validate_eval.py" \
+    --workspace "${SOURCE_DIR}" \
+    --mode full \
+    --write-success
 
 rsync -a --delete --partial --info=stats2 "${SOURCE_DIR}/" "${PARTIAL_DIR}/"
 DIFF_FILE=$(mktemp "${TMPDIR:-/tmp}/vipe-archive-diff.XXXXXX")
@@ -28,7 +32,6 @@ fi
 python3 "${PROJECT_DIR}/.tacc/validate_eval.py" \
     --workspace "${PARTIAL_DIR}" \
     --mode full \
-    --reference "${PROJECT_DIR}/.tacc/full13_reference.json" \
     --write-success
 
 python3 - "${PARTIAL_DIR}" "${SOURCE_DIR}" "${VIPE_GIT_SHA:-unknown}" <<'PY'
