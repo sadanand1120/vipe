@@ -31,9 +31,7 @@ pipeline:
     infill_chunk_size: 16                # Chunk size for filling non-keyframe poses between keyframes.
     infill_update_steps: 4               # Motion-only graph update calls for non-keyframe pose infilling; 0 uses interpolation only.
     infill_ba_iters: 2                   # Inner BA solver iterations per infill graph update.
-    ba:
-      dense_disp_alpha: 0.001            # Weight for external sensor-depth regularization in BA.
-      pose_smoothness_alpha: 0.0         # Pose smoothness prior weight; zero disables it.
+    dense_disp_alpha: 0.001              # Weight for external sensor-depth regularization in BA.
 
   output:
     pcd_max_points: 10000000             # Max saved TSDF PCD points.
@@ -42,6 +40,3 @@ pipeline:
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.
     pcd_tsdf_num_voxels_per_block_edge: 8 # Sparse TSDF block edge voxels.
     pcd_tsdf_depth_sampling_stride: 8    # Depth-pixel stride for opening TSDF blocks.
-    pcd_tsdf_depth_filter: false         # Remove high-gradient depth pixels before fusion.
-    pcd_tsdf_depth_filter_thresh: 0.1    # Relative depth-gradient threshold for the pre-fusion filter.
-    pcd_tsdf_bilinear_color: true        # Bilinearly sample RGB at projected subpixel coordinates.

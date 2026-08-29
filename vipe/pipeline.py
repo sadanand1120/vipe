@@ -82,9 +82,6 @@ class VipePipeline:
             pcd_tsdf_depth_trunc_m=self.out_cfg.pcd_tsdf_depth_trunc_m,
             pcd_tsdf_num_voxels_per_block_edge=self.out_cfg.pcd_tsdf_num_voxels_per_block_edge,
             pcd_tsdf_depth_sampling_stride=self.out_cfg.pcd_tsdf_depth_sampling_stride,
-            pcd_tsdf_depth_filter=self.out_cfg.pcd_tsdf_depth_filter,
-            pcd_tsdf_depth_filter_thresh=self.out_cfg.pcd_tsdf_depth_filter_thresh,
-            pcd_tsdf_bilinear_color=self.out_cfg.pcd_tsdf_bilinear_color,
         )
 
     def run(self, frame_stream: FrameStream) -> SLAMOutput:

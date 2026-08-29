@@ -435,7 +435,6 @@ Important buffer fields:
 | Field | Shape | Meaning |
 | --- | --- | --- |
 | `tstamp` | `(buffer,)` | Canonical stream frame index for each buffered keyframe. |
-| `images` | `(buffer,3,H,W)` | Resized/cropped RGB keyframes, float16. |
 | `poses` | `(buffer,7)` | World-to-camera SE3 pose parameters. |
 | `intrinsics` | `(4,)` | Shared resized/cropped `[fx,fy,cx,cy]`. |
 | `disps` | `(buffer,H/8,W/8)` | Optimized dense disparity maps. |
@@ -457,12 +456,11 @@ images = frame_data.rgb.permute(2, 0, 1)[None]
 motion_result = self.motion_filter.check(images)
 ```
 
-If `motion_result.is_keyframe` is true, or if this is the final frame, the frame is stored in the buffer:
+If `motion_result.is_keyframe` is true, the configured maximum keyframe gap is reached, or this is the final frame, the frame is stored in the buffer:
 
 ```python
 kf_idx = self.buffer.n_frames
 self.buffer.tstamp[kf_idx] = frame_idx
-self.buffer.images[kf_idx] = images[0]
 self.buffer.fmaps[kf_idx] = motion_result.fmap[0]
 self.buffer.nets[kf_idx], self.buffer.inps[kf_idx] = motion_result.net[0], motion_result.inp[0]
 self.buffer.n_frames += 1
@@ -576,7 +574,7 @@ where:
 
 | Symbol | Code |
 | --- | --- |
-| `alpha` | `pipeline.slam.ba.dense_disp_alpha` |
+| `alpha` | `pipeline.slam.dense_disp_alpha` |
 | `d_i` | `GraphBuffer.disps` |
 | `d_sens,i` | `GraphBuffer.disps_sens` |
 | `m_i` | `GraphBuffer.disps_sens_weight` |
@@ -686,7 +684,7 @@ Backend state changes by cadence:
 | Fixed for backend run | Backend `FactorGraph.ii/jj` edge list, `GraphBuffer` identity, DROID weights, shared intrinsics. |
 | Once per backend outer step | `FactorGraph.target`, `FactorGraph.weight`, `FactorGraph.damping`, `FactorGraph.f_net`. |
 | During inner BA solver iterations | `GraphBuffer.poses`, `GraphBuffer.disps`. |
-| Not changed by backend | `GraphBuffer.n_frames`, `images`, `fmaps`, `nets`, `inps`, `disps_sens`, `disps_sens_weight`, backend edge set. |
+| Not changed by backend | `GraphBuffer.n_frames`, `fmaps`, `nets`, `inps`, `disps_sens`, `disps_sens_weight`, backend edge set. |
 
 Exact backend BA call path:
 
@@ -827,7 +825,7 @@ def load(frame_idx):
     )
 ```
 
-`FrameDir.artifact_arrays` decodes RGB and depth on CPU. Depth is converted from millimeters to meters and nonpositive values are set to zero. If `pcd_tsdf_depth_filter` is enabled, the artifact writer computes centered horizontal and vertical depth gradients, divides their magnitude by depth, and zeroes valid pixels whose relative gradient exceeds `pcd_tsdf_depth_filter_thresh`. The current default disables this optional filter, so the TSDF PCD is built from the provided sensor depth after only invalid-value and distance rejection. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
+`FrameDir.artifact_arrays` decodes RGB and depth on CPU. Depth is converted from millimeters to meters and nonpositive values are set to zero. The TSDF PCD uses that sensor depth directly; native integration rejects nonfinite, nonpositive, and out-of-range samples. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
 
 ### Saved Artifacts
 
@@ -872,8 +870,6 @@ Per frame, the artifact writer prepares the exact arrays that the native extensi
 
 ```python
 depth = artifact_depth_m_float32
-if pcd_tsdf_depth_filter:
-    depth = relative_gradient_filter(depth, threshold=pcd_tsdf_depth_filter_thresh)
 color = rgb_uint8
 intrinsics = np.array([fx, fy, cx, cy], dtype=np.float32)
 w2c = slam_output.trajectory[frame_idx].inv().matrix()
@@ -883,7 +879,6 @@ volume.integrate(
     intrinsics,
     w2c,
     pcd_tsdf_depth_trunc_m,
-    bilinear_color=pcd_tsdf_bilinear_color,
 )
 ```
 
@@ -922,7 +917,7 @@ The square-root term converts optical-axis depth difference into approximate Euc
 \min\left(1,\frac{s}{\text{sdf\_trunc}}\right).
 ```
 
-RGB is bilinearly sampled at the projected floating-point pixel coordinate when `pcd_tsdf_bilinear_color=true`; only image-border samples that cannot form a 2x2 neighborhood fall back to nearest-pixel RGB. The voxel stores a running weighted average:
+RGB is bilinearly sampled at the projected floating-point pixel coordinate; only image-border samples that cannot form a 2x2 neighborhood fall back to nearest-pixel RGB. The voxel stores a running weighted average:
 
 ```math
 \operatorname{tsdf}
@@ -957,11 +952,8 @@ Important output knobs in `configs/default.yaml`:
 | `pipeline.output.pcd_tsdf_voxel_edge_m` | TSDF voxel edge length in meters. |
 | `pipeline.output.pcd_tsdf_sdf_trunc_m` | Signed-distance truncation band in meters. |
 | `pipeline.output.pcd_tsdf_depth_trunc_m` | Ignore depth samples beyond this many meters. |
-| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `16`. |
-| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `4`. |
-| `pipeline.output.pcd_tsdf_depth_filter` | Enable relative depth-gradient filtering before TSDF integration; current default is `false`. |
-| `pipeline.output.pcd_tsdf_depth_filter_thresh` | Relative depth-gradient cutoff; current default is `0.1`. |
-| `pipeline.output.pcd_tsdf_bilinear_color` | Bilinearly sample RGB at projected subpixel coordinates. |
+| `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `8`. |
+| `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `8`. |
 
 ## ScanNet Benchmark Adapter
 
@@ -1059,10 +1051,11 @@ The printed summary reports mean scale and individual scene scales in parenthese
 
 ### Benchmark Parallelism
 
-If `CUDA_VISIBLE_DEVICES` contains multiple GPUs and the process is not already a worker, the benchmark script spawns one worker process per visible GPU. Scenes are partitioned by scene index modulo GPU count:
+If `CUDA_VISIBLE_DEVICES` contains multiple GPUs and the process is not already a worker, the benchmark script spawns one worker process per visible GPU. Build workers dynamically claim the next unprocessed scene from a shared locked queue, so a worker that finishes early immediately receives another scene:
 
 ```python
-scenes = [scene for idx, scene in enumerate(all_scenes) if idx % total_gpus == gpu_id]
+while scene := claim_next_scene(queue_path):
+    build_scene(scene)
 ```
 
 Each build worker writes timing JSON under:
@@ -1094,7 +1087,7 @@ Important runtime config values:
 | `pipeline.slam.buffer` | Max number of keyframes kept in the graph buffer. |
 | `pipeline.slam.resize_target_pixels` | SLAM working image area before the 8px-aligned resize/crop. |
 | `pipeline.slam.filter_thresh` | Motion threshold for keyframe creation. |
-| `pipeline.slam.ba.dense_disp_alpha` | Weight for external sensor-depth disparity regularization. |
+| `pipeline.slam.dense_disp_alpha` | Weight for external sensor-depth disparity regularization. |
 | `pipeline.slam.infill_chunk_size` | Non-keyframe pose infill chunk size. |
 | `pipeline.slam.infill_update_steps` | Outer graph update calls per non-keyframe infill chunk. |
 | `pipeline.slam.infill_ba_iters` | Inner BA solver iterations per infill graph update. |

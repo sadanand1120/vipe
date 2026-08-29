@@ -33,7 +33,6 @@ from ..ba.kernel import HuberRobustKernel
 from ..ba.terms import (
     DenseDepthFlowTerm,
     DispSensRegularizationTerm,
-    PoseSmoothnessTerm,
 )
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, PoseRetractor
@@ -49,7 +48,7 @@ class GraphBuffer:
         width: int,
         buffer_size: int,
         init_disp: float,
-        ba_config,
+        dense_disp_alpha: float,
         camera_type: CameraType,
         device: torch.device = torch.device("cuda"),
     ):
@@ -58,7 +57,7 @@ class GraphBuffer:
         self.height = height
         self.width = width
         self.device = device
-        self.ba_config = ba_config
+        self.dense_disp_alpha = dense_disp_alpha
         self.camera_type = camera_type
 
         assert self.height % 8 == 0 and self.width % 8 == 0
@@ -149,22 +148,6 @@ class GraphBuffer:
             HuberRobustKernel(),
         )
 
-        pose_smoothness_alpha = float(self.ba_config.pose_smoothness_alpha)
-        if pose_smoothness_alpha > 0.0 and t1 - t0 > 0:
-            smooth_start = t0 if motion_only else max(t0 - 1, 0)
-            if smooth_start < t1 - 1:
-                smooth_i = torch.arange(smooth_start, t1 - 1, dtype=torch.long, device=self.device)
-                smooth_j = smooth_i + 1
-                frame_dt = (self.tstamp[smooth_j] - self.tstamp[smooth_i]).abs().float().clamp_min(1.0)
-                solver.add_term(
-                    PoseSmoothnessTerm(
-                        pose_i_inds=smooth_i,
-                        pose_j_inds=smooth_j,
-                        alpha=pose_smoothness_alpha,
-                        scale=frame_dt.rsqrt(),
-                    )
-                )
-
         solver.set_fixed(
             "pose",
             (torch.cat([pose_i_unique[pose_i_unique < t0], pose_i_unique[pose_i_unique >= t1]]) if t0 < t1 else None),
@@ -180,7 +163,7 @@ class GraphBuffer:
                 solver.add_term(
                     DispSensRegularizationTerm(
                         i_inds=sens_i_inds,
-                        alpha=self.ba_config.dense_disp_alpha,
+                        alpha=self.dense_disp_alpha,
                         disps_sens=disps_sens,
                         disps_sens_weight=disps_sens_weight,
                     )

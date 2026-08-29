@@ -97,29 +97,13 @@ def _integrate_tsdf_frame(
     volume,
     frame_data: ArtifactFrame,
     depth_trunc: float,
-    depth_filter: bool,
-    depth_filter_thresh: float,
-    bilinear_color: bool,
 ) -> None:
-    depth = frame_data.depth.copy()
-    color = frame_data.color
-    intrinsics = frame_data.intrinsics
-
-    if depth_filter:
-        gu = np.zeros_like(depth)
-        gv = np.zeros_like(depth)
-        gu[:, 1:-1] = np.abs(depth[:, 2:] - depth[:, :-2]) * 0.5
-        gv[1:-1, :] = np.abs(depth[2:, :] - depth[:-2, :]) * 0.5
-        rel_grad = np.sqrt(gu * gu + gv * gv) / np.maximum(depth, 1e-3)
-        depth[(rel_grad > depth_filter_thresh) & (depth > 0.0)] = 0.0
-
     volume.integrate(
-        depth,
-        color,
-        intrinsics,
+        frame_data.depth,
+        frame_data.color,
+        frame_data.intrinsics,
         frame_data.w2c_matrix,
         depth_trunc,
-        bilinear_color=bilinear_color,
     )
 
 
@@ -135,15 +119,12 @@ def save_artifacts(
     out_path: ArtifactPath,
     load_frame: Callable[[int], ArtifactFrame],
     n_frames: int,
-    max_pcd_points: int = 10_000_000,
-    pcd_tsdf_voxel_edge_m: float = 0.02,
-    pcd_tsdf_sdf_trunc_m: float = 0.15,
-    pcd_tsdf_depth_trunc_m: float = 10.0,
-    pcd_tsdf_num_voxels_per_block_edge: int = 16,
-    pcd_tsdf_depth_sampling_stride: int = 4,
-    pcd_tsdf_depth_filter: bool = True,
-    pcd_tsdf_depth_filter_thresh: float = 0.1,
-    pcd_tsdf_bilinear_color: bool = True,
+    max_pcd_points: int,
+    pcd_tsdf_voxel_edge_m: float,
+    pcd_tsdf_sdf_trunc_m: float,
+    pcd_tsdf_depth_trunc_m: float,
+    pcd_tsdf_num_voxels_per_block_edge: int,
+    pcd_tsdf_depth_sampling_stride: int,
 ) -> None:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
@@ -171,9 +152,6 @@ def save_artifacts(
             tsdf_volume,
             frame_data,
             pcd_tsdf_depth_trunc_m,
-            pcd_tsdf_depth_filter,
-            pcd_tsdf_depth_filter_thresh,
-            pcd_tsdf_bilinear_color,
         )
 
     if len(pose_list) > 0:

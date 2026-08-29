@@ -47,10 +47,10 @@ Useful output knobs in `configs/default.yaml`:
 
 - `pipeline.output.pcd_max_points=10000000`: cap saved TSDF point cloud points.
 - `pipeline.output.pcd_tsdf_depth_trunc_m=5.0`: ignore sensor depth beyond 5 meters.
-- `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=16`: TSDF voxel block edge size.
-- `pipeline.output.pcd_tsdf_depth_sampling_stride=4`: sample every fourth depth pixel when opening TSDF voxel blocks.
-- `pipeline.output.pcd_tsdf_depth_filter=false`: optional high-gradient depth-boundary rejection, currently disabled.
-- `pipeline.output.pcd_tsdf_bilinear_color=true`: bilinearly sample RGB during fusion.
+- `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=8`: TSDF voxel block edge size.
+- `pipeline.output.pcd_tsdf_depth_sampling_stride=8`: sample every eighth depth pixel when opening TSDF voxel blocks.
+
+TSDF fusion uses the provided sensor depth directly and bilinearly samples RGB at projected subpixel coordinates.
 
 Saved artifacts:
 

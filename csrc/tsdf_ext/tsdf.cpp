@@ -207,8 +207,7 @@ class TSDFVolume {
                    torch::Tensor color,
                    torch::Tensor intrinsics_tensor,
                    torch::Tensor extrinsic_tensor,
-                   double depth_trunc,
-                   bool bilinear_color) {
+                   double depth_trunc) {
         depth = depth.contiguous();
         color = color.contiguous();
         TORCH_CHECK(depth.device().is_cpu(), "depth must be a CPU tensor");
@@ -330,31 +329,24 @@ class TSDFVolume {
                             float r;
                             float g;
                             float b;
-                            if (bilinear_color) {
-                                const float color_u = u_f - 0.5f;
-                                const float color_v = v_f - 0.5f;
-                                const int u0 = static_cast<int>(std::floor(color_u));
-                                const int v0 = static_cast<int>(std::floor(color_v));
-                                if (u0 >= 0 && u0 + 1 < width && v0 >= 0 && v0 + 1 < height) {
-                                    const float fu = color_u - static_cast<float>(u0);
-                                    const float fv = color_v - static_cast<float>(v0);
-                                    const float w00 = (1.0f - fu) * (1.0f - fv);
-                                    const float w10 = fu * (1.0f - fv);
-                                    const float w01 = (1.0f - fu) * fv;
-                                    const float w11 = fu * fv;
-                                    const uint8_t *c00 = color_ptr + (v0 * width + u0) * 3;
-                                    const uint8_t *c10 = color_ptr + (v0 * width + u0 + 1) * 3;
-                                    const uint8_t *c01 = color_ptr + ((v0 + 1) * width + u0) * 3;
-                                    const uint8_t *c11 = color_ptr + ((v0 + 1) * width + u0 + 1) * 3;
-                                    r = w00 * c00[0] + w10 * c10[0] + w01 * c01[0] + w11 * c11[0];
-                                    g = w00 * c00[1] + w10 * c10[1] + w01 * c01[1] + w11 * c11[1];
-                                    b = w00 * c00[2] + w10 * c10[2] + w01 * c01[2] + w11 * c11[2];
-                                } else {
-                                    const uint8_t *rgb = color_ptr + (v * width + u) * 3;
-                                    r = static_cast<float>(rgb[0]);
-                                    g = static_cast<float>(rgb[1]);
-                                    b = static_cast<float>(rgb[2]);
-                                }
+                            const float color_u = u_f - 0.5f;
+                            const float color_v = v_f - 0.5f;
+                            const int u0 = static_cast<int>(std::floor(color_u));
+                            const int v0 = static_cast<int>(std::floor(color_v));
+                            if (u0 >= 0 && u0 + 1 < width && v0 >= 0 && v0 + 1 < height) {
+                                const float fu = color_u - static_cast<float>(u0);
+                                const float fv = color_v - static_cast<float>(v0);
+                                const float w00 = (1.0f - fu) * (1.0f - fv);
+                                const float w10 = fu * (1.0f - fv);
+                                const float w01 = (1.0f - fu) * fv;
+                                const float w11 = fu * fv;
+                                const uint8_t *c00 = color_ptr + (v0 * width + u0) * 3;
+                                const uint8_t *c10 = color_ptr + (v0 * width + u0 + 1) * 3;
+                                const uint8_t *c01 = color_ptr + ((v0 + 1) * width + u0) * 3;
+                                const uint8_t *c11 = color_ptr + ((v0 + 1) * width + u0 + 1) * 3;
+                                r = w00 * c00[0] + w10 * c10[0] + w01 * c01[0] + w11 * c11[0];
+                                g = w00 * c00[1] + w10 * c10[1] + w01 * c01[1] + w11 * c11[1];
+                                b = w00 * c00[2] + w10 * c10[2] + w01 * c01[2] + w11 * c11[2];
                             } else {
                                 const uint8_t *rgb = color_ptr + (v * width + u) * 3;
                                 r = static_cast<float>(rgb[0]);
@@ -798,10 +790,9 @@ static void write_binary_ply(
 void pybind_tsdf_ext(py::module &m) {
     py::class_<tsdf_ext::TSDFVolume>(m, "TSDFVolume")
             .def(py::init<double, double, int, int>(), py::arg("voxel_edge_m"), py::arg("sdf_trunc_m"),
-                 py::arg("num_voxels_per_block_edge") = 16, py::arg("depth_sampling_stride") = 4)
+                 py::arg("num_voxels_per_block_edge"), py::arg("depth_sampling_stride"))
             .def("integrate", &tsdf_ext::TSDFVolume::integrate, py::arg("depth"), py::arg("color"),
                  py::arg("intrinsics"), py::arg("extrinsic"), py::arg("depth_trunc"),
-                 py::arg("bilinear_color"),
                  py::call_guard<py::gil_scoped_release>())
             .def("extract_point_cloud", &tsdf_ext::TSDFVolume::extract_point_cloud, py::arg("max_points"),
                  py::call_guard<py::gil_scoped_release>());

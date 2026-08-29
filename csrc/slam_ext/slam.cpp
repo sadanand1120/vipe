@@ -9,9 +9,6 @@
 
 namespace slam_ext {
 
-torch::Tensor depth_filter_cuda(torch::Tensor poses, torch::Tensor disps, torch::Tensor intrinsics, torch::Tensor ix,
-                                torch::Tensor thresh);
-
 torch::Tensor frame_distance_cuda(torch::Tensor poses, torch::Tensor disps, torch::Tensor intrinsics, torch::Tensor pi,
                                   torch::Tensor pj, torch::Tensor qi, torch::Tensor qj, torch::Tensor di,
                                   const float beta);
@@ -32,6 +29,5 @@ void pybind_slam_ext(py::module &m) {
     m.def("ba", &slam_ext::ba_cuda, "bundle adjustment");
     m.def("frame_distance", &slam_ext::frame_distance_cuda, "frame_distance");
     m.def("projmap", &slam_ext::projmap_cuda, "projmap");
-    m.def("depth_filter", &slam_ext::depth_filter_cuda, "depth_filter");
     m.def("iproj", &slam_ext::iproj_cuda, "back projection");
 }

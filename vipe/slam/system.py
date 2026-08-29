@@ -99,7 +99,7 @@ class SLAMSystem:
             width=self.config.width,
             buffer_size=self.config.buffer,
             init_disp=self.config.init_disp,
-            ba_config=self.config.ba,
+            dense_disp_alpha=self.config.dense_disp_alpha,
             camera_type=self.config.camera_type,
             device=self.device,
         )
