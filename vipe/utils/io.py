@@ -44,27 +44,25 @@ class ArtifactPath:
 
 
 @dataclass(slots=True)
-class ArtifactFrame:
-    frame_idx: int
+class TSDFFrame:
     color: np.ndarray
     depth: np.ndarray
-    pose_matrix: np.ndarray
     w2c_matrix: np.ndarray
     intrinsics: np.ndarray
 
 
 def _prefetch_frames(
-    load_frame: Callable[[int], ArtifactFrame],
+    load_frame: Callable[[int], TSDFFrame],
     n_frames: int,
     max_prefetch: int = 16,
     num_workers: int = 4,
-) -> Iterator[ArtifactFrame]:
-    def load(frame_idx: int) -> ArtifactFrame:
+) -> Iterator[TSDFFrame]:
+    def load(frame_idx: int) -> TSDFFrame:
         return load_frame(frame_idx)
 
     with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="vipe-artifact-load") as pool:
         next_submit = 0
-        pending: dict[int, Future[ArtifactFrame]] = {}
+        pending: dict[int, Future[TSDFFrame]] = {}
 
         def submit_ready() -> None:
             nonlocal next_submit
@@ -95,7 +93,7 @@ def _make_tsdf_volume(
 
 def _integrate_tsdf_frame(
     volume,
-    frame_data: ArtifactFrame,
+    frame_data: TSDFFrame,
     depth_trunc: float,
 ) -> None:
     volume.integrate(
@@ -117,8 +115,8 @@ def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
 
 def save_artifacts(
     out_path: ArtifactPath,
-    load_frame: Callable[[int], ArtifactFrame],
-    n_frames: int,
+    pose_matrices: np.ndarray,
+    load_frame: Callable[[int], TSDFFrame],
     max_pcd_points: int,
     pcd_tsdf_voxel_edge_m: float,
     pcd_tsdf_sdf_trunc_m: float,
@@ -130,7 +128,7 @@ def save_artifacts(
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
     """
 
-    pose_list = []
+    n_frames = len(pose_matrices)
     tsdf_volume = _make_tsdf_volume(
         pcd_tsdf_voxel_edge_m,
         pcd_tsdf_sdf_trunc_m,
@@ -144,9 +142,7 @@ def save_artifacts(
             frame_data = next(frame_iter)
         except StopIteration as exc:
             raise ValueError("Final frame iterator ended before n_frames") from exc
-        assert isinstance(frame_data, ArtifactFrame)
-
-        pose_list.append((frame_data.frame_idx, frame_data.pose_matrix))
+        assert isinstance(frame_data, TSDFFrame)
 
         _integrate_tsdf_frame(
             tsdf_volume,
@@ -154,10 +150,8 @@ def save_artifacts(
             pcd_tsdf_depth_trunc_m,
         )
 
-    if len(pose_list) > 0:
-        pose_data = np.stack([pose for _, pose in pose_list], axis=0)
-        pose_inds = np.array([frame_idx for frame_idx, _ in pose_list])
+    if n_frames > 0:
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
-        np.savez(out_path.pose_path, data=pose_data, inds=pose_inds)
+        np.savez(out_path.pose_path, data=pose_matrices, inds=np.arange(n_frames))
 
     _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)

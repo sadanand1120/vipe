@@ -25,7 +25,6 @@ import torch
 from einops import rearrange
 
 from vipe.ext.lietorch.groups import SE3
-from vipe.streams.base import FrameData
 from vipe.utils.cameras import CameraType
 
 from ..ba.solver import Solver, SparseBlockVector
@@ -64,7 +63,7 @@ class GraphBuffer:
         dd_height, dd_width = self.height // 8, self.width // 8
 
         # Frame index in the original stream.
-        self.tstamp = torch.zeros(buffer_size, device=device, dtype=torch.int)
+        self.frame_indices = torch.zeros(buffer_size, device=device, dtype=torch.int)
 
         # World-to-camera pose for each buffered frame.
         self.poses = torch.zeros(buffer_size, 7, device=device, dtype=torch.float)
@@ -85,7 +84,7 @@ class GraphBuffer:
 
     def remove_second_newest(self, ix: int):
         assert ix == self.n_frames - 2
-        self.tstamp[ix] = self.tstamp[ix + 1]
+        self.frame_indices[ix] = self.frame_indices[ix + 1]
         self.poses[ix] = self.poses[ix + 1]
         self.disps[ix] = self.disps[ix + 1]
         self.disps_sens[ix] = self.disps_sens[ix + 1]
@@ -95,14 +94,9 @@ class GraphBuffer:
         self.fmaps[ix] = self.fmaps[ix + 1]
         self.n_frames -= 1
 
-    def update_disps_sens(self, frame_idx: int, frame_data: FrameData):
-        if frame_data.sensor_depth is None:
-            raise ValueError("External sensor depth is required for SLAM depth anchoring")
-
-        metric_depth = frame_data.sensor_depth.float()
+    def update_disps_sens(self, frame_idx: int, sensor_depth: torch.Tensor):
+        metric_depth = sensor_depth.float()
         valid = torch.isfinite(metric_depth) & (metric_depth > 0.0)
-        if frame_data.image_valid_mask is not None:
-            valid &= frame_data.image_valid_mask.to(valid.device)
         metric_depth = torch.where(valid, metric_depth, torch.zeros_like(metric_depth))
 
         disp_sens = metric_depth[3::8, 3::8]

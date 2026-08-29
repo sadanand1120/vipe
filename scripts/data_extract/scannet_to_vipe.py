@@ -218,11 +218,6 @@ def decode_scene(
         save_matrix(frame.camera_to_world, pose_file)
         frames.append(
             {
-                "seq": export_idx,
-                "stem": stem,
-                "color_file": f"color/{stem}.png",
-                "depth_file": f"depth/{stem}.png",
-                "pose_file": f"pose/{stem}.txt",
                 "source_frame_id": source_idx,
                 "source_color_timestamp": int(frame.timestamp_color),
                 "source_depth_timestamp": int(frame.timestamp_depth),

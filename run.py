@@ -4,7 +4,7 @@ from pathlib import Path
 
 from vipe import get_config_path
 from vipe.pipeline import VipePipeline
-from vipe.streams.base import FrameDir
+from vipe.stream import FrameDir
 from vipe.utils.config import load_yaml_config
 from vipe.utils.determinism import seed_everything
 from vipe.utils.logging import configure_logging
@@ -31,9 +31,9 @@ def main() -> None:
         output_dir=cli_args.output_dir,
     )
     frame_stream = FrameDir(path=cli_args.input_dir)
-    logger.info(f"Processing {frame_stream.name()}")
+    logger.info(f"Processing {frame_stream.name}")
     pipeline.run(frame_stream)
-    logger.info(f"Finished processing {frame_stream.name()}")
+    logger.info(f"Finished processing {frame_stream.name}")
 
 
 if __name__ == "__main__":

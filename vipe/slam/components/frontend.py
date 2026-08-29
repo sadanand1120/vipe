@@ -110,7 +110,7 @@ class SLAMFrontend:
             beta=self.beta,
             bidirectional=True,
         )
-        removal_gap = self.video.tstamp[self.t1 - 1] - self.video.tstamp[self.t1 - 3]
+        removal_gap = self.video.frame_indices[self.t1 - 1] - self.video.frame_indices[self.t1 - 3]
         keep_for_gap = self.max_keyframe_gap > 0 and removal_gap.item() > self.max_keyframe_gap
         decision_d = float(d.max().item())
         prune_threshold = self.keyframe_thresh - self.KEYFRAME_DECISION_EPS

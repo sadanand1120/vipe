@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from tqdm import tqdm
 
-from vipe.utils.data_format import intrinsic_matrix, read_pinhole_intrinsics, read_scene_frames
+from vipe.utils.data_format import frame_stem, intrinsic_matrix, read_pinhole_intrinsics, scene_frame_count
 
 
 class AttrDict(dict):
@@ -567,11 +567,12 @@ class ScanNetDataset:
         gt_mesh_path = self._gt_mesh_path(scene)
 
         ixt_shared = intrinsic_matrix(read_pinhole_intrinsics(intrinsic_path))
-        frames = read_scene_frames(scene_dir, require_pose=True)
+        n_frames = scene_frame_count(scene_dir)
         out = AttrDict(image_files=[], extrinsics=[], intrinsics=[], aux=AttrDict(gt_mesh_path=str(gt_mesh_path)))
-        for frame in tqdm(frames, desc=f"[{self.DATASET_LABEL}] {scene} load poses", leave=False):
-            img_path = scene_dir / frame["color_file"]
-            pose_path = scene_dir / frame["pose_file"]
+        for frame_idx in tqdm(range(n_frames), desc=f"[{self.DATASET_LABEL}] {scene} load poses", leave=False):
+            stem = frame_stem(frame_idx)
+            img_path = scene_dir / "color" / f"{stem}.png"
+            pose_path = scene_dir / "pose" / f"{stem}.txt"
             if not img_path.is_file():
                 raise FileNotFoundError(f"Missing {self.DATASET_LABEL} color frame: {img_path}")
             if not pose_path.is_file():

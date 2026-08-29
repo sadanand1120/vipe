@@ -61,7 +61,7 @@ def _scene_dir(args: argparse.Namespace, scene: str) -> Path:
 
 def run_vipe(scene_dir: Path, pipeline_cfg, output_dir: Path) -> None:
     from vipe.pipeline import VipePipeline
-    from vipe.streams.base import FrameDir
+    from vipe.stream import FrameDir
     from vipe.utils.logging import configure_logging
 
     seed_everything(pipeline_cfg.seed, temporary_determinism=pipeline_cfg.temporary_determinism)
@@ -72,7 +72,7 @@ def run_vipe(scene_dir: Path, pipeline_cfg, output_dir: Path) -> None:
         output_dir=output_dir,
     )
     stream = FrameDir(path=scene_dir)
-    logger.info(f"Running ViPE on {stream.name()}")
+    logger.info(f"Running ViPE on {stream.name}")
     pipeline.run(stream)
 
 

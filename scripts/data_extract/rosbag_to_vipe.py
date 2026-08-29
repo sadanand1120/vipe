@@ -317,7 +317,15 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
             "raw_depth_file": depth_item["file"],
         }
         sync_items.append(item)
-        frames.append(item)
+        frames.append(
+            {
+                "color_stamp_ns": color_item["stamp_ns"],
+                "depth_stamp_ns": depth_item["stamp_ns"],
+                "depth_dt_ns": depth_dt_ns,
+                "raw_color_file": color_item["file"],
+                "raw_depth_file": depth_item["file"],
+            }
+        )
 
     write_json(
         args.output_dir / "sync_meta.json",

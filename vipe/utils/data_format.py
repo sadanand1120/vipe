@@ -23,22 +23,12 @@ def read_scene_metadata(scene_dir: str | Path) -> dict[str, Any]:
     return metadata
 
 
-def read_scene_frames(scene_dir: str | Path, *, require_pose: bool = False) -> list[dict[str, Any]]:
+def scene_frame_count(scene_dir: str | Path) -> int:
     metadata = read_scene_metadata(scene_dir)
     frames = metadata.get("frames")
     if not isinstance(frames, list) or not frames:
         raise ValueError(f"{Path(scene_dir) / 'metadata.json'} has no frame records")
-
-    required = ("color_file", "depth_file")
-    if require_pose:
-        required += ("pose_file",)
-    for idx, frame in enumerate(frames):
-        if not isinstance(frame, dict):
-            raise ValueError(f"Frame record {idx} is not an object")
-        for key in required:
-            if not isinstance(frame.get(key), str) or not frame[key]:
-                raise ValueError(f"Frame record {idx} is missing required '{key}'")
-    return frames
+    return len(frames)
 
 
 def write_scene_metadata(
@@ -55,9 +45,6 @@ def write_scene_metadata(
         "name": name,
         "width": int(width),
         "height": int(height),
-        "color": {"dir": "color", "encoding": "rgb8_png"},
-        "depth": {"dir": "depth", "encoding": "uint16_png", "unit": "millimeter"},
-        "intrinsics": "intrinsic/intrinsic_color.json",
         "frames": frames,
     }
     if source is not None:

@@ -244,7 +244,7 @@ class FactorGraph:
         assert self.f_net is not None
 
         t = self.buffer.n_frames
-        corr_op = AltCorrBlock(self.buffer.fmaps[None])
+        corr_op = AltCorrBlock(self.buffer.fmaps[:t][None])
 
         for _ in range(steps):
             with torch.cuda.amp.autocast(enabled=False):

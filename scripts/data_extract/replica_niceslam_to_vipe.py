@@ -315,11 +315,6 @@ def export_scene(
 
         frames.append(
             {
-                "seq": export_idx,
-                "stem": stem,
-                "color_file": f"color/{stem}.png",
-                "depth_file": f"depth/{stem}.png",
-                "pose_file": f"pose/{stem}.txt",
                 "source_frame_id": source_frame_id,
                 "source_color_file": color_path.name,
                 "source_depth_file": depth_path.name,

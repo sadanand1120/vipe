@@ -26,7 +26,7 @@ The editable install builds the native ViPE extension, including the TSDF code p
 <scene>/intrinsic/intrinsic_color.json
 ```
 
-`metadata.json` is the source of truth for frame order. Each frame record names `color_file` and `depth_file`, and ScanNet benchmark scenes also include `pose_file`. Color is RGB8 PNG on disk, depth is `uint16` PNG in millimeters, and intrinsics are undistorted pinhole only. Runtime does not accept sidecar TXT intrinsics, JPG image discovery, or runtime OpenCV distortion branches.
+The length of `metadata.json["frames"]` defines the sequence length. Runtime frames use contiguous six-digit indices: `color/<index>.png` and `depth/<index>.png`; ScanNet benchmark poses use `pose/<index>.txt`. Color is RGB8 PNG, depth is `uint16` millimeters, and intrinsics are shared undistorted pinhole parameters.
 
 Dataset converters live under `scripts/data_extract/`:
 

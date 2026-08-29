@@ -38,7 +38,7 @@ class PoseInfillResult:
 
 
 class InnerFiller:
-    """This class is used to fill in non-keyframe poses"""
+    """Optimize the final full-frame trajectory against fixed keyframe references."""
 
     def __init__(self, net: DroidNet, video: GraphBuffer, args, device: torch.device):
         self.video = video
@@ -60,18 +60,18 @@ class InnerFiller:
         total_frames = self.video.n_frames
 
         # Setup initial value (for pose and disp)
-        m_tstamp = self.video.tstamp[self.start_idx : total_frames]
-        n_tstamp = self.video.tstamp[: self.start_idx]
+        pending_frame_indices = self.video.frame_indices[self.start_idx : total_frames]
+        keyframe_indices = self.video.frame_indices[: self.start_idx]
 
         # Find left (inclusive) nearest keyframe
-        t0 = torch.searchsorted(n_tstamp, m_tstamp, right=True) - 1
+        t0 = torch.searchsorted(keyframe_indices, pending_frame_indices, right=True) - 1
         t1 = torch.where(t0 < self.start_idx - 1, t0 + 1, t0)
 
-        d_time = n_tstamp[t1] - n_tstamp[t0] + 1e-3  # Avoid if time is out of bound of kfs
+        frame_gap = keyframe_indices[t1] - keyframe_indices[t0] + 1e-3
         n_pose = SE3(self.video.poses[: self.start_idx])
         d_pose = n_pose[t1] * n_pose[t0].inv()
-        vel = d_pose.log() / d_time.unsqueeze(-1)
-        w = vel * (m_tstamp - n_tstamp[t0]).unsqueeze(-1)
+        pose_step = d_pose.log() / frame_gap.unsqueeze(-1)
+        w = pose_step * (pending_frame_indices - keyframe_indices[t0]).unsqueeze(-1)
         m_pose = SE3.exp(w) * n_pose[t0]
 
         self.video.poses[self.start_idx : total_frames] = m_pose.data
