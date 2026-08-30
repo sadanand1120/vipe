@@ -26,14 +26,17 @@ The editable install builds the native ViPE extension, including the TSDF code p
 <scene>/intrinsic/intrinsic_color.json
 ```
 
-The length of `metadata.json["frames"]` defines the sequence length. Runtime frames use contiguous six-digit indices: `color/<index>.png` and `depth/<index>.png`; ScanNet benchmark poses use `pose/<index>.txt`. Color is RGB8 PNG, depth is `uint16` millimeters, and intrinsics are shared undistorted pinhole parameters.
+The length of `metadata.json["frames"]` defines the sequence length and `metadata.json["fps"]` records its canonical rate. Runtime frames use contiguous six-digit indices: `color/<index>.png` and `depth/<index>.png`; benchmark poses use `pose/<index>.txt`. Color is RGB8 PNG, depth is `uint16` millimeters, and intrinsics are shared undistorted pinhole parameters. Extractors preserve aspect ratio, normalize the image long side to `--vipe-res` pixels (`1280` by default), and subsample to `--vipe-fps` (`5` by default). RGB, depth, poses, and intrinsics are transformed together before runtime.
 
 Dataset converters live under `scripts/data_extract/`:
 
 ```bash
-python3 scripts/data_extract/scannet_to_vipe.py --scans-root /path/to/scannet/scans --output-root data/scannet --scenes scene0000_00 --frame-skip 1
-python3 scripts/data_extract/rosbag_to_vipe.py /path/to/bag.mcap --output-dir data/kinect_rosbags/processed/bag_scene
+python3 scripts/data_extract/scannet_to_vipe.py --scans-root /path/to/scannet/scans --output-root data/scannet --scenes scene0000_00 --vipe-res 1280 --vipe-fps 5
+python3 scripts/data_extract/replica_niceslam_to_vipe.py --niceslam-root /path/to/Replica --full-root /path/to/Replica_full --output-root data/replica --vipe-res 1280 --vipe-fps 5
+python3 scripts/data_extract/rosbag_to_vipe.py /path/to/bag.mcap --output-dir data/kinect_rosbags/processed/bag_scene --vipe-res 1280 --vipe-fps 5
 ```
+
+ScanNet and Replica are treated as nominal 30 Hz sources. Rosbag extraction uses synchronized message timestamps and rejects a requested rate above the measured source rate rather than duplicating frames.
 
 ## Standalone Run
 
@@ -42,6 +45,8 @@ python run.py \
   --input-dir /path/to/scene \
   --output-dir /path/to/output
 ```
+
+Runtime has no raw-rate or temporal-subsampling path. SLAM, pose infill, TSDF fusion, and saved pose indices consume the complete contiguous canonical sequence produced by the extractor.
 
 Useful output knobs in `configs/default.yaml`:
 
@@ -54,7 +59,7 @@ TSDF fusion uses the provided sensor depth directly and bilinearly samples RGB a
 
 Saved artifacts:
 
-- `pose/<scene>.npz`: camera-to-world pose per selected frame.
+- `pose/<scene>.npz`: camera-to-world pose per canonical frame.
 - `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
 
 ## ScanNet Benchmark
@@ -70,7 +75,7 @@ python3 scripts/scannet_vipe_bench_evaluator.py \
 
 The benchmark adapter assumes `--input-root/<scene>` is already canonical. It runs ViPE, writes a lightweight local manifest pointing at native ViPE artifacts, and computes pose plus `recon` metrics with the local ScanNet evaluator in `vipe/bench/scannet.py` when `--do-final-eval` is supplied. Without `--do-final-eval`, it stops after ViPE exports and incremental pose metrics, which is useful for fast build/debug loops. Reconstruction eval aligns the saved TSDF PLY with the first ViPE and ScanNet camera poses using SE3, then reports a separate scale diagnostic before computing geometry and render metrics.
 For benchmark runs, `--work-dir` owns the outputs: ViPE artifacts are written under `<work-dir>/vipe_outputs/<scene>`, benchmark manifests/caches under `<work-dir>/model_results/...`, and metric JSONs under `<work-dir>/metric_results/...`.
-If multiple GPUs are visible through `CUDA_VISIBLE_DEVICES`, the benchmark splits scene builds across them and also parallelizes final eval workers. Completed scene artifacts are reused on rerun, and failed scenes are recorded under `metric_results/failed_scenes/`.
+If multiple GPUs are visible through `CUDA_VISIBLE_DEVICES`, the benchmark splits scene builds across them and also parallelizes final eval workers. Completed scene artifacts are reused when their canonical metadata/intrinsics are unchanged, and failed scenes are recorded under `metric_results/failed_scenes/`.
 Runtime knobs live in `configs/default.yaml`; ScanNet-specific benchmark knobs live in `configs/eval_scannet_config.yaml`. Dataset roots stay explicit CLI inputs via `--input-dir`, `--input-root`, and `--raw-root`.
 
 ## Eval Dashboard

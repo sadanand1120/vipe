@@ -37,7 +37,7 @@ class FrameDir:
         frames = metadata.get("frames")
         if not isinstance(frames, list) or not frames:
             raise ValueError(f"{path / 'metadata.json'} has no frame records")
-        self._n_frames = len(frames)
+        self.frame_count = len(frames)
         self.frame_size = (int(metadata["height"]), int(metadata["width"]))
 
         self.intrinsics_path = path / "intrinsic" / "intrinsic_color.json"
@@ -55,7 +55,7 @@ class FrameDir:
         return self._intrinsics.cuda()
 
     def __len__(self) -> int:
-        return self._n_frames
+        return self.frame_count
 
     def _frame_paths(self, index: int) -> tuple[Path, Path]:
         if index < 0:

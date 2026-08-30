@@ -29,10 +29,10 @@ The runtime contract is:
 | --- | --- |
 | RGB | `color/<six-digit-index>.png`, RGB8, one file per frame. |
 | Depth | `depth/<six-digit-index>.png`, `uint16` millimeters, aligned pixel-for-pixel with RGB. Zero means invalid. |
-| Scene metadata | `vipe_rgbd_v1`, source width/height, and a nonempty `frames` list whose length defines the sequence length. |
-| Intrinsics | `vipe_pinhole_intrinsics_v1`, one shared source-resolution `[fx,fy,cx,cy]`. |
+| Scene metadata | `vipe_rgbd_v1`, canonical width/height/FPS, and a nonempty `frames` list whose length defines the input sequence length. |
+| Intrinsics | `vipe_pinhole_intrinsics_v1`, one shared canonical-resolution `[fx,fy,cx,cy]`. |
 
-Any source synchronization, depth-to-color alignment, lens rectification, and conversion to pinhole intrinsics happens during input preparation. The runtime receives no distortion coefficients and performs no camera rectification.
+Any source synchronization, temporal subsampling to `--vipe-fps` (`5` by default), depth-to-color alignment, lens rectification, conversion to pinhole intrinsics, and aspect-preserving resize to `--vipe-res` (`1280` by default) happens during input preparation. RGB uses area interpolation when shrinking and linear interpolation when enlarging; depth uses nearest-neighbor interpolation. Intrinsics are scaled by the exact integer output width and height. RGB, depth, and benchmark poses are all selected with the same source indices and renumbered contiguously. The runtime receives no full-rate sequence, distortion coefficients, or camera-rectification work.
 
 ## Runtime Flow
 
@@ -44,27 +44,27 @@ flowchart LR
     S2[Stage 2: frontend pass over RGB frames]
     S3[Stage 3: global backend BA]
     S4[Stage 4: pose infill from cached features]
-    S5[Stage 5: replay source RGB-D and write pose plus TSDF]
-    S1 -->|frame count, source size, K| S2
+    S5[Stage 5: replay canonical RGB-D and write pose plus TSDF]
+    S1 -->|canonical frame count, image size, K| S2
     S2 -->|keyframes and optimized graph state| S3
     S3 -->|globally refined keyframes| S4
-    S4 -->|full trajectory and source K| S5
+    S4 -->|full trajectory and canonical K| S5
 ```
 
 | Stage | Execution grain | Main output |
 | --- | --- | --- |
-| Stage 1 | Once per scene | Canonical scene handle, frame count, source resolution, and shared pinhole intrinsics. |
-| Stage 2 | Once per RGB frame | Keyframe-only `GraphBuffer` optimized incrementally by frontend BA; one cached DROID feature map per input frame. |
+| Stage 1 | Once per scene | Canonical scene handle, frame count, image resolution, and shared pinhole intrinsics. |
+| Stage 2 | Once per canonical RGB frame | Keyframe-only `GraphBuffer` optimized incrementally by frontend BA; one cached DROID feature map per frame. |
 | Stage 3 | Once per sequence | The same keyframe state refined by a fresh global backend `FactorGraph`. |
-| Stage 4 | Once per cached feature map, optimized in chunks | Camera-to-world pose for every input frame. |
-| Stage 5 | Once per source RGB-D frame | Pose NPZ and native colored TSDF point cloud with normals. |
+| Stage 4 | Once per cached feature map, optimized in chunks | Camera-to-world pose for every canonical frame. |
+| Stage 5 | Once per canonical RGB-D frame | Pose NPZ and native colored TSDF point cloud with normals. |
 
-## Stage 1: Open Canonical Scene And Intrinsics
+## Stage 1: Open Canonical Scene And Load Intrinsics
 
 `run.py` loads `configs/default.yaml`, applies deterministic runtime setup, creates one `FrameDir`, and passes it to `VipePipeline`:
 
 ```python
-frame_stream = FrameDir(path=cli_args.input_dir)
+frame_stream = FrameDir(cli_args.input_dir)
 pipeline.run(frame_stream)
 ```
 
@@ -73,21 +73,21 @@ pipeline.run(frame_stream)
 ```text
 scene root
 scene name
-number of frames
-source (height, width)
-shared source-resolution [fx, fy, cx, cy]
+canonical frame count
+canonical (height, width)
+shared canonical-resolution [fx, fy, cx, cy]
 ```
 
-Frame paths are not stored in per-frame lists. For frame index `i`, the reader computes the canonical stem `f"{i:06d}"` and opens:
+Frame paths are not stored in per-frame lists. For canonical sequence position `i`, the reader computes the same six-digit stem and opens:
 
 ```text
 color/<stem>.png
 depth/<stem>.png
 ```
 
-Construction verifies that the intrinsics resolution equals the declared scene resolution. RGB/depth paths are resolved only when their frame is consumed; each load checks successful decoding and its actual shape before data enters SLAM. This avoids a sequence-wide filesystem scan before processing begins.
+Construction verifies that metadata declares a positive canonical FPS and that the intrinsics resolution equals the declared scene resolution. RGB/depth paths are resolved only when a frame is consumed; each load checks successful decoding and its actual shape before data enters SLAM. There is no runtime source-index mapping or temporal branch: index `i` always means canonical frame `i` everywhere downstream.
 
-Decoded frame contents are not cached. Stage 2 holds only one decoded source RGB at a time, while retaining the much smaller 1/8-resolution DROID feature map needed by Stage 4. Stage 5 later decodes source RGB-D again for reconstruction. Caching every source RGB-D frame would replace bounded disk I/O with sequence-sized host memory.
+Decoded frame contents are not cached. Stage 2 holds only one decoded canonical RGB at a time, while retaining the much smaller 1/8-resolution DROID feature map needed by Stage 4. Stage 5 later decodes the canonical RGB-D frames again for reconstruction. Caching every RGB-D frame would replace bounded disk I/O with sequence-sized host memory.
 
 The loaded source intrinsics tensor is:
 
@@ -103,24 +103,26 @@ slam_output = SLAMSystem(...).run(frame_stream, intrinsics)
 save_outputs(frame_stream, slam_output)
 ```
 
-RGB loading produces an `(H0,W0,3)` CUDA `float32` tensor in `[0,1]`. Keyframe depth loading produces an `(H0,W0)` CUDA `float32` tensor in meters. A mismatched depth resolution is rejected because source RGB and depth must already share the same pinhole image plane.
+RGB loading produces an `(H0,W0,3)` CUDA `float32` tensor in `[0,1]`. Keyframe depth loading produces an `(H0,W0)` CUDA `float32` tensor in meters. A mismatched depth resolution is rejected because canonical RGB and depth must already share the same pinhole image plane.
 
 ## Stage 2: SLAM Pass 1 Frontend Loop
 
-Stage 2 is the first pass through all frames. It decides which frames become keyframes and optimizes those keyframes incrementally.
+Stage 2 is the first pass through all canonical frames. It decides which frames become keyframes and optimizes those keyframes incrementally.
 
 ```mermaid
 flowchart TD
-    A[decode source RGB i] --> B[apply fixed scene resize]
+    A[decode canonical RGB i] --> B[apply fixed scene resize]
     B --> C[center-crop to multiples of 8]
     C --> E[DROID motion filter and feature extraction]
-    E --> F{keyframe or final frame?}
-    F -->|yes| G[decode and resize source depth i]
+    E --> F{motion keyframe, forced gap, or final frame?}
+    F -->|yes| G[decode and resize canonical depth i]
     G --> H[store keyframe and 1/8 disparity anchors]
     F -->|no| I[skip keyframe storage]
     H --> J[SLAMFrontend.run]
-    I --> J
-    J --> K[frontend FactorGraph update and BA]
+    J --> K{frontend initialized and new keyframe stored?}
+    K -->|yes| M[frontend FactorGraph update and BA]
+    K -->|no| N[no frontend optimization]
+    I --> N
     E --> L[retain frame i feature map for Stage 4]
 ```
 
@@ -130,7 +132,7 @@ Relevant files:
 | --- | --- |
 | `vipe/stream.py` | Canonical indexed RGB-D reader and shared pinhole intrinsics loader. |
 | `vipe/slam/system.py` | Two-pass orchestration, fixed frame resizing/cropping, component calls. |
-| `vipe/slam/components/motion_filter.py` | DROID motion check and cached feature/context tensors for accepted keyframes. |
+| `vipe/slam/components/motion_filter.py` | DROID feature extraction and motion check for every frame; context extraction for accepted or forced keyframes. |
 | `vipe/slam/components/buffer.py` | Persistent keyframe state and sensor-depth disparity anchors. |
 | `vipe/slam/components/frontend.py` | Incremental frontend factor graph. |
 | `vipe/slam/components/factor_graph.py` | Factor storage, learned DROID target updates, BA invocation. |
@@ -138,7 +140,7 @@ Relevant files:
 
 ### Fixed Working-Resolution Transform
 
-Every frame in a canonical scene has the same source resolution and shared intrinsics, so `SLAMInputResizer` computes one scene-wide transform before the loop. For source size `(H0,W0)`:
+Every frame in a canonical scene has the same input resolution and shared intrinsics, so `SLAMInputResizer` computes one scene-wide transform before the loop. For canonical size `(H0,W0)`:
 
 ```python
 scale_factor = sqrt(resize_target_pixels / (H0 * W0))
@@ -169,7 +171,7 @@ The same fixed transform is applied as follows:
 
 The resulting working intrinsics are fixed constants used by all SLAM projections. They are not optimization variables.
 
-There is no inverse image operation after SLAM: no RGB, depth, feature map, or disparity map is upsampled to source resolution. `SLAMOutput` simply carries the original `K_source` loaded in Stage 1. Stage 5 uses that source K with freshly decoded source-resolution RGB and depth.
+There is no inverse image operation after SLAM: no RGB, depth, feature map, or disparity map is upsampled to canonical resolution. `SLAMOutput` simply carries the original `K_source` loaded in Stage 1. Stage 5 uses that canonical K with freshly decoded canonical-resolution RGB and depth.
 
 ### Component Construction
 
@@ -225,7 +227,7 @@ The final frame is forced into the keyframe set so pose infill has a right bound
 
 ### Sensor-Depth Anchors
 
-When a keyframe is added, its source depth is decoded, nearest-resized and cropped by the fixed transform. `GraphBuffer.update_disps_sens` then samples it into the same 1/8-resolution grid used by DROID disparities:
+When a keyframe is added, its canonical depth is decoded, nearest-resized and cropped by the fixed transform. `GraphBuffer.update_disps_sens` then samples it into the same 1/8-resolution grid used by DROID disparities:
 
 ```python
 metric_depth = sensor_depth.float()
@@ -260,6 +262,7 @@ Important frontend config values are in `configs/default.yaml`:
 | --- | ---: | --- |
 | `filter_thresh` | `2.4` | Dense motion threshold for accepting keyframes. |
 | `warmup` | `8` | Keyframes collected before initializing frontend graph. |
+| `max_keyframe_gap` | `16` | Force storage when 16 canonical frames have elapsed since the last keyframe. |
 | `keyframe_thresh` | `4.0` | Threshold for pruning redundant keyframes. |
 | `frontend_thresh` | `16.0` | Proximity threshold for frontend edge creation. |
 | `frontend_window` | `25` | Number of recent keyframes considered by frontend. |
@@ -296,7 +299,15 @@ The current projection into keyframe `j` is:
 \hat{p}_{ij}(p)=\Pi_K\left(P_j P_i^{-1}\Pi_K^{-1}(p,d_i)\right).
 ```
 
-`P_i` and `P_j` are current world-to-camera poses. DROID supplies target coordinate `p^*_{ij}(p)` and residual weight `w_{ij}(p)`.
+`P_i` and `P_j` are current world-to-camera poses. DROID supplies target coordinate `p^*_{ij}(p)` and residual weight `w_{ij}(p)`. The implementation multiplies that learned weight by the fixed visual scale `lambda_flow=0.001`, then applies a scalar Huber IRLS weight with transition at an absolute reprojection residual of `1` low-resolution pixel:
+
+```math
+h(r)=
+\begin{cases}
+1, & |r|\le 1,\\
+1/|r|, & |r|>1.
+\end{cases}
+```
 
 The dense visual term is:
 
@@ -305,10 +316,10 @@ E_{\text{flow}}
 =
 \sum_{(i,j)\in\mathcal{F}}
 \sum_p
-w_{ij}(p)
-\left\|
-\hat{p}_{ij}(p)-p^*_{ij}(p)
-\right\|^2.
+\sum_{c\in\{u,v\}}
+\lambda_{\text{flow}} w_{ij,c}(p) h(r_{ij,c}(p)) r_{ij,c}(p)^2,
+\qquad
+r_{ij}(p)=\hat{p}_{ij}(p)-p^*_{ij}(p).
 ```
 
 The sensor-depth anchor term is:
@@ -463,7 +474,7 @@ After pass 1, the frontend factor graph and motion-filter state have reached the
 
 ## Stage 4: Pose Infill
 
-Pass 1 already retained one DROID feature map for every input RGB frame. Stage 4 consumes those cached feature maps; it does not decode or resize the images again. Backend keyframes remain fixed reference nodes. Stage 4 appends a new pose slot for every canonical frame index, including indices that were keyframes, then optimizes those appended full-trajectory slots in chunks against the fixed references.
+Pass 1 already retained one DROID feature map for every canonical RGB frame. Stage 4 consumes those cached feature maps; it does not decode or resize the images again. Backend keyframes remain fixed reference nodes. Stage 4 appends a new pose slot for every canonical-sequence position, including positions that were keyframes, then optimizes those appended full-trajectory slots in chunks against the fixed references.
 
 ```mermaid
 flowchart TD
@@ -486,7 +497,7 @@ Relevant file:
 | --- | --- |
 | `vipe/slam/components/inner_filler.py` | Appends full-trajectory pose slots and optimizes them against fixed backend keyframes. |
 
-There are no physical timestamps in runtime SLAM. `GraphBuffer.frame_indices` contains the integer canonical positions `0,1,...,N-1`; source timestamps retained by dataset converters are not read by `FrameDir`. For each appended frame index, `InnerFiller.fill_pending_chunk` finds adjacent fixed keyframes by these sequence positions:
+There are no physical timestamps in runtime SLAM. `GraphBuffer.frame_indices` contains dense canonical positions `0,1,...,M-1`; source timestamps retained as extractor provenance are not read by `FrameDir`. For each appended runtime index, `InnerFiller.fill_pending_chunk` finds adjacent fixed keyframes by canonical position:
 
 ```python
 pending_frame_indices = buffer.frame_indices[start_idx:total_frames]
@@ -532,15 +543,15 @@ trajectory = infill_result.poses.inv()
 keyframe_indices = buffer.frame_indices[:buffer.n_frames].cpu().tolist()
 ```
 
-`infill_result.poses` stores world-to-camera poses, so `.inv()` produces the camera-to-world trajectory exported by ViPE. The shared output intrinsics are the unchanged source-resolution tensor loaded in Stage 1, not an upsampled or optimized estimate.
+`infill_result.poses` stores world-to-camera poses, so `.inv()` produces the camera-to-world trajectory exported by ViPE. The shared output intrinsics are the unchanged canonical-resolution tensor loaded in Stage 1, not an upsampled or optimized estimate.
 
 `SLAMOutput` contains:
 
 ```python
 SLAMOutput(
     trajectory=<camera-to-world SE3 for every canonical frame>,
-    intrinsics=<source-resolution pinhole [fx,fy,cx,cy]>,
-    keyframe_indices=<canonical frame indices of optimized SLAM keyframes>,
+    intrinsics=<canonical-resolution pinhole [fx,fy,cx,cy]>,
+    keyframe_indices=<canonical positions of optimized SLAM keyframes>,
 )
 ```
 
@@ -579,7 +590,7 @@ def load_frame(frame_idx):
 
 `FrameDir.artifact_arrays` decodes RGB and depth on CPU. Depth is converted from millimeters to meters and nonpositive values are set to zero. The TSDF PCD uses that sensor depth directly; native integration rejects nonfinite, nonpositive, and out-of-range samples. ViPE estimates the camera trajectory, but this fork does not export an independently predicted dense depth map.
 
-These are the source-resolution files, not resized SLAM tensors. TSDF therefore receives source RGB, source sensor depth, source intrinsics, and the final per-frame poses. The working-resolution DROID disparities never enter reconstruction.
+These are the canonical-resolution files, not resized SLAM tensors. TSDF therefore receives canonical RGB, canonical sensor depth, shared intrinsics, and the corresponding final poses. Every canonical frame enters TSDF integration exactly once. The working-resolution DROID disparities never enter reconstruction.
 
 ### Saved Artifacts
 
@@ -587,7 +598,7 @@ These are the source-resolution files, not resized SLAM tensors. TSDF therefore 
 
 | Artifact | Path | Contents |
 | --- | --- | --- |
-| Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: sequential canonical frame indices. |
+| Pose NPZ | `pose/<artifact_name>.npz` | `data`: camera-to-world matrices, `inds`: contiguous canonical frame indices. |
 | TSDF PLY | `pcd/<artifact_name>_tsdf.ply` | Colored points with `nx/ny/nz` normals and `normals_red/green/blue` normal colors sampled from the native TSDF zero-crossing surface. |
 
 `artifact_name` is `frame_stream.name`, the input scene directory name.
@@ -596,8 +607,8 @@ These are the source-resolution files, not resized SLAM tensors. TSDF therefore 
 
 | Array | Shape | Meaning |
 | --- | --- | --- |
-| `data` | `(N,4,4)` | Camera-to-world pose matrix for each saved frame. |
-| `inds` | `(N,)` | Sequential canonical frame index used by the artifact writer. |
+| `data` | `(M,4,4)` | Camera-to-world pose matrix for each canonical frame. |
+| `inds` | `(M,)` | Contiguous canonical index `[0,1,...,M-1]`. |
 
 ### TSDF PCD
 
@@ -730,12 +741,14 @@ Benchmark data loading is canonical-only:
 
 Scene data comes from `--input-root/<scene>`. Benchmark-only GT mesh data comes from `--raw-root/<scene>`.
 
-For every scene, the adapter:
+Before launching workers, the adapter applies its built-in GT-pose quality checks. Rejected scenes are not built or evaluated, and their reports are written to `metric_results/skipped_gt_pose_scenes.json`.
+
+For every retained scene, the adapter:
 
 1. Reads the canonical frame count and loads indexed GT poses from `pose/<six-digit-index>.txt`.
-2. Runs `VipePipeline` on `--input-root/<scene>`.
+2. Reuses existing artifacts only when their manifest still matches the canonical frame count and contract-file modification times; otherwise it runs `VipePipeline` on `--input-root/<scene>` in a scene subprocess.
 3. Writes `vipe_manifest.json` under the benchmark workspace.
-4. Writes `gt_meta.npz` containing the exact evaluated GT frame subset.
+4. Writes `gt_meta.npz` containing GT metadata for the complete canonical sequence.
 5. Runs pose and reconstruction metrics when `--do-final-eval` is supplied. Without that flag, it stops after exports and incremental pose metric JSONs.
 
 ViPE artifacts for benchmark runs are written under:
@@ -761,13 +774,13 @@ Manifest contents include:
 | `pose_path` | Absolute path to ViPE pose NPZ. |
 | `tsdf_pcd_path` | Absolute path to ViPE TSDF PLY. |
 | `output` | TSDF output parameters used for this run. |
-| `frame_indices` | Sequential canonical frame indices. |
+| `frame_count` | Number of contiguous canonical frames represented by the pose artifact. |
 
 ### Pose Metric
 
 The pose metric uses the matched canonical frames:
 
-1. Load predicted ViPE poses by `frame_indices`.
+1. Load predicted ViPE poses in contiguous canonical order and verify their NPZ indices are `[0,1,...,M-1]`.
 2. Load ScanNet GT camera-to-world poses from canonical `pose/*.txt`.
 3. Convert predicted and GT camera-to-world poses to world-to-camera extrinsics.
 4. Align both trajectories to their first camera.
@@ -805,7 +818,7 @@ The printed summary reports mean scale and individual scene scales in parenthese
 
 ### Benchmark Parallelism
 
-If `CUDA_VISIBLE_DEVICES` contains multiple GPUs and the process is not already a worker, the benchmark script spawns one worker process per visible GPU. Build workers dynamically claim the next unprocessed scene from a shared locked queue, so a worker that finishes early immediately receives another scene:
+If `CUDA_VISIBLE_DEVICES` contains multiple GPUs and the process is not already a worker, the benchmark script spawns one worker process per visible GPU. Build workers dynamically claim the next unprocessed scene from a shared locked queue, then launch that scene in an isolated subprocess. A worker that finishes early immediately receives another scene:
 
 ```python
 while scene := claim_next_scene(queue_path):
@@ -851,8 +864,8 @@ Important runtime config values:
 
 | Object | Meaning |
 | --- | --- |
-| `metadata.json` | Canonical scene format, source dimensions, and frame count. |
-| `FrameDir` | Concrete canonical scene reader that derives indexed RGB-D paths and loads shared pinhole intrinsics. |
+| `metadata.json` | Canonical scene format, image dimensions, FPS, and frame count. |
+| `FrameDir` | Canonical scene reader that derives contiguous RGB-D paths and loads shared pinhole intrinsics. |
 | `TSDFFrame` | CPU reconstruction record containing RGB, sensor depth, inverse pose, and intrinsics for one frame. |
 | `SLAMInputResizer` | One fixed source-to-working-resolution resize/crop/intrinsics transform for the scene. |
 | `GraphBuffer` | Persistent SLAM state table: keyframe poses, disparities, sensor-depth anchors, DROID features. |

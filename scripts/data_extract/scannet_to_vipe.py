@@ -13,12 +13,22 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from vipe.utils.data_format import frame_stem, write_pinhole_intrinsics, write_scene_metadata
+from vipe.utils.data_format import (
+    DEFAULT_VIPE_FPS,
+    frame_stem,
+    long_side_size,
+    rescale_pinhole_matrix,
+    resize_image,
+    subsampled_frame_indices,
+    write_pinhole_intrinsics,
+    write_scene_metadata,
+)
 
 
 COMPRESSION_TYPE_COLOR = {-1: "unknown", 0: "raw", 1: "png", 2: "jpeg"}
 COMPRESSION_TYPE_DEPTH = {-1: "unknown", 0: "raw_ushort", 1: "zlib_ushort", 2: "occi_ushort"}
 PROGRESS_UPDATE_INTERVAL = 16
+SCANNET_FPS = 30.0
 
 
 def emit_progress(progress_queue, worker_idx: int | None, kind: str, **payload) -> None:
@@ -154,7 +164,8 @@ def save_matrix(matrix: np.ndarray, path: Path) -> None:
 def decode_scene(
     scene_dir: Path,
     output_scene_dir: Path,
-    frame_skip: int,
+    vipe_res: int,
+    vipe_fps: float,
     show_progress: bool = True,
     progress_queue=None,
     worker_idx: int | None = None,
@@ -176,11 +187,13 @@ def decode_scene(
     if not np.isclose(sensor_data.depth_shift, 1000.0):
         raise ValueError(f"Unexpected ScanNet depth_shift={sensor_data.depth_shift}; expected 1000.0")
 
-    k = sensor_data.intrinsic_color[:3, :3]
+    source_size = (sensor_data.color_width, sensor_data.color_height)
+    output_size = long_side_size(*source_size, vipe_res)
+    k = rescale_pinhole_matrix(sensor_data.intrinsic_color[:3, :3], source_size, output_size)
     write_pinhole_intrinsics(
         output_scene_dir / "intrinsic" / "intrinsic_color.json",
-        width=sensor_data.color_width,
-        height=sensor_data.color_height,
+        width=output_size[0],
+        height=output_size[1],
         fx=k[0, 0],
         fy=k[1, 1],
         cx=k[0, 2],
@@ -188,7 +201,7 @@ def decode_scene(
         source={"dataset": "ScanNet", "file": str(sens_files[0]), "matrix": "intrinsic_color"},
     )
 
-    frame_indices = list(range(0, len(sensor_data.frames), frame_skip))
+    frame_indices = subsampled_frame_indices(len(sensor_data.frames), SCANNET_FPS, vipe_fps)
     frames = []
     if show_progress:
         print(f"Decoding {scene_dir.name}: {len(frame_indices)} frames")
@@ -207,6 +220,8 @@ def decode_scene(
         )
         if depth.shape[:2] != color.shape[:2]:
             depth = cv2.resize(depth, (color.shape[1], color.shape[0]), interpolation=cv2.INTER_NEAREST)
+        color = resize_image(color, output_size)
+        depth = resize_image(depth, output_size, nearest=True)
 
         color_file = output_scene_dir / "color" / f"{stem}.png"
         depth_file = output_scene_dir / "depth" / f"{stem}.png"
@@ -235,20 +250,29 @@ def decode_scene(
     write_scene_metadata(
         output_scene_dir,
         name=scene_dir.name,
-        width=sensor_data.color_width,
-        height=sensor_data.color_height,
+        width=output_size[0],
+        height=output_size[1],
+        fps=vipe_fps,
         frames=frames,
         source={
             "dataset": "ScanNet",
             "scene": scene_dir.name,
             "sens_file": str(sens_files[0]),
-            "frame_skip": frame_skip,
+            "source_fps": SCANNET_FPS,
+            "vipe_res": vipe_res,
             "depth_unit": "millimeter",
         },
     )
 
 
-def decode_scene_worker(task_queue, progress_queue, output_root: Path, frame_skip: int, worker_idx: int) -> None:
+def decode_scene_worker(
+    task_queue,
+    progress_queue,
+    output_root: Path,
+    vipe_res: int,
+    vipe_fps: float,
+    worker_idx: int,
+) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     while True:
         scene_dir = task_queue.get()
@@ -258,7 +282,8 @@ def decode_scene_worker(task_queue, progress_queue, output_root: Path, frame_ski
             decode_scene(
                 scene_dir,
                 output_root / scene_dir.name,
-                frame_skip,
+                vipe_res,
+                vipe_fps,
                 show_progress=False,
                 progress_queue=progress_queue,
                 worker_idx=worker_idx,
@@ -269,7 +294,13 @@ def decode_scene_worker(task_queue, progress_queue, output_root: Path, frame_ski
             return
 
 
-def run_parallel_scenes(scenes: list[Path], output_root: Path, frame_skip: int, num_workers: int) -> None:
+def run_parallel_scenes(
+    scenes: list[Path],
+    output_root: Path,
+    vipe_res: int,
+    vipe_fps: float,
+    num_workers: int,
+) -> None:
     worker_count = min(num_workers, len(scenes))
     ctx = mp.get_context("fork")
     task_queue = ctx.Queue()
@@ -280,7 +311,10 @@ def run_parallel_scenes(scenes: list[Path], output_root: Path, frame_skip: int, 
         task_queue.put(None)
 
     workers = [
-        ctx.Process(target=decode_scene_worker, args=(task_queue, progress_queue, output_root, frame_skip, worker_idx))
+        ctx.Process(
+            target=decode_scene_worker,
+            args=(task_queue, progress_queue, output_root, vipe_res, vipe_fps, worker_idx),
+        )
         for worker_idx in range(worker_count)
     ]
     for worker in workers:
@@ -336,14 +370,17 @@ def main() -> None:
     scene_group = parser.add_mutually_exclusive_group()
     scene_group.add_argument("--scenes", nargs="*", default=None, help="Scene names to extract. Defaults to all scenes.")
     scene_group.add_argument("--totN", type=int, default=None, help="Extract the first N sorted scenes.")
-    parser.add_argument("--frame-skip", type=int, default=1, help="Write every Nth source frame.")
+    parser.add_argument("--vipe-res", type=int, default=1280, help="Canonical output image long side (default: 1280).")
+    parser.add_argument("--vipe-fps", type=float, default=DEFAULT_VIPE_FPS, help="Canonical output FPS (default: 5).")
     parser.add_argument("--num-workers", type=int, default=1, help="Number of scenes to extract in parallel.")
     args = parser.parse_args()
 
-    if args.frame_skip < 1:
-        raise ValueError("--frame-skip must be >= 1")
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
+    if args.vipe_res < 1:
+        raise ValueError("--vipe-res must be >= 1")
+    if args.vipe_fps <= 0.0:
+        raise ValueError("--vipe-fps must be positive")
     if args.totN is not None and args.totN < 1:
         raise ValueError("--totN must be >= 1")
 
@@ -361,10 +398,10 @@ def main() -> None:
 
     if args.num_workers == 1 or len(scenes) <= 1:
         for scene_dir in scenes:
-            decode_scene(scene_dir, args.output_root / scene_dir.name, args.frame_skip)
+            decode_scene(scene_dir, args.output_root / scene_dir.name, args.vipe_res, args.vipe_fps)
         return
 
-    run_parallel_scenes(scenes, args.output_root, args.frame_skip, args.num_workers)
+    run_parallel_scenes(scenes, args.output_root, args.vipe_res, args.vipe_fps, args.num_workers)
 
 
 if __name__ == "__main__":

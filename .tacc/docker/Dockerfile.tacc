@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/conda/envs/vipe-manual/bin:${PATH} \
     PYTHONPATH=/opt/vipe \
     TORCH_HOME=/opt/vipe-cache/torch \
-    TORCH_CUDA_ARCH_LIST="7.5;8.6;8.7;9.0;12.0+PTX"
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.7;9.0;12.0+PTX"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash build-essential ca-certificates git libgl1 libglib2.0-0 libgomp1 \

@@ -30,8 +30,8 @@ def main() -> None:
         output=cfg.pipeline.output,
         output_dir=cli_args.output_dir,
     )
-    frame_stream = FrameDir(path=cli_args.input_dir)
-    logger.info(f"Processing {frame_stream.name}")
+    frame_stream = FrameDir(cli_args.input_dir)
+    logger.info("Processing %s (%d canonical frames)", frame_stream.name, len(frame_stream))
     pipeline.run(frame_stream)
     logger.info(f"Finished processing {frame_stream.name}")
 

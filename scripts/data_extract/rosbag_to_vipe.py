@@ -14,7 +14,12 @@ from rosidl_runtime_py.utilities import get_message
 from tqdm import tqdm
 
 from vipe.utils.data_format import (
+    DEFAULT_VIPE_FPS,
     frame_stem,
+    long_side_size,
+    rescale_pinhole_matrix,
+    resize_image,
+    subsampled_timestamp_indices,
     write_pinhole_intrinsics,
     write_scene_metadata,
 )
@@ -102,7 +107,7 @@ def read_camera_info(args: argparse.Namespace) -> dict:
     if args.color_info_topic not in topic_types:
         raise KeyError(f"Missing required camera info topic in bag: {args.color_info_topic}")
 
-    with tqdm(total=reader_message_count(reader), desc="Read camera info", unit="msg") as progress:
+    with tqdm(total=reader_message_count(reader), desc="Read camera info", unit="msg", leave=False) as progress:
         while reader.has_next():
             topic, data, bag_stamp_ns = reader.read_next()
             progress.update(1)
@@ -145,11 +150,11 @@ def build_rectifier(camera_info: dict) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def write_intrinsics(output_dir: Path, camera_info: dict) -> None:
-    k = camera_info["output_k"]
+    k = camera_info["vipe_k"]
     write_pinhole_intrinsics(
         output_dir / "intrinsic" / "intrinsic_color.json",
-        width=camera_info["width"],
-        height=camera_info["height"],
+        width=camera_info["vipe_size"][0],
+        height=camera_info["vipe_size"][1],
         fx=k[0, 0],
         fy=k[1, 1],
         cx=k[0, 2],
@@ -261,6 +266,8 @@ def write_synced_image(src: Path, dst: Path, kind: str, camera_info: dict, recti
     elif image.shape[:2] != (target_size[1], target_size[0]):
         image = cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
 
+    image = resize_image(image, camera_info["vipe_size"], nearest=kind == "depth")
+
     if not cv2.imwrite(str(dst), image):
         raise RuntimeError(f"Failed to write synced image: {dst}")
 
@@ -278,14 +285,26 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
     max_depth_dt_ns = int(args.max_depth_dt * 1_000_000_000)
     rectifier = build_rectifier(camera_info)
 
-    sync_items = []
-    frames = []
-    for color_item in tqdm(color, desc="Sync frames", unit="frame"):
+    candidates = []
+    for color_item in color:
         depth_item = nearest(depth, depth_stamps, color_item["stamp_ns"])
         depth_dt_ns = abs(depth_item["stamp_ns"] - color_item["stamp_ns"])
         if depth_dt_ns > max_depth_dt_ns:
             continue
+        candidates.append((color_item, depth_item, depth_dt_ns))
+    if not candidates:
+        raise RuntimeError("No RGB-depth pairs passed the synchronization threshold")
 
+    selected_indices = subsampled_timestamp_indices(
+        [item[0]["stamp_ns"] for item in candidates],
+        args.vipe_fps,
+    )
+    selected = [candidates[index] for index in selected_indices]
+    source_fps = fps_from_timestamps_ns([item[0]["stamp_ns"] for item in candidates])
+
+    sync_items = []
+    frames = []
+    for color_item, depth_item, depth_dt_ns in tqdm(selected, desc="Write canonical frames", unit="frame"):
         seq = len(sync_items)
         stem = frame_stem(seq)
         color_name = f"{stem}.png"
@@ -341,8 +360,9 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
     write_scene_metadata(
         args.output_dir,
         name=args.output_dir.name,
-        width=camera_info["width"],
-        height=camera_info["height"],
+        width=camera_info["vipe_size"][0],
+        height=camera_info["vipe_size"][1],
+        fps=args.vipe_fps,
         frames=frames,
         source={
             "type": "rosbag2_mcap",
@@ -350,10 +370,12 @@ def sync_outputs(args: argparse.Namespace, camera_info: dict) -> tuple[float, li
             "color_topic": args.color_topic,
             "depth_topic": args.depth_topic,
             "color_info_topic": args.color_info_topic,
+            "source_fps": source_fps,
+            "vipe_res": args.vipe_res,
             "depth_unit": "millimeter",
         },
     )
-    print(f"Synchronized export: {len(sync_items)} frames")
+    print(f"Canonical export: {len(sync_items)}/{len(candidates)} synchronized frames at {args.vipe_fps:g} FPS")
     synced_fps = round(fps_from_timestamps_ns([item["color_stamp_ns"] for item in sync_items]), 2)
     return synced_fps, sync_items
 
@@ -366,6 +388,8 @@ def main() -> None:
     parser.add_argument("--depth-topic", default=DEPTH_TOPIC)
     parser.add_argument("--color-info-topic", default=COLOR_INFO_TOPIC)
     parser.add_argument("--max-depth-dt", type=float, default=0.05)
+    parser.add_argument("--vipe-res", type=int, default=1280, help="Canonical output image long side (default: 1280).")
+    parser.add_argument("--vipe-fps", type=float, default=DEFAULT_VIPE_FPS, help="Canonical output FPS (default: 5).")
     args = parser.parse_args()
 
     args.bag_path = args.bag_path.resolve()
@@ -376,9 +400,16 @@ def main() -> None:
         raise ValueError(f"Expected an .mcap bag file, got: {args.bag_path}")
     if args.max_depth_dt < 0.0:
         raise ValueError("--max-depth-dt must be non-negative")
+    if args.vipe_res < 1:
+        raise ValueError("--vipe-res must be >= 1")
+    if args.vipe_fps <= 0.0:
+        raise ValueError("--vipe-fps must be positive")
 
     prepare_dirs(args.output_dir, args.bag_path)
     camera_info = read_camera_info(args)
+    source_size = (camera_info["width"], camera_info["height"])
+    camera_info["vipe_size"] = long_side_size(*source_size, args.vipe_res)
+    camera_info["vipe_k"] = rescale_pinhole_matrix(camera_info["output_k"], source_size, camera_info["vipe_size"])
     raw_fps = export_raw(args)
     synced_fps, _ = sync_outputs(args, camera_info)
     write_intrinsics(args.output_dir, camera_info)

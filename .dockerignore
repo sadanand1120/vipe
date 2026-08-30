@@ -15,6 +15,7 @@ vipe_ext*.so
 data
 workspace
 outputs
+outputs.*
 tmpouts
 runs
 results

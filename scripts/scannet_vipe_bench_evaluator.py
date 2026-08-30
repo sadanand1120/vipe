@@ -16,8 +16,9 @@ from typing import Any
 import numpy as np
 from vipe import get_config_path
 from vipe.bench.gt_pose_checks import filter_scenes_with_bad_gt_pose_data
-from vipe.bench.scannet import AttrDict, ScanNetEvaluator
+from vipe.bench.scannet import ScanNetEvaluator
 from vipe.utils.config import load_yaml_config
+from vipe.utils.data_format import scene_frame_count
 from vipe.utils.determinism import seed_everything
 
 
@@ -71,36 +72,9 @@ def run_vipe(scene_dir: Path, pipeline_cfg, output_dir: Path) -> None:
         output=pipeline_cfg.pipeline.output,
         output_dir=output_dir,
     )
-    stream = FrameDir(path=scene_dir)
+    stream = FrameDir(scene_dir)
     logger.info(f"Running ViPE on {stream.name}")
     pipeline.run(stream)
-
-
-def _subset_scene_data(scene_data, keep_indices: list[int]):
-    subset = AttrDict()
-    subset.image_files = [scene_data.image_files[i] for i in keep_indices]
-    subset.extrinsics = scene_data.extrinsics[keep_indices]
-    subset.intrinsics = scene_data.intrinsics[keep_indices]
-    subset.aux = AttrDict()
-    for key, val in scene_data.aux.items():
-        if isinstance(val, list) and len(val) == len(scene_data.image_files):
-            subset.aux[key] = [val[i] for i in keep_indices]
-        elif isinstance(val, np.ndarray) and len(val) == len(scene_data.image_files):
-            subset.aux[key] = val[keep_indices]
-        else:
-            subset.aux[key] = val
-    return subset
-
-
-def _benchmark_frame_request(
-    evaluator,
-    scene: str,
-) -> tuple[Any, list[int], list[int]]:
-    dataset = evaluator.datasets["scannet"]
-    full_scene_data = dataset.get_data(scene)
-    frame_indices = list(range(len(full_scene_data.image_files)))
-    kept_scene_indices = list(frame_indices)
-    return full_scene_data, frame_indices, kept_scene_indices
 
 
 def _artifact_name(scene_dir: Path) -> str:
@@ -111,14 +85,13 @@ def _write_vipe_manifest(
     args: argparse.Namespace,
     evaluator,
     scene: str,
-    full_scene_data,
-    frame_indices: list[int],
-    kept_scene_indices: list[int],
+    scene_data,
     vipe_output_dir: Path,
     artifact_name: str,
     pipeline_cfg,
 ) -> None:
-    print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={len(frame_indices)}", flush=True)
+    frame_count = len(scene_data.image_files)
+    print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={frame_count}", flush=True)
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
@@ -142,10 +115,9 @@ def _write_vipe_manifest(
             "pcd_tsdf_num_voxels_per_block_edge": int(pipeline_cfg.pipeline.output.pcd_tsdf_num_voxels_per_block_edge),
             "pcd_tsdf_depth_sampling_stride": int(pipeline_cfg.pipeline.output.pcd_tsdf_depth_sampling_stride),
         },
-        "frame_indices": [int(idx) for idx in frame_indices],
+        "frame_count": frame_count,
     }
 
-    exported_scene_data = _subset_scene_data(full_scene_data, kept_scene_indices)
     export_dir = Path(evaluator._export_dir("scannet", scene))
     exports_dir = export_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +126,7 @@ def _write_vipe_manifest(
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"[INFO] Wrote ViPE manifest | {scene} | {manifest_path}", flush=True)
     print(f"[INFO] Writing GT metadata | {scene}", flush=True)
-    evaluator._save_gt_meta(str(export_dir), exported_scene_data)
+    evaluator._save_gt_meta(str(export_dir), scene_data)
 
     print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
@@ -180,11 +152,14 @@ def _final_eval_worker_path(args: argparse.Namespace) -> Path:
     return _metric_dir(args) / "final_eval_workers" / f"scannet_final_eval_worker_{args.gpu_id}.json"
 
 
-def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
+def _timing_entry(frames: int, seconds: float, peak_vram_mb: float | None = None) -> dict[str, float]:
     frames = int(frames)
     seconds = float(seconds)
     fps = frames / seconds if seconds > 0.0 else 0.0
-    return {"frames": frames, "seconds": seconds, "fps": fps}
+    entry = {"frames": frames, "seconds": seconds, "fps": fps}
+    if peak_vram_mb is not None:
+        entry["peak_vram_mb"] = float(peak_vram_mb)
+    return entry
 
 
 def _write_worker_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
@@ -333,10 +308,16 @@ def _mean_fps(scene_timing: dict) -> float:
     return float(np.mean(fps_values).item())
 
 
+def _mean_peak_vram_mb(scene_timing: dict) -> float:
+    values = [float(entry["peak_vram_mb"]) for entry in scene_timing.values() if "peak_vram_mb" in entry]
+    return float(np.mean(values).item()) if values else 0.0
+
+
 def _write_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> dict:
     timing = {
         "build": {
             "mean_fps": _mean_fps(build_timing),
+            "mean_peak_vram_mb": _mean_peak_vram_mb(build_timing),
             "scenes": build_timing,
         },
         "metric_eval": {
@@ -487,7 +468,26 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> Iterable[str]:
     return scenes
 
 
-def _run_scene_subprocess(args: argparse.Namespace, scene: str, vipe_output_dir: Path) -> None:
+def _gpu_memory_used_mb() -> float:
+    visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"]
+    if "," in visible_gpu:
+        raise ValueError(f"Scene worker requires one visible GPU, got {visible_gpu}")
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--id",
+            visible_gpu,
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip())
+
+
+def _run_scene_subprocess(args: argparse.Namespace, scene: str, vipe_output_dir: Path) -> float:
     cmd = [
         sys.executable,
         os.path.abspath(__file__),
@@ -504,9 +504,14 @@ def _run_scene_subprocess(args: argparse.Namespace, scene: str, vipe_output_dir:
     ]
     env = os.environ.copy()
     env[WORKER_ENV] = "1"
-    result = subprocess.run(cmd, env=env)
-    if result.returncode != 0:
-        raise RuntimeError(f"scene subprocess exited with code {result.returncode}")
+    process = subprocess.Popen(cmd, env=env)
+    peak_vram_mb = _gpu_memory_used_mb()
+    while process.poll() is None:
+        peak_vram_mb = max(peak_vram_mb, _gpu_memory_used_mb())
+        time.sleep(0.2)
+    if process.returncode != 0:
+        raise RuntimeError(f"scene subprocess exited with code {process.returncode}")
+    return peak_vram_mb
 
 
 def _scene_export_manifest_path(args: argparse.Namespace, scene: str) -> Path:
@@ -525,22 +530,32 @@ def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path,
     )
 
 
-def _manifest_artifacts_exist(manifest_path: Path) -> bool:
+def _load_matching_manifest(manifest_path: Path, args: argparse.Namespace, scene: str) -> dict | None:
     if not manifest_path.exists():
-        return False
+        return None
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
-        return False
-    return (
+        return None
+    scene_dir = _scene_dir(args, scene)
+    if int(manifest.get("frame_count", -1)) != scene_frame_count(scene_dir):
+        return None
+    contract_paths = [scene_dir / "metadata.json", scene_dir / "intrinsic" / "intrinsic_color.json"]
+    if manifest_path.stat().st_mtime_ns < max(path.stat().st_mtime_ns for path in contract_paths):
+        return None
+    return manifest
+
+
+def _scene_build_matches_request(args: argparse.Namespace, scene: str) -> bool:
+    manifest = _load_matching_manifest(_scene_export_manifest_path(args, scene), args, scene)
+    return manifest is not None and (
         Path(manifest["pose_path"]).exists()
         and Path(manifest["tsdf_pcd_path"]).exists()
     )
 
 
 def _scene_export_complete(args: argparse.Namespace, scene: str) -> bool:
-    manifest_path = _scene_export_manifest_path(args, scene)
-    return _manifest_artifacts_exist(manifest_path) and _scene_gt_meta_path(args, scene).exists()
+    return _scene_build_matches_request(args, scene) and _scene_gt_meta_path(args, scene).exists()
 
 
 def _completed_scenes(args: argparse.Namespace) -> list[str]:
@@ -630,7 +645,7 @@ def prepare_vipe_benchmark_exports(
         start_scene = time.perf_counter()
         scene_dir = _scene_dir(args, scene)
         vipe_output_dir = _resolve_vipe_output_dir(args, scene)
-        full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(evaluator, scene)
+        scene_data = evaluator.datasets["scannet"].get_data(scene)
         pose_path, tsdf_pcd_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
         if _scene_export_complete(args, scene):
             print(f"[INFO] Reusing existing ViPE artifacts | {scene}", flush=True)
@@ -638,15 +653,13 @@ def prepare_vipe_benchmark_exports(
             if not inc_path.exists():
                 _write_incremental_pose_metric(args, evaluator, scene)
             continue
-        if pose_path.exists() and tsdf_pcd_path.exists():
+        if pose_path.exists() and tsdf_pcd_path.exists() and _scene_build_matches_request(args, scene):
             print(f"[INFO] Reusing existing ViPE build outputs and refreshing manifest | {scene}", flush=True)
             _write_vipe_manifest(
                 args,
                 evaluator,
                 scene,
-                full_scene_data,
-                frame_indices,
-                kept_scene_indices,
+                scene_data,
                 vipe_output_dir,
                 _artifact_name(scene_dir),
                 pipeline_cfg,
@@ -655,9 +668,13 @@ def prepare_vipe_benchmark_exports(
             if not inc_path.exists():
                 _write_incremental_pose_metric(args, evaluator, scene)
             continue
+        if pose_path.exists() or tsdf_pcd_path.exists():
+            print(f"[INFO] Removing stale ViPE artifacts for changed canonical input | {scene}", flush=True)
+            shutil.rmtree(vipe_output_dir, ignore_errors=True)
+            shutil.rmtree(args.work_dir / "model_results" / "scannet" / scene, ignore_errors=True)
         start_build = time.perf_counter()
         try:
-            _run_scene_subprocess(args, scene, vipe_output_dir)
+            peak_vram_mb = _run_scene_subprocess(args, scene, vipe_output_dir)
         except Exception as exc:
             failures[scene] = str(exc)
             print(f"[WARN] Skipping ScanNet scene after ViPE failure | {scene} | {exc}", flush=True)
@@ -671,16 +688,14 @@ def prepare_vipe_benchmark_exports(
             args,
             evaluator,
             scene,
-            full_scene_data,
-            frame_indices,
-            kept_scene_indices,
+            scene_data,
             vipe_output_dir,
             _artifact_name(scene_dir),
             pipeline_cfg,
         )
-        frames = len(frame_indices)
+        frames = len(scene_data.image_files)
         metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
-        build_timing[scene] = _timing_entry(frames, build_seconds)
+        build_timing[scene] = _timing_entry(frames, build_seconds, peak_vram_mb)
         metric_timing[scene] = _timing_entry(frames, metric_seconds)
         _write_incremental_pose_metric(args, evaluator, scene)
         _cleanup_cuda_runtime()
@@ -778,7 +793,11 @@ def main() -> None:
     if args.scene_worker_scene is not None:
         if args.scene_worker_output_dir is None:
             raise ValueError("--scene-worker-output-dir is required with --scene-worker-scene")
-        run_vipe(_scene_dir(args, args.scene_worker_scene), pipeline_cfg, args.scene_worker_output_dir)
+        run_vipe(
+            _scene_dir(args, args.scene_worker_scene),
+            pipeline_cfg,
+            args.scene_worker_output_dir,
+        )
         return
 
     evaluator = _load_evaluator(args, eval_config)

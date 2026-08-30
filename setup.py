@@ -24,7 +24,7 @@ except ImportError:
     raise ValueError("Pytorch not found, please install it first.")
 
 PACKAGE_NAME = "vipe"
-DEFAULT_CUDA_ARCHES = ["7.5", "8.6", "8.7", "9.0+PTX"]
+DEFAULT_CUDA_ARCHES = ["7.5", "8.0", "8.6", "8.7", "9.0+PTX"]
 
 # Avoid directly importing the package
 with open(f"{PACKAGE_NAME}/__init__.py", "r") as fh:

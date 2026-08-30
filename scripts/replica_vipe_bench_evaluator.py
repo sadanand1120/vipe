@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import gc
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -15,8 +17,8 @@ import numpy as np
 from vipe import get_config_path
 from vipe.bench.gt_pose_checks import filter_scenes_with_bad_gt_pose_data
 from vipe.bench.replica import ReplicaEvaluator
-from vipe.bench.scannet import AttrDict
 from vipe.utils.config import load_yaml_config
+from vipe.utils.data_format import scene_frame_count
 from vipe.utils.determinism import seed_everything
 
 
@@ -41,8 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-root", required=True, type=Path, help="Canonical ViPE Replica scene root")
     parser.add_argument("--raw-root", required=True, type=Path, help="Full Replica asset root with GT meshes")
     parser.add_argument("--print-only", action="store_true", help="Only print saved metrics")
+    parser.add_argument("--do-final-eval", action="store_true", help="Run final pose/reconstruction eval after exports")
     parser.add_argument("--gpu-id", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--total-gpus", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--scene-worker-scene", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--scene-worker-output-dir", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--final-eval-worker", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -67,36 +72,9 @@ def run_vipe(scene_dir: Path, pipeline_cfg, output_dir: Path) -> None:
         output=pipeline_cfg.pipeline.output,
         output_dir=output_dir,
     )
-    stream = FrameDir(path=scene_dir)
+    stream = FrameDir(scene_dir)
     logger.info(f"Running ViPE on {stream.name}")
     pipeline.run(stream)
-
-
-def _subset_scene_data(scene_data, keep_indices: list[int]):
-    subset = AttrDict()
-    subset.image_files = [scene_data.image_files[i] for i in keep_indices]
-    subset.extrinsics = scene_data.extrinsics[keep_indices]
-    subset.intrinsics = scene_data.intrinsics[keep_indices]
-    subset.aux = AttrDict()
-    for key, val in scene_data.aux.items():
-        if isinstance(val, list) and len(val) == len(scene_data.image_files):
-            subset.aux[key] = [val[i] for i in keep_indices]
-        elif isinstance(val, np.ndarray) and len(val) == len(scene_data.image_files):
-            subset.aux[key] = val[keep_indices]
-        else:
-            subset.aux[key] = val
-    return subset
-
-
-def _benchmark_frame_request(
-    evaluator,
-    scene: str,
-) -> tuple[Any, list[int], list[int]]:
-    dataset = evaluator.datasets["replica"]
-    full_scene_data = dataset.get_data(scene)
-    frame_indices = list(range(len(full_scene_data.image_files)))
-    kept_scene_indices = list(frame_indices)
-    return full_scene_data, frame_indices, kept_scene_indices
 
 
 def _artifact_name(scene_dir: Path) -> str:
@@ -107,14 +85,13 @@ def _write_vipe_manifest(
     args: argparse.Namespace,
     evaluator,
     scene: str,
-    full_scene_data,
-    frame_indices: list[int],
-    kept_scene_indices: list[int],
+    scene_data,
     vipe_output_dir: Path,
     artifact_name: str,
     pipeline_cfg,
 ) -> None:
-    print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={len(frame_indices)}", flush=True)
+    frame_count = len(scene_data.image_files)
+    print(f"[INFO] Writing ViPE benchmark manifest | {scene} | frames={frame_count}", flush=True)
 
     pose_path = vipe_output_dir / "pose" / f"{artifact_name}.npz"
     tsdf_pcd_path = vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply"
@@ -138,10 +115,9 @@ def _write_vipe_manifest(
             "pcd_tsdf_num_voxels_per_block_edge": int(pipeline_cfg.pipeline.output.pcd_tsdf_num_voxels_per_block_edge),
             "pcd_tsdf_depth_sampling_stride": int(pipeline_cfg.pipeline.output.pcd_tsdf_depth_sampling_stride),
         },
-        "frame_indices": [int(idx) for idx in frame_indices],
+        "frame_count": frame_count,
     }
 
-    exported_scene_data = _subset_scene_data(full_scene_data, kept_scene_indices)
     export_dir = Path(evaluator._export_dir("replica", scene))
     exports_dir = export_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
@@ -150,7 +126,7 @@ def _write_vipe_manifest(
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"[INFO] Wrote ViPE manifest | {scene} | {manifest_path}", flush=True)
     print(f"[INFO] Writing GT metadata | {scene}", flush=True)
-    evaluator._save_gt_meta(str(export_dir), exported_scene_data)
+    evaluator._save_gt_meta(str(export_dir), scene_data)
 
     print(f"[INFO] Exported ViPE benchmark manifest for {scene} under {args.work_dir}")
 
@@ -176,15 +152,43 @@ def _final_eval_worker_path(args: argparse.Namespace) -> Path:
     return _metric_dir(args) / "final_eval_workers" / f"replica_final_eval_worker_{args.gpu_id}.json"
 
 
-def _timing_entry(frames: int, seconds: float) -> dict[str, float]:
+def _timing_entry(frames: int, seconds: float, peak_vram_mb: float | None = None) -> dict[str, float]:
     frames = int(frames)
     seconds = float(seconds)
     fps = frames / seconds if seconds > 0.0 else 0.0
-    return {"frames": frames, "seconds": seconds, "fps": fps}
+    entry = {"frames": frames, "seconds": seconds, "fps": fps}
+    if peak_vram_mb is not None:
+        entry["peak_vram_mb"] = float(peak_vram_mb)
+    return entry
 
 
 def _write_worker_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
     _write_json(_worker_timing_path(args), {"build": build_timing, "metric_eval": metric_timing})
+
+
+def _worker_failures_path(args: argparse.Namespace) -> Path:
+    return _metric_dir(args) / "failed_scenes" / f"replica_failed_worker_{args.gpu_id}.json"
+
+
+def _write_worker_failures(args: argparse.Namespace, failures: dict) -> None:
+    _write_json(_worker_failures_path(args), failures)
+
+
+def _clear_failure_records(args: argparse.Namespace) -> None:
+    shutil.rmtree(_metric_dir(args) / "failed_scenes", ignore_errors=True)
+    (_metric_dir(args) / "failed_scenes.json").unlink(missing_ok=True)
+
+
+def _cleanup_cuda_runtime() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[dict, dict]:
@@ -192,6 +196,9 @@ def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[di
     metric_timing = {}
     for gpu_id in range(total_gpus):
         path = _metric_dir(args) / "timing_workers" / f"replica_timing_worker_{gpu_id}.json"
+        if not path.exists():
+            print(f"[WARN] Missing timing file from Replica worker {gpu_id}: {path}", flush=True)
+            continue
         with path.open(encoding="utf-8") as f:
             worker_timing = json.load(f)
         build_timing.update(worker_timing.get("build", {}))
@@ -199,10 +206,26 @@ def _load_parallel_timing(args: argparse.Namespace, total_gpus: int) -> tuple[di
     return build_timing, metric_timing
 
 
-def _clear_final_eval_worker_outputs(args: argparse.Namespace) -> None:
-    import shutil
+def _load_parallel_failures(args: argparse.Namespace, total_gpus: int) -> dict:
+    failures = {}
+    for gpu_id in range(total_gpus):
+        path = _metric_dir(args) / "failed_scenes" / f"replica_failed_worker_{gpu_id}.json"
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8") as f:
+            failures.update(json.load(f))
+    if failures:
+        _write_json(_metric_dir(args) / "failed_scenes.json", failures)
+    return failures
 
+
+def _clear_final_eval_worker_outputs(args: argparse.Namespace) -> None:
     shutil.rmtree(_metric_dir(args) / "final_eval_workers", ignore_errors=True)
+
+
+def _clear_final_eval_outputs(args: argparse.Namespace) -> None:
+    for filename in ("replica_pose.json", "replica_recon.json"):
+        (_metric_dir(args) / filename).unlink(missing_ok=True)
 
 
 def _mean_metric_dict(scene_metrics: dict[str, dict]) -> dict[str, float]:
@@ -259,10 +282,16 @@ def _mean_fps(scene_timing: dict) -> float:
     return float(np.mean(fps_values).item())
 
 
+def _mean_peak_vram_mb(scene_timing: dict) -> float:
+    values = [float(entry["peak_vram_mb"]) for entry in scene_timing.values() if "peak_vram_mb" in entry]
+    return float(np.mean(values).item()) if values else 0.0
+
+
 def _write_timing(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> dict:
     timing = {
         "build": {
             "mean_fps": _mean_fps(build_timing),
+            "mean_peak_vram_mb": _mean_peak_vram_mb(build_timing),
             "scenes": build_timing,
         },
         "metric_eval": {
@@ -289,6 +318,11 @@ def _skip_bad_gt_pose_scenes(args: argparse.Namespace, evaluator) -> list[tuple[
     kept, skipped = filter_scenes_with_bad_gt_pose_data(dataset, list(args.scenes))
     args.scenes = kept
     evaluator.scenes_filter = kept
+    if os.environ.get(WORKER_ENV) != "1":
+        _write_json(
+            _metric_dir(args) / "skipped_gt_pose_scenes.json",
+            {scene: report.summary() for scene, report in skipped},
+        )
     if skipped:
         scene_names = "; ".join(f"{scene} ({report.summary()})" for scene, report in skipped)
         print(f"[INFO] Skipped {len(skipped)} Replica scene(s) with bad GT pose data: {scene_names}", flush=True)
@@ -338,12 +372,17 @@ def maybe_spawn_workers(args: argparse.Namespace) -> tuple[dict, dict] | None:
         print(f"[INFO] Starting ViPE worker {idx} on GPU {visible_gpu}")
         processes.append(subprocess.Popen(cmd, env=env))
 
-    for process in processes:
+    failed_workers = []
+    for idx, process in enumerate(processes):
         process.wait()
         if process.returncode != 0:
-            raise SystemExit(process.returncode)
+            failed_workers.append((idx, process.returncode))
+
+    if failed_workers:
+        print(f"[WARN] Replica worker failures: {failed_workers}. Continuing with completed scene artifacts.", flush=True)
 
     print("[INFO] All ViPE workers completed")
+    _load_parallel_failures(args, len(gpu_list))
     return _load_parallel_timing(args, len(gpu_list))
 
 
@@ -403,9 +442,113 @@ def _scenes_for_worker(args: argparse.Namespace, evaluator) -> Iterable[str]:
     return scenes
 
 
+def _gpu_memory_used_mb() -> float:
+    visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"]
+    if "," in visible_gpu:
+        raise ValueError(f"Scene worker requires one visible GPU, got {visible_gpu}")
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--id",
+            visible_gpu,
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip())
+
+
+def _run_scene_subprocess(args: argparse.Namespace, scene: str, vipe_output_dir: Path) -> float:
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--work-dir",
+        str(args.work_dir),
+        "--input-root",
+        str(args.input_root),
+        "--raw-root",
+        str(args.raw_root),
+        "--scene-worker-scene",
+        scene,
+        "--scene-worker-output-dir",
+        str(vipe_output_dir),
+    ]
+    env = os.environ.copy()
+    env[WORKER_ENV] = "1"
+    process = subprocess.Popen(cmd, env=env)
+    peak_vram_mb = _gpu_memory_used_mb()
+    while process.poll() is None:
+        peak_vram_mb = max(peak_vram_mb, _gpu_memory_used_mb())
+        time.sleep(0.2)
+    if process.returncode != 0:
+        raise RuntimeError(f"scene subprocess exited with code {process.returncode}")
+    return peak_vram_mb
+
+
+def _scene_export_manifest_path(args: argparse.Namespace, scene: str) -> Path:
+    return args.work_dir / "model_results" / "replica" / scene / "recon" / "exports" / "vipe_manifest.json"
+
+
+def _scene_gt_meta_path(args: argparse.Namespace, scene: str) -> Path:
+    return _scene_export_manifest_path(args, scene).with_name("gt_meta.npz")
+
+
+def _scene_artifact_paths(scene_dir: Path, vipe_output_dir: Path) -> tuple[Path, Path]:
+    artifact_name = _artifact_name(scene_dir)
+    return (
+        vipe_output_dir / "pose" / f"{artifact_name}.npz",
+        vipe_output_dir / "pcd" / f"{artifact_name}_tsdf.ply",
+    )
+
+
+def _load_matching_manifest(manifest_path: Path, args: argparse.Namespace, scene: str) -> dict | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    scene_dir = _scene_dir(args, scene)
+    if int(manifest.get("frame_count", -1)) != scene_frame_count(scene_dir):
+        return None
+    contract_paths = [scene_dir / "metadata.json", scene_dir / "intrinsic" / "intrinsic_color.json"]
+    if manifest_path.stat().st_mtime_ns < max(path.stat().st_mtime_ns for path in contract_paths):
+        return None
+    return manifest
+
+
+def _scene_build_matches_request(args: argparse.Namespace, scene: str) -> bool:
+    manifest = _load_matching_manifest(_scene_export_manifest_path(args, scene), args, scene)
+    return manifest is not None and Path(manifest["pose_path"]).exists() and Path(manifest["tsdf_pcd_path"]).exists()
+
+
+def _scene_export_complete(args: argparse.Namespace, scene: str) -> bool:
+    return _scene_build_matches_request(args, scene) and _scene_gt_meta_path(args, scene).exists()
+
+
+def _completed_scenes(args: argparse.Namespace) -> list[str]:
+    return [scene for scene in args.scenes if _scene_export_complete(args, scene)]
+
+
+def _restrict_eval_to_completed_scenes(args: argparse.Namespace, evaluator) -> None:
+    completed = _completed_scenes(args)
+    dropped = [scene for scene in args.scenes if scene not in completed]
+    if dropped:
+        print(
+            f"[WARN] Skipping {len(dropped)} Replica scene(s) without complete ViPE artifacts: {', '.join(dropped)}",
+            flush=True,
+        )
+    args.scenes = completed
+    evaluator.scenes_filter = completed
+
+
 def _run_final_eval_worker(args: argparse.Namespace, evaluator) -> None:
     args.scenes = _scenes_for_worker(args, evaluator)
     evaluator.scenes_filter = args.scenes
+    _restrict_eval_to_completed_scenes(args, evaluator)
     metrics = evaluator.eval(dump=False)
     _write_json(
         _final_eval_worker_path(args),
@@ -419,12 +562,13 @@ def _run_final_eval_worker(args: argparse.Namespace, evaluator) -> None:
 def _run_final_eval(args: argparse.Namespace, evaluator) -> tuple[dict, dict]:
     gpu_list = _cuda_visible_gpu_list()
     if len(gpu_list) <= 1 or os.environ.get(WORKER_ENV) == "1":
+        _restrict_eval_to_completed_scenes(args, evaluator)
         metrics = evaluator.eval()
         return metrics, evaluator.metric_eval_timing()
 
     _clear_final_eval_worker_outputs(args)
     base_cmd = _append_common_cli_args(
-        [sys.executable, os.path.abspath(__file__), "--final-eval-worker"],
+        [sys.executable, os.path.abspath(__file__), "--do-final-eval", "--final-eval-worker"],
         args,
     )
 
@@ -467,29 +611,60 @@ def prepare_vipe_benchmark_exports(
 ) -> tuple[dict, dict]:
     build_timing = {}
     metric_timing = {}
+    failures = {}
     for scene in _scenes_for_worker(args, evaluator):
         start_scene = time.perf_counter()
         scene_dir = _scene_dir(args, scene)
         vipe_output_dir = _resolve_vipe_output_dir(args, scene)
-        full_scene_data, frame_indices, kept_scene_indices = _benchmark_frame_request(evaluator, scene)
+        scene_data = evaluator.datasets["replica"].get_data(scene)
+        pose_path, tsdf_pcd_path = _scene_artifact_paths(scene_dir, vipe_output_dir)
+        if _scene_export_complete(args, scene):
+            print(f"[INFO] Reusing existing ViPE artifacts | {scene}", flush=True)
+            continue
+        if pose_path.exists() and tsdf_pcd_path.exists() and _scene_build_matches_request(args, scene):
+            print(f"[INFO] Reusing existing ViPE build outputs and refreshing manifest | {scene}", flush=True)
+            _write_vipe_manifest(
+                args,
+                evaluator,
+                scene,
+                scene_data,
+                vipe_output_dir,
+                _artifact_name(scene_dir),
+                pipeline_cfg,
+            )
+            continue
+        if pose_path.exists() or tsdf_pcd_path.exists():
+            print(f"[INFO] Removing stale ViPE artifacts for changed canonical input | {scene}", flush=True)
+            shutil.rmtree(vipe_output_dir, ignore_errors=True)
+            shutil.rmtree(args.work_dir / "model_results" / "replica" / scene, ignore_errors=True)
         start_build = time.perf_counter()
-        run_vipe(scene_dir, pipeline_cfg, vipe_output_dir)
+        try:
+            peak_vram_mb = _run_scene_subprocess(args, scene, vipe_output_dir)
+        except Exception as exc:
+            failures[scene] = str(exc)
+            print(f"[WARN] Skipping Replica scene after ViPE failure | {scene} | {exc}", flush=True)
+            shutil.rmtree(vipe_output_dir, ignore_errors=True)
+            shutil.rmtree(args.work_dir / "model_results" / "replica" / scene, ignore_errors=True)
+            _write_worker_failures(args, failures)
+            _cleanup_cuda_runtime()
+            continue
         build_seconds = time.perf_counter() - start_build
         _write_vipe_manifest(
             args,
             evaluator,
             scene,
-            full_scene_data,
-            frame_indices,
-            kept_scene_indices,
+            scene_data,
             vipe_output_dir,
             _artifact_name(scene_dir),
             pipeline_cfg,
         )
-        frames = len(frame_indices)
+        frames = len(scene_data.image_files)
         metric_seconds = max(0.0, time.perf_counter() - start_scene - build_seconds)
-        build_timing[scene] = _timing_entry(frames, build_seconds)
+        build_timing[scene] = _timing_entry(frames, build_seconds, peak_vram_mb)
         metric_timing[scene] = _timing_entry(frames, metric_seconds)
+        _cleanup_cuda_runtime()
+    if failures:
+        _write_worker_failures(args, failures)
     return build_timing, metric_timing
 
 
@@ -559,6 +734,18 @@ def print_replica_summary(metrics) -> None:
     print(f"{'Metric Eval':<{col1}}{_fmt_fps(_get_nested(timing, 'metric_eval', 'mean_fps')):<{col2}}")
 
 
+def _finish_without_final_eval(args: argparse.Namespace, build_timing: dict, metric_timing: dict) -> None:
+    _clear_final_eval_outputs(args)
+    timing = _write_timing(args, build_timing, metric_timing)
+    completed = len(_completed_scenes(args))
+    print(
+        f"[INFO] Skipping final Replica eval (--do-final-eval not set). "
+        f"Completed artifacts: {completed}/{len(args.scenes)} | "
+        f"build_fps={timing['build']['mean_fps']:.2f}",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -566,6 +753,16 @@ def main() -> None:
     eval_config = load_yaml_config(EVAL_CONFIG_PATH)
     seed_everything(int(eval_config.seed), temporary_determinism=eval_config.temporary_determinism)
     is_worker = os.environ.get(WORKER_ENV) == "1"
+
+    if args.scene_worker_scene is not None:
+        if args.scene_worker_output_dir is None:
+            raise ValueError("--scene-worker-output-dir is required with --scene-worker-scene")
+        run_vipe(
+            _scene_dir(args, args.scene_worker_scene),
+            pipeline_cfg,
+            args.scene_worker_output_dir,
+        )
+        return
 
     evaluator = _load_evaluator(args, eval_config)
     if args.scenes is None:
@@ -585,9 +782,17 @@ def main() -> None:
         _run_final_eval_worker(args, evaluator)
         return
 
+    if not is_worker:
+        _clear_failure_records(args)
+        if not args.do_final_eval:
+            _clear_final_eval_outputs(args)
+
     build_timing = maybe_spawn_workers(args)
     if build_timing is not None:
         build_scene_timing, metric_scene_timing = build_timing
+        if not args.do_final_eval:
+            _finish_without_final_eval(args, build_scene_timing, metric_scene_timing)
+            return
         metrics, final_metric_timing = _run_final_eval(args, evaluator)
         metric_scene_timing = _merge_scene_timing(metric_scene_timing, final_metric_timing)
         metrics["replica_timing"] = _write_timing(args, build_scene_timing, metric_scene_timing)
@@ -597,6 +802,9 @@ def main() -> None:
     build_scene_timing, metric_scene_timing = prepare_vipe_benchmark_exports(args, evaluator, pipeline_cfg)
     if is_worker:
         _write_worker_timing(args, build_scene_timing, metric_scene_timing)
+        return
+    if not args.do_final_eval:
+        _finish_without_final_eval(args, build_scene_timing, metric_scene_timing)
         return
     metrics, final_metric_timing = _run_final_eval(args, evaluator)
     metric_scene_timing = _merge_scene_timing(metric_scene_timing, final_metric_timing)

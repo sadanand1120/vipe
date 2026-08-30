@@ -611,16 +611,18 @@ class ScanNetDataset:
         with open(result_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _load_vipe_pose_map(self, manifest: dict) -> dict[int, np.ndarray]:
+    def _load_vipe_poses(self, manifest: dict) -> np.ndarray:
         pose_npz = np.load(manifest["pose_path"])
-        return {int(idx): pose.astype(np.float32) for idx, pose in zip(pose_npz["inds"], pose_npz["data"])}
+        poses = pose_npz["data"].astype(np.float32)
+        indices = pose_npz["inds"].astype(np.int64)
+        expected_count = int(manifest["frame_count"])
+        if len(poses) != expected_count or not np.array_equal(indices, np.arange(expected_count)):
+            raise ValueError("ViPE poses do not match the contiguous canonical frame sequence")
+        return poses
 
     def load_pred_extrinsics(self, result_path: str) -> np.ndarray:
         manifest = self._load_vipe_manifest(result_path)
-        pose_map = self._load_vipe_pose_map(manifest)
-        return np.stack(
-            [np.linalg.inv(pose_map[int(frame_idx)]).astype(np.float32) for frame_idx in manifest["frame_indices"]]
-        )
+        return np.stack([np.linalg.inv(pose).astype(np.float32) for pose in self._load_vipe_poses(manifest)])
 
     def _tsdf_pcd_path(self, result_path: str) -> str:
         manifest = self._load_vipe_manifest(result_path)
@@ -650,14 +652,13 @@ class ScanNetDataset:
         gt_meta = self._load_gt_meta(result_path)
         if gt_meta is None:
             gt_meta = self.get_data(scene)
-        frame_indices = [int(idx) for idx in manifest["frame_indices"]]
-        if len(gt_meta.extrinsics) != len(frame_indices):
+        frame_count = int(manifest["frame_count"])
+        if len(gt_meta.extrinsics) != frame_count:
             raise ValueError(
-                f"GT metadata length ({len(gt_meta.extrinsics)}) does not match manifest frame count ({len(frame_indices)})"
+                f"GT metadata length ({len(gt_meta.extrinsics)}) does not match manifest frame count ({frame_count})"
             )
 
-        pose_map = self._load_vipe_pose_map(manifest)
-        pred_c2w = np.stack([as_homogeneous(pose_map[idx]).astype(np.float64) for idx in frame_indices])
+        pred_c2w = np.stack([as_homogeneous(pose).astype(np.float64) for pose in self._load_vipe_poses(manifest)])
         pred_c2w_valid, gt_w2c_valid = _filter_valid_poses(pred_c2w, gt_meta.extrinsics, f"{self.DATASET_LABEL} {scene} align")
         se3, gt_c2w_valid = _first_camera_se3(pred_c2w_valid, gt_w2c_valid)
         scale_diagnostic = _first_camera_scale_diagnostic(pred_c2w_valid, gt_c2w_valid, se3)

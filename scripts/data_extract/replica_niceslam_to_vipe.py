@@ -12,7 +12,16 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from vipe.utils.data_format import frame_stem, write_pinhole_intrinsics, write_scene_metadata
+from vipe.utils.data_format import (
+    DEFAULT_VIPE_FPS,
+    frame_stem,
+    long_side_size,
+    rescale_pinhole_matrix,
+    resize_image,
+    subsampled_frame_indices,
+    write_pinhole_intrinsics,
+    write_scene_metadata,
+)
 
 
 STANDARD_REPLICA_SCENES = (
@@ -39,6 +48,7 @@ REPLICA_BASE_FY = 600.0
 REPLICA_BASE_CX = 599.5
 REPLICA_BASE_CY = 339.5
 REPLICA_DEPTH_SCALE = 6553.5
+REPLICA_FPS = 30.0
 PROGRESS_UPDATE_INTERVAL = 16
 
 
@@ -240,7 +250,8 @@ def validate_scene(niceslam_root: Path, full_root: Path, scene_name: str) -> dic
 def export_scene(
     scene_info: dict,
     output_root: Path,
-    frame_skip: int,
+    vipe_res: int,
+    vipe_fps: float,
     show_progress: bool = True,
     progress_queue=None,
     worker_idx: int | None = None,
@@ -249,13 +260,13 @@ def export_scene(
     output_scene_dir = output_root / scene_name
     prepare_scene_dir(output_scene_dir, [scene_info["scene_dir"], scene_info["full_scene_dir"]])
 
-    width = int(scene_info["width"])
-    height = int(scene_info["height"])
-    intrinsics = load_replica_intrinsics(width, height)
+    source_size = (int(scene_info["width"]), int(scene_info["height"]))
+    output_size = long_side_size(*source_size, vipe_res)
+    intrinsics = rescale_pinhole_matrix(load_replica_intrinsics(*source_size), source_size, output_size)
     write_pinhole_intrinsics(
         output_scene_dir / "intrinsic" / "intrinsic_color.json",
-        width=width,
-        height=height,
+        width=output_size[0],
+        height=output_size[1],
         fx=intrinsics[0, 0],
         fy=intrinsics[1, 1],
         cx=intrinsics[0, 2],
@@ -268,7 +279,7 @@ def export_scene(
         },
     )
 
-    selected_indices = list(range(0, len(scene_info["frame_ids"]), frame_skip))
+    selected_indices = subsampled_frame_indices(len(scene_info["frame_ids"]), REPLICA_FPS, vipe_fps)
     if show_progress:
         print(f"Exporting {scene_name}: {len(selected_indices)} frames")
     else:
@@ -290,18 +301,19 @@ def export_scene(
             raise ValueError(f"Could not read Replica color frame: {color_path}")
         if depth_raw is None:
             raise ValueError(f"Could not read Replica depth frame: {depth_path}")
-        if color.shape[:2] != (height, width):
+        if color.shape[:2] != (source_size[1], source_size[0]):
             raise ValueError(
-                f"Replica color size changed within {scene_name}: expected {width}x{height}, "
+                f"Replica color size changed within {scene_name}: expected {source_size[0]}x{source_size[1]}, "
                 f"got {color.shape[1]}x{color.shape[0]} for {color_path}"
             )
-        if depth_raw.shape[:2] != (height, width):
+        if depth_raw.shape[:2] != (source_size[1], source_size[0]):
             raise ValueError(
-                f"Replica depth size changed within {scene_name}: expected {width}x{height}, "
+                f"Replica depth size changed within {scene_name}: expected {source_size[0]}x{source_size[1]}, "
                 f"got {depth_raw.shape[1]}x{depth_raw.shape[0]} for {depth_path}"
             )
 
-        depth_mm = convert_depth_to_mm(depth_raw)
+        color = resize_image(color, output_size)
+        depth_mm = resize_image(convert_depth_to_mm(depth_raw), output_size, nearest=True)
         stem = frame_stem(export_idx)
         out_color_path = output_scene_dir / "color" / f"{stem}.png"
         out_depth_path = output_scene_dir / "depth" / f"{stem}.png"
@@ -332,8 +344,9 @@ def export_scene(
     write_scene_metadata(
         output_scene_dir,
         name=scene_name,
-        width=width,
-        height=height,
+        width=output_size[0],
+        height=output_size[1],
+        fps=vipe_fps,
         frames=frames,
         source={
             "dataset": "Replica",
@@ -344,7 +357,8 @@ def export_scene(
             "full_replica_scene_dir": str(scene_info["full_scene_dir"]),
             "full_replica_mesh_file": str(scene_info["full_scene_dir"] / "mesh.ply"),
             "full_replica_habitat_semantic": str(scene_info["full_scene_dir"] / "habitat" / "mesh_semantic.ply"),
-            "frame_skip": int(frame_skip),
+            "source_fps": REPLICA_FPS,
+            "vipe_res": vipe_res,
             "depth_unit_original": "uint16_scaled_depth",
             "depth_scale_original": REPLICA_DEPTH_SCALE,
             "depth_unit_exported": "millimeter",
@@ -357,7 +371,8 @@ def process_scene(
     niceslam_root: Path,
     full_root: Path,
     output_root: Path,
-    frame_skip: int,
+    vipe_res: int,
+    vipe_fps: float,
     show_progress: bool = True,
     progress_queue=None,
     worker_idx: int | None = None,
@@ -368,7 +383,8 @@ def process_scene(
     export_scene(
         scene_info,
         output_root,
-        frame_skip,
+        vipe_res,
+        vipe_fps,
         show_progress=show_progress,
         progress_queue=progress_queue,
         worker_idx=worker_idx,
@@ -376,7 +392,16 @@ def process_scene(
     return scene_name
 
 
-def replica_worker(task_queue, progress_queue, niceslam_root: Path, full_root: Path, output_root: Path, frame_skip: int, worker_idx: int) -> None:
+def replica_worker(
+    task_queue,
+    progress_queue,
+    niceslam_root: Path,
+    full_root: Path,
+    output_root: Path,
+    vipe_res: int,
+    vipe_fps: float,
+    worker_idx: int,
+) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     while True:
         scene_name = task_queue.get()
@@ -388,7 +413,8 @@ def replica_worker(task_queue, progress_queue, niceslam_root: Path, full_root: P
                 niceslam_root,
                 full_root,
                 output_root,
-                frame_skip,
+                vipe_res,
+                vipe_fps,
                 show_progress=False,
                 progress_queue=progress_queue,
                 worker_idx=worker_idx,
@@ -404,7 +430,8 @@ def run_parallel_scenes(
     niceslam_root: Path,
     full_root: Path,
     output_root: Path,
-    frame_skip: int,
+    vipe_res: int,
+    vipe_fps: float,
     num_workers: int,
 ) -> None:
     worker_count = min(num_workers, len(scene_names))
@@ -419,7 +446,7 @@ def run_parallel_scenes(
     workers = [
         ctx.Process(
             target=replica_worker,
-            args=(task_queue, progress_queue, niceslam_root, full_root, output_root, frame_skip, worker_idx),
+            args=(task_queue, progress_queue, niceslam_root, full_root, output_root, vipe_res, vipe_fps, worker_idx),
         )
         for worker_idx in range(worker_count)
     ]
@@ -474,22 +501,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--niceslam-root", required=True, type=Path, help="Replica NICE-SLAM RGB-D root")
     parser.add_argument("--full-root", required=True, type=Path, help="Full Replica asset root")
     parser.add_argument("--output-root", required=True, type=Path, help="Directory to write canonical ViPE scenes into")
-    parser.add_argument("--frame-skip", type=int, default=1, help="Write every Nth source frame")
+    parser.add_argument("--vipe-res", type=int, default=1280, help="Canonical output image long side (default: 1280)")
+    parser.add_argument("--vipe-fps", type=float, default=DEFAULT_VIPE_FPS, help="Canonical output FPS (default: 5)")
     parser.add_argument("--num-workers", type=int, default=1, help="Number of scenes to extract in parallel")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.frame_skip < 1:
-        raise ValueError("--frame-skip must be >= 1")
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
+    if args.vipe_res < 1:
+        raise ValueError("--vipe-res must be >= 1")
+    if args.vipe_fps <= 0.0:
+        raise ValueError("--vipe-fps must be positive")
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     if args.num_workers == 1:
         for scene_name in STANDARD_REPLICA_SCENES:
-            process_scene(scene_name, args.niceslam_root, args.full_root, args.output_root, args.frame_skip)
+            process_scene(
+                scene_name,
+                args.niceslam_root,
+                args.full_root,
+                args.output_root,
+                args.vipe_res,
+                args.vipe_fps,
+            )
         return
 
     run_parallel_scenes(
@@ -497,7 +534,8 @@ def main() -> None:
         args.niceslam_root,
         args.full_root,
         args.output_root,
-        args.frame_skip,
+        args.vipe_res,
+        args.vipe_fps,
         args.num_workers,
     )
 

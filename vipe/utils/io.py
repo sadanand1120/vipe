@@ -152,6 +152,6 @@ def save_artifacts(
 
     if n_frames > 0:
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
-        np.savez(out_path.pose_path, data=pose_matrices, inds=np.arange(n_frames))
+        np.savez(out_path.pose_path, data=pose_matrices, inds=np.arange(n_frames, dtype=np.int64))
 
     _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)
