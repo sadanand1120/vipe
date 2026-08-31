@@ -5,6 +5,8 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import torch
 
+from vipe.utils.logging import pbar
+
 
 @torch.no_grad()
 def visible_points(
@@ -66,7 +68,6 @@ def lift_masks(
     height: int,
     occlusion_tolerance: float,
     min_voxels: int,
-    log: Callable[[str], None] = print,
 ) -> tuple[dict, dict[int, np.ndarray]]:
     """Lift masks into sparse atom evidence and accumulate adjacent-atom affinity."""
     atom_of = np.asarray(atom_of, np.int64)
@@ -82,9 +83,8 @@ def lift_masks(
     lifted_frame_count = 0
     track_unions: dict[int, np.ndarray] = {}
 
-    for position, frame_index in enumerate(frames, 1):
-        if position % 100 == 0 or position == len(frames):
-            log(f"  [instance] lift {position}/{len(frames)} frames={lifted_frame_count}")
+    progress = pbar(frames, desc="Instance masks + lift", unit="frame")
+    for frame_index in progress:
         indices, u, v = visible_points(
             points,
             c2w_of(frame_index),
@@ -167,6 +167,8 @@ def lift_masks(
             visible_flag[visible_atoms] = False
             masked_flag[masked_atoms] = False
             lifted_frame_count += 1
+        if hasattr(progress, "set_postfix_str"):
+            progress.set_postfix_str(f"lifted={lifted_frame_count}", refresh=False)
 
     def _csr(rows, keys, counts):
         if not rows:

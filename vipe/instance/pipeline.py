@@ -109,17 +109,16 @@ def _spatial_instance_colors(points: np.ndarray, owner: np.ndarray, count: int) 
     return colors
 
 
-def write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndarray]) -> None:
-    """Write a smallest-hypothesis-wins visualization of the TSDF surface prediction."""
-    owner = np.full(len(points), -1, np.int32)
-    owner_size = np.full(len(points), np.iinfo(np.int64).max, np.int64)
-    for hypothesis_id, voxels in enumerate(hypotheses):
-        take = voxels[len(voxels) < owner_size[voxels]]
-        owner[take] = hypothesis_id
-        owner_size[take] = len(voxels)
+def _write_labeled_ply(path: Path, points: np.ndarray, labels: np.ndarray) -> None:
+    labels = np.asarray(labels, dtype=np.int32)
+    if labels.shape != (len(points),):
+        raise ValueError(f"Point labels must have shape ({len(points)},), got {labels.shape}")
+    visible = np.unique(labels[labels >= 0])
+    compact = np.full(len(labels), -1, dtype=np.int32)
+    compact[labels >= 0] = np.searchsorted(visible, labels[labels >= 0])
     colors = np.tile(np.array([60, 60, 60], np.uint8), (len(points), 1))
-    assigned = owner >= 0
-    colors[assigned] = _spatial_instance_colors(points, owner, len(hypotheses))[owner[assigned]]
+    assigned = compact >= 0
+    colors[assigned] = _spatial_instance_colors(points, compact, len(visible))[compact[assigned]]
 
     records = np.empty(
         len(points),
@@ -135,7 +134,7 @@ def write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndarr
     )
     records["x"], records["y"], records["z"] = points.T
     records["red"], records["green"], records["blue"] = colors.T
-    records["instance"] = owner
+    records["instance"] = labels
     header = (
         "ply\nformat binary_little_endian 1.0\n"
         f"element vertex {len(points)}\n"
@@ -147,6 +146,22 @@ def write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndarr
     with path.open("wb") as handle:
         handle.write(header)
         handle.write(records.tobytes())
+
+
+def write_labeled_instance_ply(path: Path, points: np.ndarray, labels: np.ndarray) -> None:
+    """Write one preserved instance ID per point with spatially contrasting colors."""
+    _write_labeled_ply(path, points, labels)
+
+
+def write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndarray]) -> None:
+    """Write a smallest-hypothesis-wins visualization of the TSDF surface prediction."""
+    owner = np.full(len(points), -1, np.int32)
+    owner_size = np.full(len(points), np.iinfo(np.int64).max, np.int64)
+    for hypothesis_id, voxels in enumerate(hypotheses):
+        take = voxels[len(voxels) < owner_size[voxels]]
+        owner[take] = hypothesis_id
+        owner_size[take] = len(voxels)
+    _write_labeled_ply(path, points, owner)
 
 
 class InstancePipeline:

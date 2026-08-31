@@ -171,4 +171,5 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
     assert result["r90"] == 1.0
     assert result["n_hyps"] == 2
     assert result["ate_se3_m"] < 1e-12
+    assert (output_dir / "pcd" / f"{scene}_instances_gt.ply").is_file()
     assert (output_dir / "pcd" / f"{scene}_instances_gtmatch.ply").is_file()

@@ -5,6 +5,8 @@ import tempfile
 import time
 
 from collections.abc import Callable, Sequence
+from functools import partial
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -77,6 +79,7 @@ class SAM2Tracker:
 
     def __init__(self, config, device: torch.device) -> None:
         from sam2.build_sam import build_sam2_video_predictor
+        from tqdm import tqdm
 
         values = dict(config)
         self.threshold = float(values["threshold"])
@@ -87,6 +90,10 @@ class SAM2Tracker:
             device=str(device),
             apply_postprocessing=False,
         )
+        # SAM2 has no progress toggle; ViPE owns one scene-level lift bar instead.
+        silent_tqdm = partial(tqdm, disable=True)
+        import_module(type(self.predictor).__module__).tqdm = silent_tqdm
+        import_module("sam2.utils.misc").tqdm = silent_tqdm
 
     def track(
         self, frame_directory: Path, frame_count: int, seeds: Sequence[tuple[int, np.ndarray]]
@@ -138,7 +145,6 @@ class StreamingMasks:
         config,
         jpeg_quality: int,
         device: torch.device,
-        log: Callable[[str], None] = print,
     ) -> None:
         self.keyframes = [int(frame) for frame in keyframes]
         self.position = {frame: index for index, frame in enumerate(self.keyframes)}
@@ -151,7 +157,6 @@ class StreamingMasks:
         self.sam2_config = config["sam2"]
         self.jpeg_quality = int(jpeg_quality)
         self.device = device
-        self.log = log
         self.frame_masks: dict[int, list[dict]] = {}
         self.built_chunk = -1
         self.next_track_id = 0
@@ -346,12 +351,9 @@ def generate_and_lift(
     lift_config,
     jpeg_quality: int,
     device: torch.device,
-    log: Callable[[str], None] = print,
 ):
     """Run the frozen mask, propagation, lift, and global-linking path."""
-    masks = StreamingMasks(
-        keyframes, rgb_of, width, height, config, jpeg_quality, device, log
-    )
+    masks = StreamingMasks(keyframes, rgb_of, width, height, config, jpeg_quality, device)
     evidence, track_unions = lift_masks(
         points,
         atom_of,
@@ -365,7 +367,6 @@ def generate_and_lift(
         height,
         float(lift_config["occlusion_tolerance_m"]),
         int(lift_config["min_voxels"]),
-        log,
     )
     masks.finalize(evidence, track_unions)
     global_tracks = int(np.unique(evidence["global_track_ids"]).size)

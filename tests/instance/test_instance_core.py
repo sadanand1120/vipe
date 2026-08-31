@@ -71,7 +71,6 @@ def test_lift_streams_atom_csr_and_exact_track_unions() -> None:
         1,
         0.05,
         1,
-        lambda _: None,
     )
     np.testing.assert_array_equal(evidence["leafI_ptr"], [0, 2, 4])
     np.testing.assert_array_equal(evidence["leafI_gm"], [0, 1, 0, 1])
@@ -104,7 +103,6 @@ def test_affinity_counts_one_sided_mask_frames_as_disagreement() -> None:
         1,
         0.05,
         1,
-        lambda _: None,
     )
     np.testing.assert_allclose(evidence["affinity_num"], [1.0])
     np.testing.assert_array_equal(evidence["affinity_weight"], [2.0])
@@ -140,7 +138,6 @@ def test_streamed_affinity_matches_sequence_wide_sparse_formula() -> None:
         1,
         0.05,
         1,
-        lambda _: None,
     )
 
     gm_frame = evidence["gm_frame"]
@@ -218,7 +215,7 @@ def test_sam1_and_sam2_consume_the_same_chunk_jpeg() -> None:
         "stitch": {"min_iou": 0.8, "margin": 1.2},
     }
     rgb = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
-    masks = StreamingMasks([0], lambda _: rgb, 8, 6, config, 83, torch.device("cpu"), lambda _: None)
+    masks = StreamingMasks([0], lambda _: rgb, 8, 6, config, 83, torch.device("cpu"))
     masks._models = lambda: (SAM1(), SAM2())
     masks._build_chunk(0)
 

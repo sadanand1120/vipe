@@ -255,9 +255,9 @@ pcd/<scene>_instances.ply       smallest-hypothesis-wins visualization
 
 The instance NPZ is authoritative. It stores retained TSDF surface points, concatenated hypothesis point indices, offsets, K, the `tsdf_surface` domain tag, and the TSDF voxel edge. The visualization PLY is not used by the algorithm or metric. Its colors are assigned so hypotheses that touch on the output surface are visually distinct.
 
-## Replica Evaluation Boundary
+## Instance Evaluation Boundary
 
-Replica evaluation is separate from runtime. It builds a GT 2 cm cloud from canonical depth and GT poses, labels it from `mesh_semantic.ply`, aligns the predicted ViPE trajectory to GT by first solving one global SE3 transform, and transfers GT instance IDs to the predicted TSDF surface by nearest neighbor.
+Instance evaluation is separate from runtime. It builds a GT 2 cm cloud from canonical depth and GT poses, aligns the predicted ViPE trajectory to GT by solving one global SE3 transform, and transfers GT instance IDs to the predicted TSDF surface by nearest neighbor. Replica labels the GT cloud from `mesh_semantic.ply`; ScanNet maps its aggregation groups through the oversegmentation IDs onto `_vh_clean_2.ply`, then labels the GT cloud from that annotated mesh.
 
 Known annotation-debris IDs are relabeled to background before scoring:
 
@@ -271,7 +271,7 @@ Excluded labels remain represented on the prediction surface as background, so t
 
 For each GT instance `g`, evaluation computes the best point-set IoU over all hypotheses. Average Recall is the mean recall over IoU thresholds `0.50, 0.55, ..., 0.95`. R50, R75, R90, hypothesis count, and mean/max point membership are reported alongside AR.
 
-Evaluation also writes `pcd/<scene>_instances_gtmatch.ply`. It keeps the unique best predicted hypothesis for every GT instance whose best IoU is at least `0.30`, then applies the same smallest-hypothesis-wins visualization and spatially contrasting colors. This is a benchmark visualization only: GT labels select hypotheses after runtime has completed and never enter instance distillation.
+Evaluation writes `pcd/<scene>_instances_gt.ply`, which colors the predicted TSDF domain by transferred GT instance ID, and `pcd/<scene>_instances_gtmatch.ply`, which keeps the unique best predicted hypothesis for every GT instance whose best IoU is at least `0.30`. Both use spatially contrasting colors. These are benchmark visualizations only: GT labels never enter instance distillation.
 
 ## Determinism And Lifetime
 

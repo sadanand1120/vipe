@@ -92,13 +92,17 @@ Instance-enabled runs additionally save:
 
 The class-agnostic algorithm and its explicit relation to ViPE Stages 1-5 are documented in [`ALGORITHM.md`](ALGORITHM.md).
 
-## Replica Instance Benchmark
+## Instance Benchmarks
 
 ```bash
 python3 scripts/replica_instance_bench_evaluator.py --scenes office0 office2 room0 --work-dir workspace/evaluation_replica_instance --input-root data/replica --raw-root /robodata/smodak/datasets/Replica_full --do-final-eval
+
+python3 scripts/scannet_instance_bench_evaluator.py --scenes scene0011_00 --work-dir workspace/evaluation_scannet_instance --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans --do-final-eval
 ```
 
-The benchmark runs instance distillation inside `VipePipeline.run()`, records build timing and peak VRAM, and evaluates the overlapping hypothesis soup with fixed-`K=5` AR. Runtime parameters live in `configs/default_instance.yaml`; GT projection, metric thresholds, and audited Replica label exclusions live in `configs/eval_replica_instance_config.yaml`. Instance hypotheses index a deterministic native-resolution subset of the same TSDF surface written by Stage 5; no second all-frame reconstruction is built. Evaluation also writes `pcd/<scene>_instances_gtmatch.ply`, retaining the unique best predicted hypothesis for each GT instance when its IoU is at least `0.30`.
+Both benchmarks run instance distillation inside `VipePipeline.run()`, record build timing and peak VRAM, and evaluate the overlapping hypothesis soup with fixed-`K=5` AR. Runtime parameters live in `configs/default_instance.yaml`; dataset-specific GT projection and metric parameters live in `configs/eval_replica_instance_config.yaml` and `configs/eval_scannet_instance_config.yaml`. Instance hypotheses index a deterministic native-resolution subset of the same TSDF surface written by Stage 5; no second all-frame reconstruction is built.
+
+Evaluation writes two additional visualizations on the predicted TSDF instance domain. `pcd/<scene>_instances_gt.ply` shows the GT labels transferred to every predicted point and preserves those IDs in the `instance` property. `pcd/<scene>_instances_gtmatch.ply` retains the unique best predicted hypothesis for each GT instance when its IoU is at least `0.30`.
 
 ## ScanNet Benchmark
 

@@ -1,0 +1,25 @@
+seed: 42                                  # Seed evaluator-side NumPy/SciPy work.
+temporary_determinism: true               # Match the deterministic runtime setup.
+
+dataset:
+  gt_mesh_suffix: _vh_clean_2.ply         # Preferred raw ScanNet mesh used by pose-data validation.
+  gt_mesh_fallback_suffix: _vh_clean.ply  # Fallback raw ScanNet mesh suffix.
+
+cloud:
+  voxel_m: 0.02                           # Fixed GT evaluation-cloud voxel edge.
+  depth_min_m: 0.1                        # Reject invalid and near-field GT depth.
+  depth_max_m: 5.0                        # Match ViPE TSDF's far-depth cutoff.
+
+labels:
+  mesh_neighbors: 5                       # Annotated-mesh neighbors used for majority-vote GT labels.
+  mesh_max_distance_m: 0.10               # Reject GT cloud points farther than this from the annotated mesh.
+
+metric:
+  iou_min: 0.50                           # Lowest recall IoU threshold.
+  iou_max: 0.95                           # Highest recall IoU threshold.
+  iou_step: 0.05                          # AR averages recall over 0.50, 0.55, ..., 0.95.
+
+outputs:
+  metrics_filename: scannet_instance.json
+  timing_filename: scannet_instance_timing.json
+  gt_cache_filename: gt_occupancy_labels_2cm.npz
