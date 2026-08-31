@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -84,9 +85,35 @@ struct PlyVertex {
 
 static_assert(sizeof(PlyVertex) == 30, "PLY vertex layout must match the Python structured dtype");
 
+static constexpr size_t kPlyChunkVertices = 65536;
+
+struct Representative {
+    PlyVertex vertex;
+    float distance_sq;
+};
+
 static uint8_t clamp_ply_color(float value) {
     value = std::min(255.0f, std::max(0.0f, value));
     return static_cast<uint8_t>(std::round(value));
+}
+
+static void write_ply_header(std::ofstream &ply_file, int64_t vertex_count) {
+    ply_file << "ply\n"
+             << "format binary_little_endian 1.0\n"
+             << "element vertex " << vertex_count << "\n"
+             << "property float x\n"
+             << "property float y\n"
+             << "property float z\n"
+             << "property float nx\n"
+             << "property float ny\n"
+             << "property float nz\n"
+             << "property uchar red\n"
+             << "property uchar green\n"
+             << "property uchar blue\n"
+             << "property uchar normals_red\n"
+             << "property uchar normals_green\n"
+             << "property uchar normals_blue\n"
+             << "end_header\n";
 }
 
 struct Matrix4f {
@@ -364,7 +391,100 @@ class TSDFVolume {
         });
     }
 
-    std::vector<torch::Tensor> extract_point_cloud(int64_t max_points) const {
+    std::tuple<torch::Tensor, torch::Tensor, int64_t> write_point_cloud(
+            const std::string &path,
+            int64_t max_points,
+            bool select_representatives) const {
+        const std::vector<SurfaceTriangle> triangles = surface_triangles();
+        const int64_t out_count = surface_sample_count(triangles, max_points);
+        auto float_options = torch::dtype(torch::kFloat32).device(torch::kCPU);
+        if (out_count == 0) {
+            return {torch::empty({0, 3}, float_options), torch::empty({0, 3}, float_options), 0};
+        }
+
+        std::ofstream ply_file(path, std::ios::binary);
+        TORCH_CHECK(ply_file.good(), "Could not open PLY for writing: ", path);
+        write_ply_header(ply_file, out_count);
+
+        std::vector<PlyVertex> chunk;
+        chunk.reserve(std::min<size_t>(kPlyChunkVertices, static_cast<size_t>(out_count)));
+        std::unordered_map<BlockKey, Representative, BlockKeyHash> representatives;
+        auto flush_chunk = [&]() {
+            ply_file.write(
+                    reinterpret_cast<const char *>(chunk.data()),
+                    static_cast<std::streamsize>(chunk.size() * sizeof(PlyVertex)));
+            chunk.clear();
+        };
+
+        for_each_surface_sample(triangles, max_points, [&](int64_t, const SurfaceVertex &vertex) {
+            const PlyVertex ply_vertex = make_ply_vertex(vertex);
+            chunk.push_back(ply_vertex);
+            if (chunk.size() == kPlyChunkVertices) {
+                flush_chunk();
+            }
+
+            if (!select_representatives) {
+                return;
+            }
+            const BlockKey cell = {
+                    static_cast<int>(std::floor(ply_vertex.x / voxel_edge_m_)),
+                    static_cast<int>(std::floor(ply_vertex.y / voxel_edge_m_)),
+                    static_cast<int>(std::floor(ply_vertex.z / voxel_edge_m_)),
+            };
+            const float center_x = (static_cast<float>(cell.x) + 0.5f) * voxel_edge_m_;
+            const float center_y = (static_cast<float>(cell.y) + 0.5f) * voxel_edge_m_;
+            const float center_z = (static_cast<float>(cell.z) + 0.5f) * voxel_edge_m_;
+            const float dx = ply_vertex.x - center_x;
+            const float dy = ply_vertex.y - center_y;
+            const float dz = ply_vertex.z - center_z;
+            float distance_sq = dx * dx;
+            distance_sq += dy * dy;
+            distance_sq += dz * dz;
+
+            auto inserted = representatives.emplace(cell, Representative{ply_vertex, distance_sq});
+            if (!inserted.second && distance_sq < inserted.first->second.distance_sq) {
+                inserted.first->second = {ply_vertex, distance_sq};
+            }
+        });
+        if (!chunk.empty()) {
+            flush_chunk();
+        }
+        TORCH_CHECK(ply_file.good(), "Failed while writing PLY: ", path);
+
+        if (!select_representatives) {
+            return {torch::empty({0, 3}, float_options), torch::empty({0, 3}, float_options), out_count};
+        }
+
+        std::vector<const std::pair<const BlockKey, Representative> *> ordered;
+        ordered.reserve(representatives.size());
+        for (const auto &item : representatives) {
+            ordered.push_back(&item);
+        }
+        std::sort(ordered.begin(), ordered.end(), [](const auto *a, const auto *b) {
+            if (a->first.x != b->first.x) return a->first.x < b->first.x;
+            if (a->first.y != b->first.y) return a->first.y < b->first.y;
+            return a->first.z < b->first.z;
+        });
+
+        const int64_t representative_count = static_cast<int64_t>(ordered.size());
+        auto points = torch::empty({representative_count, 3}, float_options);
+        auto normals = torch::empty({representative_count, 3}, float_options);
+        float *points_ptr = points.data_ptr<float>();
+        float *normals_ptr = normals.data_ptr<float>();
+        for (int64_t i = 0; i < representative_count; ++i) {
+            const PlyVertex &vertex = ordered[static_cast<size_t>(i)]->second.vertex;
+            points_ptr[i * 3 + 0] = vertex.x;
+            points_ptr[i * 3 + 1] = vertex.y;
+            points_ptr[i * 3 + 2] = vertex.z;
+            normals_ptr[i * 3 + 0] = vertex.nx;
+            normals_ptr[i * 3 + 1] = vertex.ny;
+            normals_ptr[i * 3 + 2] = vertex.nz;
+        }
+        return {points, normals, out_count};
+    }
+
+   private:
+    std::vector<SurfaceTriangle> surface_triangles() const {
         static const int shifts[8][3] = {
                 {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
                 {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1},
@@ -373,9 +493,6 @@ class TSDFVolume {
                 {0, 5, 1, 6}, {0, 1, 2, 6}, {0, 2, 3, 6},
                 {0, 3, 7, 6}, {0, 7, 4, 6}, {0, 4, 5, 6},
         };
-        static constexpr double kBarycentricSampleStep1 = 0.7548776662466927;
-        static constexpr double kBarycentricSampleStep2 = 0.5698402909980532;
-
         std::vector<BlockKey> keys;
         keys.reserve(all_blocks_.size());
         for (const auto &item : all_blocks_) keys.push_back(item.first);
@@ -437,25 +554,33 @@ class TSDFVolume {
             }
         }
 
+        return triangles;
+    }
+
+    static int64_t surface_sample_count(const std::vector<SurfaceTriangle> &triangles, int64_t max_points) {
+        return max_points > 0 && !triangles.empty() ? max_points : static_cast<int64_t>(triangles.size()) * 3;
+    }
+
+    template <typename Emit>
+    static void for_each_surface_sample(
+            const std::vector<SurfaceTriangle> &triangles,
+            int64_t max_points,
+            Emit emit) {
+        static constexpr double kBarycentricSampleStep1 = 0.7548776662466927;
+        static constexpr double kBarycentricSampleStep2 = 0.5698402909980532;
         double total_area = 0.0;
         for (const auto &tri : triangles) {
             total_area += tri.area;
         }
         const int64_t tri_count = static_cast<int64_t>(triangles.size());
-        const int64_t out_count = max_points > 0 && tri_count > 0 ? max_points : tri_count * 3;
-        auto points = torch::empty({out_count, 3}, torch::dtype(torch::kFloat32).device(torch::kCPU));
-        auto colors = torch::empty({out_count, 3}, torch::dtype(torch::kUInt8).device(torch::kCPU));
-        auto normals = torch::empty({out_count, 3}, torch::dtype(torch::kFloat32).device(torch::kCPU));
-        float *points_ptr = points.data_ptr<float>();
-        uint8_t *colors_ptr = colors.data_ptr<uint8_t>();
-        float *normals_ptr = normals.data_ptr<float>();
         if (max_points <= 0) {
             for (int64_t i = 0; i < tri_count; ++i) {
-                write_vertex(points_ptr, colors_ptr, normals_ptr, i * 3 + 0, triangles[i].a);
-                write_vertex(points_ptr, colors_ptr, normals_ptr, i * 3 + 1, triangles[i].b);
-                write_vertex(points_ptr, colors_ptr, normals_ptr, i * 3 + 2, triangles[i].c);
+                emit(i * 3 + 0, triangles[static_cast<size_t>(i)].a);
+                emit(i * 3 + 1, triangles[static_cast<size_t>(i)].b);
+                emit(i * 3 + 2, triangles[static_cast<size_t>(i)].c);
             }
         } else if (tri_count > 0 && total_area > 0.0) {
+            const int64_t out_count = max_points;
             int64_t tri_idx = 0;
             double cumulative = triangles[0].area;
             for (int64_t i = 0; i < out_count; ++i) {
@@ -470,13 +595,10 @@ class TSDFVolume {
                 const float w0 = 1.0f - sr1;
                 const float w1 = sr1 * (1.0f - static_cast<float>(r2));
                 const float w2 = sr1 * static_cast<float>(r2);
-                write_vertex(points_ptr, colors_ptr, normals_ptr, i, mix_triangle(triangles[tri_idx], w0, w1, w2));
+                emit(i, mix_triangle(triangles[static_cast<size_t>(tri_idx)], w0, w1, w2));
             }
         }
-        return {points, colors, normals};
     }
-
-   private:
     int index_of(int x, int y, int z) const {
         return x * num_voxels_per_block_edge_ * num_voxels_per_block_edge_ + y * num_voxels_per_block_edge_ + z;
     }
@@ -680,22 +802,22 @@ class TSDFVolume {
         };
     }
 
-    static void write_vertex(
-            float *points_ptr,
-            uint8_t *colors_ptr,
-            float *normals_ptr,
-            int64_t out_idx,
-            const SurfaceVertex &vertex) {
-        points_ptr[out_idx * 3 + 0] = vertex.x;
-        points_ptr[out_idx * 3 + 1] = vertex.y;
-        points_ptr[out_idx * 3 + 2] = vertex.z;
-        colors_ptr[out_idx * 3 + 0] = clamp_color(vertex.r);
-        colors_ptr[out_idx * 3 + 1] = clamp_color(vertex.g);
-        colors_ptr[out_idx * 3 + 2] = clamp_color(vertex.b);
+    static PlyVertex make_ply_vertex(const SurfaceVertex &vertex) {
         const Vec3f normal = normalize(vertex.nx, vertex.ny, vertex.nz);
-        normals_ptr[out_idx * 3 + 0] = normal.x;
-        normals_ptr[out_idx * 3 + 1] = normal.y;
-        normals_ptr[out_idx * 3 + 2] = normal.z;
+        return {
+                vertex.x,
+                vertex.y,
+                vertex.z,
+                normal.x,
+                normal.y,
+                normal.z,
+                clamp_color(vertex.r),
+                clamp_color(vertex.g),
+                clamp_color(vertex.b),
+                clamp_ply_color((normal.x * 0.5f + 0.5f) * 255.0f),
+                clamp_ply_color((normal.y * 0.5f + 0.5f) * 255.0f),
+                clamp_ply_color((normal.z * 0.5f + 0.5f) * 255.0f),
+        };
     }
 
     static double frac(double value) {
@@ -711,80 +833,6 @@ class TSDFVolume {
     std::unordered_map<BlockKey, std::vector<Voxel>, BlockKeyHash> all_blocks_;
 };
 
-static void write_binary_ply(
-        const std::string &path,
-        torch::Tensor points,
-        torch::Tensor colors,
-        torch::Tensor normals) {
-    points = points.contiguous();
-    colors = colors.contiguous();
-    normals = normals.contiguous();
-    TORCH_CHECK(points.device().is_cpu(), "points must be a CPU tensor");
-    TORCH_CHECK(colors.device().is_cpu(), "colors must be a CPU tensor");
-    TORCH_CHECK(normals.device().is_cpu(), "normals must be a CPU tensor");
-    TORCH_CHECK(points.scalar_type() == at::ScalarType::Float, "points must be float32");
-    TORCH_CHECK(colors.scalar_type() == at::ScalarType::Byte, "colors must be uint8");
-    TORCH_CHECK(normals.scalar_type() == at::ScalarType::Float, "normals must be float32");
-    TORCH_CHECK(points.dim() == 2 && points.size(1) == 3, "points must have shape Nx3");
-    TORCH_CHECK(colors.dim() == 2 && colors.size(1) == 3, "colors must have shape Nx3");
-    TORCH_CHECK(normals.dim() == 2 && normals.size(1) == 3, "normals must have shape Nx3");
-    TORCH_CHECK(colors.size(0) == points.size(0) && normals.size(0) == points.size(0),
-                "points/colors/normals must have matching lengths");
-
-    const int64_t n = points.size(0);
-    if (n == 0) {
-        return;
-    }
-
-    const float *points_ptr = points.data_ptr<float>();
-    const uint8_t *colors_ptr = colors.data_ptr<uint8_t>();
-    const float *normals_ptr = normals.data_ptr<float>();
-    std::vector<PlyVertex> vertices(static_cast<size_t>(n));
-
-    at::parallel_for(0, n, 4096, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            const float nx = normals_ptr[i * 3 + 0];
-            const float ny = normals_ptr[i * 3 + 1];
-            const float nz = normals_ptr[i * 3 + 2];
-            vertices[static_cast<size_t>(i)] = {
-                    points_ptr[i * 3 + 0],
-                    points_ptr[i * 3 + 1],
-                    points_ptr[i * 3 + 2],
-                    nx,
-                    ny,
-                    nz,
-                    colors_ptr[i * 3 + 0],
-                    colors_ptr[i * 3 + 1],
-                    colors_ptr[i * 3 + 2],
-                    clamp_ply_color((nx * 0.5f + 0.5f) * 255.0f),
-                    clamp_ply_color((ny * 0.5f + 0.5f) * 255.0f),
-                    clamp_ply_color((nz * 0.5f + 0.5f) * 255.0f),
-            };
-        }
-    });
-
-    std::ofstream ply_file(path, std::ios::binary);
-    TORCH_CHECK(ply_file.good(), "Could not open PLY for writing: ", path);
-    ply_file << "ply\n"
-             << "format binary_little_endian 1.0\n"
-             << "element vertex " << n << "\n"
-             << "property float x\n"
-             << "property float y\n"
-             << "property float z\n"
-             << "property float nx\n"
-             << "property float ny\n"
-             << "property float nz\n"
-             << "property uchar red\n"
-             << "property uchar green\n"
-             << "property uchar blue\n"
-             << "property uchar normals_red\n"
-             << "property uchar normals_green\n"
-             << "property uchar normals_blue\n"
-             << "end_header\n";
-    ply_file.write(reinterpret_cast<const char *>(vertices.data()), static_cast<std::streamsize>(vertices.size() * sizeof(PlyVertex)));
-    TORCH_CHECK(ply_file.good(), "Failed while writing PLY: ", path);
-}
-
 }  // namespace tsdf_ext
 
 void pybind_tsdf_ext(py::module &m) {
@@ -794,8 +842,7 @@ void pybind_tsdf_ext(py::module &m) {
             .def("integrate", &tsdf_ext::TSDFVolume::integrate, py::arg("depth"), py::arg("color"),
                  py::arg("intrinsics"), py::arg("extrinsic"), py::arg("depth_trunc"),
                  py::call_guard<py::gil_scoped_release>())
-            .def("extract_point_cloud", &tsdf_ext::TSDFVolume::extract_point_cloud, py::arg("max_points"),
+            .def("write_point_cloud", &tsdf_ext::TSDFVolume::write_point_cloud, py::arg("path"),
+                 py::arg("max_points"), py::arg("select_representatives"),
                  py::call_guard<py::gil_scoped_release>());
-    m.def("write_binary_ply", &tsdf_ext::write_binary_ply, py::arg("path"), py::arg("points"),
-          py::arg("colors"), py::arg("normals"), py::call_guard<py::gil_scoped_release>());
 }

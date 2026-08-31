@@ -7,13 +7,12 @@ The instance algorithm consumes the native TSDF surface, RGB, sensor depth, shar
 ```mermaid
 flowchart LR
     V[ViPE Stages 1-5<br/>poses and TSDF] --> S6[Stage 6<br/>TSDF surface and frame coreset]
-    S6 --> S7[Stage 7<br/>SAM1 seeds and SAM2 propagation]
-    S7 --> S8[Stage 8<br/>3D lift and track linking]
-    S8 --> S9[Stage 9<br/>normal-aware atoms]
-    S9 --> S10[Stage 10<br/>affinity and hierarchy]
-    S10 --> S11[Stage 11<br/>evidence candidates]
-    S11 --> S12[Stage 12<br/>K-capped selection and exchange]
-    S12 --> O[Instance NPZ and visualization PLY]
+    S6 --> S7[Stage 7<br/>normal-aware atoms]
+    S7 --> S8[Stage 8<br/>masks, lift, and track linking]
+    S8 --> S9[Stage 9<br/>affinity and hierarchy]
+    S9 --> S10[Stage 10<br/>evidence candidates]
+    S10 --> S11[Stage 11<br/>K-capped selection and exchange]
+    S11 --> O[Instance NPZ and visualization PLY]
 ```
 
 ## Representation
@@ -40,9 +39,9 @@ The final output is a hypothesis soup with at most `K=5` hypotheses covering any
 
 ## Stage 6: TSDF Surface And Frame Coreset
 
-Stage 5 extracts the fused TSDF zero surface once, writes its full RGB+normal PLY, and hands the same CPU point tensor directly to Stage 6. There is no PLY reread and no second all-frame backprojection.
+Stage 5 extracts the fused TSDF zero surface once. The native extension writes the full RGB+normal PLY in bounded chunks while simultaneously retaining the compact surface domain needed by Stage 6. Python receives only those retained point/normal pairs, not the dense output sample tensors. There is no PLY reread and no second all-frame backprojection.
 
-The saved PLY contains a dense deterministic area sample. Running association over all ten million output samples would make point count depend on an output-density knob rather than TSDF resolution. Stage 6 therefore retains one original TSDF sample per native TSDF-sized cell. For TSDF voxel edge `s`, sample `p_i`, and cell index `c_i`:
+The saved PLY contains a dense deterministic area sample. Running association over all ten million output samples would make point count depend on an output-density knob rather than TSDF resolution. During that same native extraction stream, Stage 5 retains one original TSDF sample per native TSDF-sized cell for Stage 6. For TSDF voxel edge `s`, sample `p_i`, and cell index `c_i`:
 
 ```math
 c_i = \left\lfloor p_i/s \right\rfloor,
@@ -63,11 +62,21 @@ or the optical-axis angle exceeds `8 degrees`. The retained frame becomes the ne
 
 Instance images use a separate 1024-pixel-long-side view. RGB is aspect-preserving LANCZOS-resized; depth is nearest-neighbor resized; intrinsics are scaled independently in x and y. This does not alter the canonical ViPE input or TSDF.
 
-## Stage 7: 2D Mask Generation And Propagation
+## Stage 7: Normal-Aware Atoms
 
-Retained frames are processed in consecutive chunks of four.
+Use the native TSDF-gradient normal carried by each retained surface sample. Build a symmetric 12-neighbor point graph, capped at `2.5` TSDF voxel edges. Edge cost is:
 
-### Stage 7.1: SAM1 AMG Seeds
+```math
+w(i,j)=\lVert p_i-p_j\rVert_2\left(1+4\left(1-|n_i^Tn_j|\right)\right).
+```
+
+Seed one surface point in each occupied 3 cm cell. Multi-source Dijkstra assigns every point to its lowest-cost seed, producing an atom partition. Atom adjacency consists of point-graph edges crossing between atoms.
+
+## Stage 8: Masks, Lift, And Global Track Linking
+
+Retained frames are processed in consecutive chunks of four. Mask generation and lifting are interleaved one chunk at a time.
+
+### Stage 8.1: SAM1 AMG Seeds
 
 SAM1 ViT-H automatic mask generation runs on the first frame of each chunk with:
 
@@ -79,17 +88,15 @@ SAM1 ViT-H automatic mask generation runs on the first frame of each chunk with:
 
 Survivors are stably sorted by predicted IoU and capped at 100. Each seed receives a monotonically allocated track ID. IDs are never reused across chunks.
 
-### Stage 7.2: SAM2 Propagation
+### Stage 8.2: SAM2 Propagation
 
 SAM2.1-small receives every seed in one inference state and propagates them forward through the remaining chunk frames. The mask-logit threshold is `-1.0`; postprocessing and CPU offload are disabled.
 
 The seed frame keeps the original SAM1 masks. Later frames carry the same track IDs and inherited SAM1 scores. A track may disappear and later reappear within its chunk. Track IDs never cross chunk boundaries at this stage.
 
-Mask generation and Stage 8 lifting are interleaved one chunk at a time. Once a chunk has been lifted, its decoded masks and SAM state are released.
+Once a chunk has been lifted, its decoded masks and SAM state are released.
 
-## Stage 8: Lift And Global Track Linking
-
-### Stage 8.1: Visibility And Lift
+### Stage 8.3: Visibility And Lift
 
 For surface point `X_w`, final pose `T_{c2w}`, and frame depth map `D_f`, compute camera coordinates and projection:
 
@@ -105,9 +112,16 @@ A projected point is visible only when it is in front of the camera, inside the 
 \left|X_c^z-D_f(u,v)\right| \le 0.05\text{ m}.
 ```
 
-Each 2D mask selects from those visible surface-point indices, producing `q_gm`. Lifted masks with fewer than five points are discarded. Frame provenance and chunk-local track IDs remain attached.
+Each 2D mask selects from those visible surface-point indices, producing `q_gm`. Lifted masks with fewer than five points are discarded. The lift immediately counts visible and claimed points per atom and stores the nonzero counts in two atom-major CSR tables:
 
-### Stage 8.2: Global Track Linking
+```text
+leafI(atom, mask)  = I_a,gm
+leafN(atom, frame) = N_a,f
+```
+
+No dense `number_of_atoms x number_of_masks` membership matrix exists. Frame provenance and chunk-local track IDs remain attached to the sparse mask records.
+
+### Stage 8.4: Global Track Linking
 
 After every retained frame is lifted, each chunk-local track is represented by the union of all point sets claimed by that track. Candidate track pairs must share points and come from different chunks.
 
@@ -117,19 +131,9 @@ For every ordered chunk pair, a track pair is accepted only when:
 - each track is the other's best partner in the opposite chunk;
 - the accepted IoU exceeds both runner-up IoUs by a factor of at least `1.2`.
 
-Accepted pairs are processed in descending IoU with union-find. A connected component may contain at most one track from each chunk, preventing same-frame part/whole seeds from collapsing. The minimum track ID becomes the deterministic global ID.
+Accepted pairs are processed in descending IoU with union-find. A connected component may contain at most one track from each chunk, preventing same-frame part/whole seeds from collapsing. The minimum track ID becomes the deterministic global ID. Only one exact union of claimed point indices is retained per chunk-local track for this linking operation; it is released immediately after global IDs are resolved.
 
-## Stage 9: Normal-Aware Atoms
-
-Use the native TSDF-gradient normal carried by each retained surface sample. Build a symmetric 12-neighbor point graph, capped at `2.5` TSDF voxel edges. Edge cost is:
-
-```math
-w(i,j)=\lVert p_i-p_j\rVert_2\left(1+4\left(1-|n_i^Tn_j|\right)\right).
-```
-
-Seed one surface point in each occupied 3 cm cell. Multi-source Dijkstra assigns every point to its lowest-cost seed, producing an atom partition. Atom adjacency consists of point-graph edges crossing between atoms.
-
-## Stage 10: Affinity And Hierarchy
+## Stage 9: Affinity And Hierarchy
 
 For atom `a`, mask `gm`, and the mask's frame `f(gm)`, define visible claim fraction:
 
@@ -163,9 +167,9 @@ Before agglomeration, adjacent atoms with `A >= 0.98` over at least eight observ
 
 Nested candidates with IoU at least `0.95` are collapsed to the largest representative, creating an epsilon-cover of the hierarchy without turning it into a partition.
 
-## Stage 11: Evidence Candidates
+## Stage 10: Evidence Candidates
 
-### Stage 11.1: Per-Node Evidence
+### Stage 10.1: Per-Node Evidence
 
 A post-order pass sums visibility and mask intersections from atoms to every node. A frame can judge node `R` only when:
 
@@ -188,7 +192,7 @@ For each eligible frame and mask:
 
 Nodes smaller than ten points are not candidates. Masks with coverage at least `0.5` enter the evidence-edge stage.
 
-### Stage 11.2: Evidence-Edge Clustering
+### Stage 10.2: Evidence-Edge Clustering
 
 For two co-eligible, non-nested nodes, a frame provides graded join evidence when one mask covers both. The union endorsement is:
 
@@ -204,7 +208,7 @@ k\ln\frac{p_{same}}{p_{diff}}+(n-k)\ln\frac{1-p_{same}}{1-p_{diff}}.
 
 `p_same` and `p_diff` are fit per scene by an unlabeled two-component binomial-mixture EM. Positive pair edges and positive greedy contractions become additional union candidates. A separate track channel proposes cross-viewpoint unions when one global track covers different nodes in different frames. Track proposals add candidates but no negative evidence.
 
-## Stage 12: K-Capped Selection And Exchange
+## Stage 11: K-Capped Selection And Exchange
 
 Selection chooses hypotheses by maximizing:
 
@@ -271,4 +275,4 @@ Evaluation also writes `pcd/<scene>_instances_gtmatch.ply`. It keeps the unique 
 
 Ordering is part of the algorithm: frames and chunks are ascending, SAM top-k sorting is stable, track IDs are monotonic, union-find keeps the minimum representative, and projection uses explicit elementwise arithmetic. TF32 remains disabled and deterministic ViPE settings remain active.
 
-Stage 5 releases SLAM GPU state before SAM models are built. The dense TSDF output tensors are reduced immediately, then released before SAM inference. Stage 7 retains one mask chunk at a time. Mask tensors, SAM2 state, temporary JPEGs, lifted intermediates, and hierarchy tables are released immediately after their last consumer. Only the retained TSDF surface and final packed hypotheses survive to instance artifact writing.
+Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction streams the dense PLY in bounded chunks and returns only the compact Stage-6 surface domain. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Only the retained TSDF surface and final packed hypotheses survive to instance artifact writing.

@@ -3,7 +3,6 @@
 
 import gc
 import logging
-import time
 
 from pathlib import Path
 
@@ -52,7 +51,7 @@ class VipePipeline:
         pose_matrices,
         w2c_matrices,
         intrinsics,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
         logger.info(f"Saving artifacts to {artifact_path}")
 
         def load_frame(frame_idx: int) -> io.TSDFFrame:
@@ -93,15 +92,9 @@ class VipePipeline:
         gc.collect()
         torch.cuda.empty_cache()
 
-        from vipe.instance.pipeline import InstancePipeline, reduce_tsdf_surface
+        from vipe.instance.pipeline import InstancePipeline
 
-        tick = time.perf_counter()
-        surface_points, surface_normals = reduce_tsdf_surface(
-            *tsdf_surface,
-            float(self.out_cfg.pcd_tsdf_voxel_edge_m),
-        )
-        surface_reduce_seconds = time.perf_counter() - tick
-        source_surface_points = len(tsdf_surface[0])
+        surface_points, surface_normals, source_surface_points = tsdf_surface
         del tsdf_surface
 
         logger.info("Starting post-TSDF instance distillation for %s", frame_stream.name)
@@ -114,5 +107,4 @@ class VipePipeline:
             surface_normals,
             float(self.out_cfg.pcd_tsdf_voxel_edge_m),
             source_surface_points,
-            surface_reduce_seconds,
         )

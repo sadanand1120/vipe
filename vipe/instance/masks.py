@@ -239,17 +239,13 @@ class StreamingMasks:
             for entry in self.frame_masks.get(frame_index, [])
         ]
 
-    def _link_tracks(self, framed: list[dict]) -> None:
+    def _link_tracks(self, track_unions: dict[int, np.ndarray]) -> None:
         import scipy.sparse as sp
 
-        collected: dict[int, list[np.ndarray]] = {}
-        for frame in framed:
-            for voxels, track_id in zip(frame["masks"], frame["mtid"].tolist()):
-                collected.setdefault(int(track_id), []).append(voxels)
-        if not collected:
+        if not track_unions:
             return
-        track_ids = np.array(sorted(collected), np.int64)
-        voxel_sets = [np.unique(np.concatenate(collected[int(track_id)])) for track_id in track_ids]
+        track_ids = np.array(sorted(track_unions), np.int64)
+        voxel_sets = [track_unions[int(track_id)] for track_id in track_ids]
         sizes = np.array([len(voxels) for voxels in voxel_sets], np.int64)
         chunk_starts = np.asarray(self.chunk_starts, np.int64)
         chunks = np.searchsorted(chunk_starts, track_ids, side="right") - 1
@@ -324,17 +320,20 @@ class StreamingMasks:
             component_chunks[self.union_find.find(left)] = left_chunks | right_chunks
             self.stats["linked_tracks"] += 1
 
-    def finalize(self, framed: list[dict]) -> list[dict]:
-        self._link_tracks(framed)
-        for frame in framed:
-            frame["mgid"] = np.asarray(
-                [self.union_find.find(int(track_id)) for track_id in frame["mtid"]], np.int64
-            )
-        return framed
+    def finalize(self, evidence: dict, track_unions: dict[int, np.ndarray]) -> dict:
+        self._link_tracks(track_unions)
+        track_unions.clear()
+        track_ids = evidence.pop("gm_track_id")
+        evidence["global_track_ids"] = np.asarray(
+            [self.union_find.find(int(track_id)) for track_id in track_ids],
+            np.int64,
+        )
+        return evidence
 
 
 def generate_and_lift(
     points: torch.Tensor,
+    atom_of: np.ndarray,
     keyframes: Sequence[int],
     rgb_of: Callable[[int], np.ndarray],
     depth_of: Callable[[int], np.ndarray],
@@ -352,8 +351,9 @@ def generate_and_lift(
     masks = StreamingMasks(
         keyframes, rgb_of, width, height, config, jpeg_quality, device, log
     )
-    framed = lift_masks(
+    evidence, track_unions = lift_masks(
         points,
+        atom_of,
         keyframes,
         c2w_of,
         masks.masks_of,
@@ -365,6 +365,6 @@ def generate_and_lift(
         int(lift_config["min_voxels"]),
         log,
     )
-    masks.finalize(framed)
-    global_tracks = len({int(value) for frame in framed for value in frame["mgid"]})
-    return framed, {**masks.stats, **masks.timings, "global_tracks": global_tracks}
+    masks.finalize(evidence, track_unions)
+    global_tracks = int(np.unique(evidence["global_track_ids"]).size)
+    return evidence, {**masks.stats, **masks.timings, "global_tracks": global_tracks}

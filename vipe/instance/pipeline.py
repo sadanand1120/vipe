@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vipe.instance.association import associate, frame_coreset_poses
+from vipe.instance.association import associate, build_atom_graph, frame_coreset_poses
 from vipe.instance.masks import generate_and_lift
 from vipe.utils.io import ArtifactPath
 
@@ -36,48 +36,6 @@ def _contract_geometry(width: int, height: int, long_side: int):
     x = np.minimum((np.arange(out_width) / (out_width / width)).astype(np.int64), width - 1)
     y = np.minimum((np.arange(out_height) / (out_height / height)).astype(np.int64), height - 1)
     return out_width, out_height, x, y
-
-
-def reduce_tsdf_surface(
-    points_tensor: torch.Tensor,
-    normals_tensor: torch.Tensor,
-    voxel_edge_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Keep the native TSDF sample nearest each TSDF-sized cell center."""
-    if points_tensor.device.type != "cpu" or normals_tensor.device.type != "cpu":
-        raise ValueError("TSDF surface tensors must remain on CPU")
-    if points_tensor.dtype != torch.float32 or normals_tensor.dtype != torch.float32:
-        raise ValueError("TSDF surface points and normals must be float32")
-    if points_tensor.shape != normals_tensor.shape or points_tensor.ndim != 2 or points_tensor.shape[1] != 3:
-        raise ValueError("TSDF surface points and normals must have matching (N, 3) shapes")
-    if len(points_tensor) == 0 or voxel_edge_m <= 0.0:
-        raise ValueError("TSDF surface and voxel edge must be non-empty and positive")
-
-    points = points_tensor.contiguous().numpy()
-    normals = normals_tensor.contiguous().numpy()
-    cells = np.floor(points / voxel_edge_m).astype(np.int64)
-    minimum = cells.min(axis=0)
-    spans = cells.max(axis=0) - minimum + 1
-    key_space = int(spans[0]) * int(spans[1]) * int(spans[2])
-    if key_space > np.iinfo(np.int64).max:
-        raise ValueError("TSDF surface extent exceeds deterministic cell-key capacity")
-
-    keys = cells[:, 0] - minimum[0]
-    keys = keys * spans[1] + cells[:, 1] - minimum[1]
-    keys = keys * spans[2] + cells[:, 2] - minimum[2]
-    distance2 = np.zeros(len(points), np.float32)
-    for axis in range(3):
-        residual = points[:, axis] - (cells[:, axis].astype(np.float32) + 0.5) * voxel_edge_m
-        distance2 += residual * residual
-    del cells
-
-    unique_keys, inverse = np.unique(keys, return_inverse=True)
-    best_distance = np.full(len(unique_keys), np.inf, np.float32)
-    np.minimum.at(best_distance, inverse, distance2)
-    candidates = np.flatnonzero(distance2 == best_distance[inverse])
-    chosen = np.full(len(unique_keys), len(points), np.int64)
-    np.minimum.at(chosen, inverse[candidates], candidates)
-    return np.ascontiguousarray(points[chosen]), np.ascontiguousarray(normals[chosen])
 
 
 def _pack_hypotheses(hypotheses: list[np.ndarray]):
@@ -218,7 +176,6 @@ class InstancePipeline:
         normals: np.ndarray,
         tsdf_voxel_edge_m: float,
         source_surface_points: int,
-        surface_reduce_seconds: float,
     ) -> dict:
         """Distill overlapping 3D instances and return the persisted scene summary."""
         started = time.perf_counter()
@@ -264,11 +221,22 @@ class InstancePipeline:
             depth = frame_stream._read_depth(frame_index, frame_stream.frame_size)
             return depth[np.ix_(y_index, x_index)]
 
-        logger.info("Stages 7-8: generating, propagating, and lifting instance masks")
+        logger.info("Stage 7: building normal-aware surface atoms")
+        tick = time.perf_counter()
+        atom_graph = build_atom_graph(
+            points,
+            normals,
+            self.config["association"],
+            tsdf_voxel_edge_m,
+        )
+        atom_seconds = time.perf_counter() - tick
+
+        logger.info("Stage 8: generating, propagating, and lifting instance masks")
         tick = time.perf_counter()
         points_device = torch.as_tensor(points, dtype=torch.float32, device=self.device)
-        framed, mask_stats = generate_and_lift(
+        lifted_evidence, mask_stats = generate_and_lift(
             points_device,
+            atom_graph["atom_of"],
             frame_indices,
             rgb_of,
             depth_of,
@@ -286,13 +254,13 @@ class InstancePipeline:
         gc.collect()
         torch.cuda.empty_cache()
 
-        logger.info("Stages 9-12: atomizing and selecting overlapping 3D hypotheses")
+        logger.info("Stages 9-11: selecting overlapping 3D hypotheses")
         association_result = associate(
-            framed,
-            points,
-            normals,
+            atom_graph,
+            lifted_evidence,
+            len(points),
             self.config["association"],
-            tsdf_voxel_edge_m,
+            atom_seconds=atom_seconds,
         )
         hypotheses = association_result["hypotheses"]
         indices, offsets = _pack_hypotheses(hypotheses)
@@ -317,13 +285,12 @@ class InstancePipeline:
             "counts": {
                 "tsdf_output_points": source_surface_points,
                 "points": len(points),
-                "lifted_frames": len(framed),
-                "lifted_masks": sum(len(frame["masks"]) for frame in framed),
+                "lifted_frames": int(lifted_evidence["n_frames"]),
+                "lifted_masks": int(len(lifted_evidence["gm_frame"])),
                 **mask_stats,
                 **association_result["counts"],
             },
             "timings": {
-                "surface_reduce_s": round(surface_reduce_seconds, 3),
                 "masks_and_lift_s": round(mask_seconds, 3),
                 **association_result["timings"],
                 "wall_s": round(time.perf_counter() - started, 3),

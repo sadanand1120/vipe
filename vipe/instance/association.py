@@ -1,15 +1,15 @@
 """GT-free association from lifted masks to overlapping 3D hypotheses.
 
-The numerical path is the frozen ``instance_bench@a887292`` association core:
+The numerical path follows the frozen ``instance_bench@a887292`` association core:
 
-   5 atoms      normal-aware over-segmentation (3cm seeds) + adjacency graph
-   6 tree       per-atom signatures -> affinity -> border-mean agglomeration; EVERY node is
+   7 atoms      normal-aware over-segmentation (3cm seeds) + adjacency graph
+   9 tree       per-atom signatures -> affinity -> border-mean agglomeration; EVERY node is
                 retained, then >=95%-nested chains collapse to their largest member (an
                 epsilon-cover of the laminar family at the metric's own top IoU threshold)
-   7 evidence   per-node evidence tables (fr_stats / cov_stats / D / vis_bins), then evidence-edge
+  10 evidence   per-node evidence tables (fr_stats / cov_stats / D / vis_bins), then evidence-edge
                 clustering over them: shared covering masks become signed join/miss edges, every
                 positive edge and every GAEC contraction becomes a union candidate
-   8 select     the objective: F(S) = sum_e max_h phi_h(e) - lam*|S| s.t. per-atom <= K, with
+  11 select     the objective: F(S) = sum_e max_h phi_h(e) - lam*|S| s.t. per-atom <= K, with
                 graded phi (cov^alpha * pur^beta * IoU) and clients = global tracks; then the
                 zero-loss ancestor swap, the exchange move on the greedy cover"""
 import time
@@ -32,8 +32,7 @@ def _ranges(starts, lens):
 
 
 def build_tables(T, log=print):
-    """Stage-11's view of the leaf tables. build_tree already stores them as CSR, so this is now a
-    relabelling, not a rebuild (it used to flatten 28M dict entries into a second array copy)."""
+    """Stage 10's view of the sparse leaf tables; this is a relabeling, not a rebuild."""
     return {"rI": (T["leafI_ptr"], T["leafI_gm"], T["leafI_c"]),
             "rN": (T["leafN_ptr"], T["leafN_f"], T["leafN_c"]),
             "gm_frame": np.asarray(T["gm_frame"], np.int64),
@@ -41,7 +40,7 @@ def build_tables(T, log=print):
 
 
 def frame_coreset_poses(frames, c2w_of, move_cm, move_deg, log=print):
-    """STAGE 1 — PRE-LIFT frame coreset by MOTION: walk the trajectory in order and keep a frame once
+    """Stage 6 frame coreset: walk the trajectory in order and keep a frame once
     the camera has moved > move_cm or turned > move_deg since the last KEPT one, which then becomes the
     reference. Pose-only, so it runs before the lift.
 
@@ -59,12 +58,15 @@ def frame_coreset_poses(frames, c2w_of, move_cm, move_deg, log=print):
     return [frames[i] for i in keep]
 
 
-def build_atom_graph(pts, normals, at, ds, log=print):
-    """Build normal-aware atoms and their adjacency graph.
+def build_atom_graph(pts, normals, config, ds, log=print):
+    """Stage 7: build normal-aware atoms and their adjacency graph.
     knn/rcap_mult shape the voxel kNN graph that BOTH the Dijkstra grouping and the atom adjacency
     derive from. `acnt` = per-edge crossing-voxel-edge count, a contact-area proxy, logged only."""
     t = time.time()
-    atom_cm, lam, k, rcap_mult = at["size_cm"], at["lam"], at["knn"], at["rcap_mult"]
+    atom_cm = float(config["atom_size_m"]) * 100.0
+    lam = float(config["atom_normal_weight"])
+    k = int(config["atom_knn"])
+    rcap_mult = float(config["atom_radius_cap_voxels"])
     atom_of, edges = ATOMS.build_atoms(
         pts,
         normals,
@@ -82,56 +84,25 @@ def build_atom_graph(pts, normals, at, ds, log=print):
             "asize": np.array([a.size for a in av], np.int64)}
 
 
-def build_tree(framed, A, mustlink=None, log=print):
-    """STAGE 6 — per-atom signatures -> affinity -> agglomeration.
+def build_tree(evidence, A, mustlink=None, log=print):
+    """Stage 9: per-atom signatures -> affinity -> agglomeration.
     A is the atom-graph output. Border weighting is count (each adjacent atom
     pair = 1; area/sqrt weights measured worse). Linkage is weighted mean over the border: dyadic
     UPGMA was measured worse (its extents kill R@0.9). Returns T: atoms + mask tables + tree.
 
-    Every kept frame counts once. Stage 1 keeps a frame only after real camera motion, so there are no
+    Every kept frame counts once. Stage 6 keeps a frame only after real camera motion, so there are no
     near-duplicate views left to down-weight -- "distinct viewpoints" is just "distinct frames"."""
     atom_of, av, na = A["atom_of"], A["av"], len(A["av"])
-
-    # ---- leaf sums, stored as CSR row tables per atom ----
-    #      I[a][gm] = |atom a ∩ mask gm|,  N[a][f] = |atom a visible in frame f|.
-    #      These are the pipeline's largest structure (19M + 9M entries on office0). As dicts they
-    #      cost ~75 bytes an entry and were ALSO flattened into a second array copy for Stage 11;
-    #      as CSR they are 8 bytes an entry and the flat copy IS the storage.
-    t = time.time()
-    iA, iG, iC = [], [], []
-    nA_, nF_, nC = [], [], []
-    gm_frame = []; gm_size = []
-    for fidx, fr in enumerate(framed):
-        ua, uc = np.unique(atom_of[np.asarray(fr["V"], np.int64)], return_counts=True)
-        nA_.append(ua.astype(np.int32)); nF_.append(np.full(len(ua), fidx, np.int32))
-        nC.append(uc.astype(np.int32))
-        for q in fr["masks"]:
-            gm = len(gm_frame)
-            gm_frame.append(fidx); gm_size.append(int(np.asarray(q).size))
-            uqa, uqc = np.unique(atom_of[np.asarray(q, np.int64)], return_counts=True)
-            iA.append(uqa.astype(np.int32)); iG.append(np.full(len(uqa), gm, np.int32))
-            iC.append(uqc.astype(np.int32))
-    gm_frame = np.array(gm_frame, np.int64); gm_size = np.array(gm_size, np.int64)
-
-    def _csr(rows, cols, cnts):
-        """(atom, key, count) triples -> CSR grouped by atom, keys ascending within each atom.
-        The triples arrive mask-major (keys already ascending for any given atom), so ONE STABLE
-        sort by atom is enough -- a lexsort would redo work the input ordering already gives, and
-        on room0 that cost 125s instead of 22s."""
-        r = np.concatenate(rows); rows.clear()
-        c = np.concatenate(cols); cols.clear()
-        v = np.concatenate(cnts); cnts.clear()
-        o = np.argsort(r, kind="stable")
-        ptr = np.zeros(na + 1, np.int64); np.cumsum(np.bincount(r, minlength=na), out=ptr[1:])
-        del r
-        c = c[o]
-        v = v[o]
-        return ptr, c, v
-    leafI_ptr, leafI_gm, leafI_c = _csr(iA, iG, iC)
-    leafN_ptr, leafN_f, leafN_c = _csr(nA_, nF_, nC)
-    log(f"  [hier] {len(gm_frame)} masks | leaf sums: {len(leafI_gm)} I-rows {len(leafN_f)} N-rows "
-        f"({time.time()-t:.0f}s)")
-
+    gm_frame = np.asarray(evidence["gm_frame"], np.int64)
+    gm_size = np.asarray(evidence["gm_size"], np.int64)
+    leafI_ptr = evidence["leafI_ptr"]
+    leafI_gm = evidence["leafI_gm"]
+    leafI_c = evidence["leafI_c"]
+    leafN_ptr = evidence["leafN_ptr"]
+    leafN_f = evidence["leafN_f"]
+    leafN_c = evidence["leafN_c"]
+    log(f"  [hier] {len(gm_frame)} masks | leaf sums: {len(leafI_gm)} I-rows "
+        f"{len(leafN_f)} N-rows")
 
     # ---- signatures: per-(atom, frame) L2-normalised mask membership, as a CSR over masks ----
     #      Vectorised. The float summation order differs from a per-atom Python loop, so the last
@@ -140,7 +111,7 @@ def build_tree(framed, A, mustlink=None, log=print):
     #      filters, same edge set.
     t = time.time()
     import scipy.sparse as sp
-    nfr = len(framed)
+    nfr = int(evidence["n_frames"])
     # The CSR rows are atom-major and mask-ascending, and gm ascending implies frame ascending, so
     # each (atom, frame) L2 block is a CONTIGUOUS RUN. That is what keeps this affordable at scale:
     # mercedes has 810M I-rows, and materialising int64 (atom, frame) keys for a np.unique over them
@@ -417,10 +388,10 @@ def atoms_vox(T, nd):
 
 
 def verify_stats(T, nvox, vf, log=print):
-    """STAGE 7a — the evidence tables. Returns V: bottom-up frame sums (post-order; If freed on
+    """Stage 10.1: build evidence tables. Returns V: bottom-up frame sums (post-order; if freed on
     consumption, Nf kept for the contrastive parent lookup), then per candidate node cache the
     per-ELIGIBLE-FRAME stats of its best-IoU mask (frame, bin, iou, cov, pur) + D (mean over bins of
-    bin-max IoU) + the DISAMBIGUATING bin set (parent remainder visible) + the cov_stats rows Stage 8
+    bin-max IoU) + the DISAMBIGUATING bin set (parent remainder visible) + the cov_stats rows Stage 10.2
     links on."""
     t = time.time()
     node_size, children, order_nodes = T["node_size"], T["children"], T["order_nodes"]
@@ -486,7 +457,7 @@ def verify_stats(T, nvox, vf, log=print):
 
 
 def make_pool(scored, T, dedup_ratio):
-    """STAGE 6b — chain-collapse near-duplicate NESTED candidates (tree nodes are nested-or-disjoint,
+    """Stage 9: chain-collapse near-duplicate nested candidates (tree nodes are nested-or-disjoint,
     so all near-duplicates are ancestor chains and nested IoU == size ratio). An epsilon-cover of the
     candidate family at the metric's own top IoU threshold; the representative is the LARGEST
     member -- the dedup victims are fuller extents, and no mask-agreement score can rank extent
@@ -515,7 +486,7 @@ def make_pool(scored, T, dedup_ratio):
 
 def evidence_link_candidates(V, pool, T, lk, sel, gm_gid, max_vox, mech_sink, members_of,
                              log=print):
-    """STAGE 7b — evidence-edge correlation clustering over the pool.
+    """Stage 10.2: evidence-edge correlation clustering over the pool.
 
     A part's per-frame BEST mask is its own part mask, so part<->whole relations are invisible to
     best-mask statistics; the signal is a mask that covers a large fraction of SEVERAL nodes' visible
@@ -792,7 +763,7 @@ def evidence_link_candidates(V, pool, T, lk, sel, gm_gid, max_vox, mech_sink, me
 
 
 def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS, log=print):
-    """STAGE 8b — zero-loss ancestor replacement, per budget K: the exchange move.
+    """Stage 11: zero-loss ancestor replacement, per budget K: the exchange move.
 
     Where >=2 surviving hypotheses sit inside one tree ancestor,
     swap the group for the ancestor iff the evidence cover does NOT drop and the per-atom <=K cap
@@ -945,7 +916,7 @@ def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS
 
 
 def cover_select(flat, T, tables, KS, vf, sel, gm_gid, members_of, log=print):
-    """STAGE 8 — lambda-priced greedy MAX WEIGHTED EVIDENCE-COVER selection of the objective
+    """Stage 11: lambda-priced greedy max-weighted evidence-cover selection of the objective
 
         F(S) = sum_e w_e * max_{h in S} phi_h(e)  -  lam * |S|,   s.t. per-atom <= K
 
@@ -1038,7 +1009,7 @@ def cover_select(flat, T, tables, KS, vf, sel, gm_gid, members_of, log=print):
     _pn_cache = {}
 
     def phi_of_tree_node(nd):
-        """Per-mask phi for ANY tree node, not just the candidates -- Stage 12's replacement pass
+        """Per-mask phi for any tree node, not just candidates; the replacement pass
         has to score ancestors that were never candidates. Same weighting, same tables, cached."""
         v = _pn_cache.get(nd)
         if v is None:
@@ -1082,7 +1053,7 @@ def cover_select(flat, T, tables, KS, vf, sel, gm_gid, members_of, log=print):
 
     t0 = time.time()
     phis = []                                                  # client-aggregated, for the greedy
-    phi_mask = []                                              # per-mask, forwarded to Stage 11
+    phi_mask = []                                              # per-mask, forwarded to replacement
     for _ci, (nd, ats, vsz) in enumerate(flat):
         if nd < nn:                                            # tree node
             _ev = evidence_of_node(nd)
@@ -1154,12 +1125,6 @@ def _config_for_core(config):
             "min_aff": float(config["mustlink_min_affinity"]),
             "min_w": int(config["mustlink_min_observations"]),
         },
-        "atoms": {
-            "size_cm": float(config["atom_size_m"]) * 100.0,
-            "lam": float(config["atom_normal_weight"]),
-            "knn": int(config["atom_knn"]),
-            "rcap_mult": float(config["atom_radius_cap_voxels"]),
-        },
         "verify": {
             "min_vox": int(config["candidate_min_voxels"]),
             "elig_min_vox": int(config["eligible_min_voxels"]),
@@ -1177,26 +1142,22 @@ def _config_for_core(config):
     }
 
 
-def associate(framed, points, normals, config, voxel_size, log=print):
-    """Run atomization, hierarchy, evidence association, and fixed-K selection."""
+def associate(atom_graph, evidence, point_count, config, atom_seconds=0.0, log=print):
+    """Run hierarchy, evidence association, and fixed-K selection on prebuilt lifted evidence."""
     started = time.time()
     cfg = _config_for_core(config)
     budget = int(config["membership_budget"])
-    timings = {}
+    timings = {"atoms_s": round(atom_seconds, 3)}
 
     tick = time.time()
-    atom_graph = build_atom_graph(points, normals, cfg["atoms"], voxel_size, log=log)
-    timings["atoms_s"] = round(time.time() - tick, 3)
-
-    tick = time.time()
-    tree = build_tree(framed, atom_graph, mustlink=cfg["mustlink"], log=log)
+    tree = build_tree(evidence, atom_graph, mustlink=cfg["mustlink"], log=log)
     timings["hierarchy_s"] = round(time.time() - tick, 3)
 
     tick = time.time()
-    evidence = verify_stats(tree, len(points), cfg["verify"], log=log)
+    verified = verify_stats(tree, point_count, cfg["verify"], log=log)
     timings["evidence_s"] = round(time.time() - tick, 3)
 
-    pool = make_pool(evidence["fr_stats"].keys(), tree, cfg["dedup"]["ratio"])
+    pool = make_pool(verified["fr_stats"].keys(), tree, cfg["dedup"]["ratio"])
     node_size = tree["node_size"]
     node_lo, node_hi, leaf_order = tree["node_lo"], tree["node_hi"], tree["leaf_order"]
     candidates = [
@@ -1204,7 +1165,7 @@ def associate(framed, points, normals, config, voxel_size, log=print):
         for node in pool
         if node_size[node] >= cfg["verify"]["min_vox"]
     ]
-    global_track_ids = np.concatenate([frame["mgid"] for frame in framed])
+    global_track_ids = np.asarray(evidence["global_track_ids"], np.int64)
     if len(global_track_ids) != len(tree["gm_frame"]):
         raise ValueError("Global track IDs do not match the hierarchy mask enumeration")
 
@@ -1212,13 +1173,13 @@ def associate(framed, points, normals, config, voxel_size, log=print):
     mechanisms = {}
     members = {}
     candidates += evidence_link_candidates(
-        evidence,
+        verified,
         pool,
         tree,
         cfg["link"],
         cfg["select"],
         global_track_ids,
-        len(points),
+        point_count,
         mechanisms,
         members,
         log=log,
@@ -1246,7 +1207,7 @@ def associate(framed, points, normals, config, voxel_size, log=print):
         log=log,
     )
     timings["selection_s"] = round(time.time() - tick, 3)
-    timings["total_s"] = round(time.time() - started, 3)
+    timings["total_s"] = round(atom_seconds + time.time() - started, 3)
 
     hypotheses = [np.asarray(voxels, np.int32) for voxels in voxels_by_k[budget]]
     return {
@@ -1255,7 +1216,7 @@ def associate(framed, points, normals, config, voxel_size, log=print):
         "counts": {
             "atoms": int(tree["na"]),
             "nodes": int(tree["n_nodes"]),
-            "evidence_candidates": int(len(evidence["fr_stats"])),
+            "evidence_candidates": int(len(verified["fr_stats"])),
             "pool": int(len(pool)),
             "selection_candidates": int(len(candidates)),
             "hypotheses": int(len(hypotheses)),

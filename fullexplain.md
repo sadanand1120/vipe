@@ -701,9 +701,14 @@ After all frames, the extension extracts the zero-crossing surface directly as a
 Normals are computed from the fused implicit surface, not from per-frame depth maps. At each voxel corner, the extension estimates the TSDF gradient with central differences when both neighbors exist and one-sided differences near sparse-volume boundaries. A zero-crossing vertex interpolates endpoint gradients along the crossing edge and normalizes the result. A sampled point interpolates its triangle vertex normals barycentrically and normalizes again. This writes smooth surface normals tied to the fused TSDF geometry.
 
 ```python
-points, colors, normals = volume.extract_point_cloud_tensors(pcd_max_points)
-write_binary_ply(...)
+instance_surface = volume.write_point_cloud(
+    pcd_path,
+    pcd_max_points,
+    select_representatives=instance_distillation_enabled,
+)
 ```
+
+The native extension streams PLY vertices in bounded chunks. When instance distillation is enabled, that same extraction pass also retains the nearest actual zero-surface sample to each native TSDF-cell center and returns only those compact point/normal tensors to Python. The full dense output is never materialized as Python tensors or reread from the PLY.
 
 So the saved reconstruction artifact is the sampled colored point cloud, plus per-point normals, extracted from the final native sparse TSDF volume. The binary PLY vertex schema is `x y z nx ny nz red green blue normals_red normals_green normals_blue`.
 
@@ -720,11 +725,11 @@ Important output knobs in `configs/default.yaml`:
 | `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `8`. |
 | `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `8`. |
 
-## Optional Stages 6-12: Instance Distillation
+## Optional Stages 6-11: Instance Distillation
 
 When `run.py` receives `--instance-config`, Stage 5 first completes the normal pose and TSDF artifacts. The pipeline then converts no additional SLAM state: it releases the finished graph/output and CUDA cache, retains only the CPU camera-to-world poses and shared intrinsics, and synchronously runs the class-agnostic instance path before `VipePipeline.run()` returns.
 
-Stage 6 receives native TSDF points and their TSDF-gradient normals directly from Stage 5 in memory, keeps one matched point/normal pair per native TSDF-sized cell, and selects motion-spaced views. Stages 7-12 generate and propagate SAM masks, lift them onto that surface, use the retained TSDF normals for atomization, and select the final overlapping `K=5` hypotheses. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels and Replica exclusions are benchmark-only and never enter these runtime stages.
+Stage 6 receives the compact native TSDF point/normal pairs selected during Stage 5 and chooses motion-spaced views. Stage 7 builds normal-aware surface atoms. Stage 8 generates and propagates SAM masks, projects the compact surface into each retained frame, and directly accumulates sparse atom-mask and atom-frame count tables. Stages 9-11 build the hierarchy, form evidence candidates, and select the final overlapping `K=5` hypotheses. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels and Replica exclusions are benchmark-only and never enter these runtime stages.
 
 ## ScanNet Benchmark Adapter
 

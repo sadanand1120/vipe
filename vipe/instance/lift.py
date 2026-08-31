@@ -55,6 +55,7 @@ def visible_points(
 
 def lift_masks(
     points: torch.Tensor,
+    atom_of: np.ndarray,
     frames: Sequence[int],
     c2w_of: Callable[[int], np.ndarray],
     masks_of: Callable[[int], Sequence[tuple[np.ndarray, float, int, int]]],
@@ -65,12 +66,19 @@ def lift_masks(
     occlusion_tolerance: float,
     min_voxels: int,
     log: Callable[[str], None] = print,
-) -> list[dict]:
-    """Lift all masks while retaining frame visibility and track provenance."""
-    lifted = []
+) -> tuple[dict, dict[int, np.ndarray]]:
+    """Lift masks directly into atom-level evidence and exact per-track point unions."""
+    atom_of = np.asarray(atom_of, np.int64)
+    atom_count = int(atom_of.max()) + 1
+    i_atom, i_mask, i_count = [], [], []
+    n_atom, n_frame, n_count = [], [], []
+    gm_frame, gm_size, gm_track_id = [], [], []
+    lifted_frame_count = 0
+    track_unions: dict[int, np.ndarray] = {}
+
     for position, frame_index in enumerate(frames, 1):
         if position % 100 == 0 or position == len(frames):
-            log(f"  [instance] lift {position}/{len(frames)} frames={len(lifted)}")
+            log(f"  [instance] lift {position}/{len(frames)} frames={lifted_frame_count}")
         indices, u, v = visible_points(
             points,
             c2w_of(frame_index),
@@ -82,28 +90,62 @@ def lift_masks(
         )
         if not indices.size:
             continue
-        visible = indices.astype(np.int64)
-        masks, scores, track_ids, global_ids = [], [], [], []
-        for mask, score, track_id, global_id in masks_of(frame_index):
+        visible = indices.astype(np.int32)
+        retained_frame = lifted_frame_count
+        retained_masks = 0
+        for mask, _, track_id, _ in masks_of(frame_index):
             selected = mask[v, u]
             if not selected.any():
                 continue
             voxels = visible[selected]
             if voxels.size >= min_voxels:
-                masks.append(voxels.astype(np.int32))
-                scores.append(float(score))
-                track_ids.append(int(track_id))
-                global_ids.append(int(global_id))
-        if masks:
-            lifted.append(
-                {
-                    "frame": int(frame_index),
-                    "V": visible.astype(np.int32),
-                    "masks": masks,
-                    "c2w": np.asarray(c2w_of(frame_index), np.float32),
-                    "mscore": np.asarray(scores, np.float32),
-                    "mtid": np.asarray(track_ids, np.int64),
-                    "mgid": np.asarray(global_ids, np.int64),
-                }
+                global_mask = len(gm_frame)
+                atoms, counts = np.unique(atom_of[voxels], return_counts=True)
+                i_atom.append(atoms.astype(np.int32))
+                i_mask.append(np.full(len(atoms), global_mask, np.int32))
+                i_count.append(counts.astype(np.int32))
+                gm_frame.append(retained_frame)
+                gm_size.append(int(voxels.size))
+                gm_track_id.append(int(track_id))
+                previous = track_unions.get(int(track_id))
+                track_unions[int(track_id)] = (
+                    voxels.copy() if previous is None else np.union1d(previous, voxels)
+                )
+                retained_masks += 1
+        if retained_masks:
+            atoms, counts = np.unique(atom_of[visible], return_counts=True)
+            n_atom.append(atoms.astype(np.int32))
+            n_frame.append(np.full(len(atoms), retained_frame, np.int32))
+            n_count.append(counts.astype(np.int32))
+            lifted_frame_count += 1
+
+    def _csr(rows, keys, counts):
+        if not rows:
+            return (
+                np.zeros(atom_count + 1, np.int64),
+                np.empty(0, np.int32),
+                np.empty(0, np.int32),
             )
-    return lifted
+        row = np.concatenate(rows)
+        key = np.concatenate(keys)
+        count = np.concatenate(counts)
+        order = np.argsort(row, kind="stable")
+        ptr = np.zeros(atom_count + 1, np.int64)
+        np.cumsum(np.bincount(row, minlength=atom_count), out=ptr[1:])
+        return ptr, key[order], count[order]
+
+    leafI_ptr, leafI_gm, leafI_c = _csr(i_atom, i_mask, i_count)
+    leafN_ptr, leafN_f, leafN_c = _csr(n_atom, n_frame, n_count)
+    evidence = {
+        "n_frames": lifted_frame_count,
+        "gm_frame": np.asarray(gm_frame, np.int64),
+        "gm_size": np.asarray(gm_size, np.int64),
+        "gm_track_id": np.asarray(gm_track_id, np.int64),
+        "leafI_ptr": leafI_ptr,
+        "leafI_gm": leafI_gm,
+        "leafI_c": leafI_c,
+        "leafN_ptr": leafN_ptr,
+        "leafN_f": leafN_f,
+        "leafN_c": leafN_c,
+    }
+    return evidence, track_unions

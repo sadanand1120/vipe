@@ -5,36 +5,14 @@ import torch
 
 from vipe.instance.association import frame_coreset_poses
 from vipe.instance.atoms import atom_adjacency, atom_voxels
-from vipe.instance.lift import visible_points
+from vipe.instance.lift import lift_masks, visible_points
 from vipe.instance.masks import StreamingMasks, _UnionFind
 from vipe.instance.pipeline import (
     _contract_geometry,
     _pack_hypotheses,
     _spatial_instance_colors,
     write_instance_ply,
-    reduce_tsdf_surface,
 )
-
-
-def test_tsdf_surface_reduction_keeps_nearest_sample_and_native_normal() -> None:
-    points = torch.tensor(
-        [
-            [0.10, 0.10, 0.10],
-            [0.49, 0.49, 0.49],
-            [-0.10, 0.10, 0.10],
-            [-0.49, 0.49, 0.49],
-            [1.25, 0.50, 0.50],
-            [1.75, 0.50, 0.50],
-        ],
-        dtype=torch.float32,
-    )
-    normals = torch.arange(18, dtype=torch.float32).reshape(6, 3)
-    reduced_points, reduced_normals = reduce_tsdf_surface(points, normals, 1.0)
-    np.testing.assert_array_equal(
-        reduced_points,
-        np.array([[-0.49, 0.49, 0.49], [0.49, 0.49, 0.49], [1.25, 0.50, 0.50]], np.float32),
-    )
-    np.testing.assert_array_equal(reduced_normals, normals[[3, 1, 4]].numpy())
 
 
 def test_touching_instances_receive_different_colors() -> None:
@@ -74,19 +52,47 @@ def test_projection_is_occlusion_correct_and_ascending() -> None:
     np.testing.assert_array_equal(v, [0, 0])
 
 
+def test_lift_streams_atom_csr_and_exact_track_unions() -> None:
+    points = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [3.0, 0.0, 1.0]])
+    masks = [
+        (np.array([[1, 0, 1, 0]], bool), 0.9, 4, 4),
+        (np.array([[0, 1, 1, 1]], bool), 0.8, 5, 5),
+    ]
+    evidence, track_unions = lift_masks(
+        points,
+        np.array([0, 0, 1, 1], np.int32),
+        [0],
+        lambda _: np.eye(4, dtype=np.float32),
+        lambda _: masks,
+        lambda _: np.ones((1, 4), np.float32),
+        np.array([1.0, 1.0, 0.0, 0.0], np.float32),
+        4,
+        1,
+        0.05,
+        1,
+        lambda _: None,
+    )
+    np.testing.assert_array_equal(evidence["leafI_ptr"], [0, 2, 4])
+    np.testing.assert_array_equal(evidence["leafI_gm"], [0, 1, 0, 1])
+    np.testing.assert_array_equal(evidence["leafI_c"], [1, 1, 1, 2])
+    np.testing.assert_array_equal(evidence["leafN_ptr"], [0, 1, 2])
+    np.testing.assert_array_equal(evidence["leafN_c"], [2, 2])
+    np.testing.assert_array_equal(track_unions[4], [0, 2])
+    np.testing.assert_array_equal(track_unions[5], [1, 2, 3])
+
+
 def test_global_track_linking_uses_minimum_id() -> None:
     masks = StreamingMasks.__new__(StreamingMasks)
     masks.chunk_starts = [0, 1]
     masks.stitch_config = {"min_iou": 0.8, "margin": 1.2}
     masks.union_find = _UnionFind()
     masks.stats = {"linked_tracks": 0, "low_iou": 0, "ambiguous": 0}
-    framed = [
-        {"masks": [np.array([1, 2, 3], np.int32)], "mtid": np.array([0]), "mgid": np.array([0])},
-        {"masks": [np.array([1, 2, 3], np.int32)], "mtid": np.array([1]), "mgid": np.array([1])},
-    ]
-    masks.finalize(framed)
-    assert framed[0]["mgid"].tolist() == [0]
-    assert framed[1]["mgid"].tolist() == [0]
+    evidence = {"gm_track_id": np.array([0, 1], np.int64)}
+    masks.finalize(
+        evidence,
+        {0: np.array([1, 2, 3], np.int32), 1: np.array([1, 2, 3], np.int32)},
+    )
+    assert evidence["global_track_ids"].tolist() == [0, 0]
     assert masks.stats["linked_tracks"] == 1
 
 

@@ -41,12 +41,21 @@ class TSDFVolume:
             float(depth_trunc),
         )
 
-    def extract_point_cloud(self, max_points: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        points, colors, normals = self.volume.extract_point_cloud(int(max_points))
-        return points.numpy(), colors.numpy(), normals.numpy()
-
-    def extract_point_cloud_tensors(self, max_points: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.volume.extract_point_cloud(int(max_points))
+    def write_point_cloud(
+        self,
+        path: Path,
+        max_points: int,
+        select_representatives: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        path.parent.mkdir(exist_ok=True, parents=True)
+        points, normals, source_count = self.volume.write_point_cloud(
+            str(path),
+            int(max_points),
+            bool(select_representatives),
+        )
+        if source_count == 0 or not select_representatives:
+            return None
+        return points, normals, int(source_count)
 
 
 def _cpu_tensor(value: np.ndarray | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -60,79 +69,3 @@ def _cpu_tensor(value: np.ndarray | torch.Tensor, dtype: torch.dtype) -> torch.T
     if not value.flags.c_contiguous:
         value = np.ascontiguousarray(value)
     return torch.as_tensor(value, dtype=dtype, device="cpu")
-
-
-def write_binary_ply(
-    path: Path,
-    points: np.ndarray | torch.Tensor,
-    colors: np.ndarray | torch.Tensor,
-    normals: np.ndarray | torch.Tensor,
-) -> None:
-    if len(points) == 0:
-        return
-
-    path.parent.mkdir(exist_ok=True, parents=True)
-    if isinstance(points, torch.Tensor):
-        tsdf_ext.write_binary_ply(
-            str(path),
-            _cpu_tensor(points, torch.float32).contiguous(),
-            _cpu_tensor(colors, torch.uint8).contiguous(),
-            _cpu_tensor(normals, torch.float32).contiguous(),
-        )
-        return
-
-    colors = np.clip(colors, 0, 255).astype(np.uint8, copy=False)
-    normals = normals.astype(np.float32, copy=False)
-    normal_colors = np.clip(np.rint((normals * 0.5 + 0.5) * 255.0), 0, 255).astype(np.uint8)
-    vertex_dtype = np.dtype(
-        [
-            ("x", "<f4"),
-            ("y", "<f4"),
-            ("z", "<f4"),
-            ("nx", "<f4"),
-            ("ny", "<f4"),
-            ("nz", "<f4"),
-            ("red", "u1"),
-            ("green", "u1"),
-            ("blue", "u1"),
-            ("normals_red", "u1"),
-            ("normals_green", "u1"),
-            ("normals_blue", "u1"),
-        ]
-    )
-    vertices = np.empty(len(points), dtype=vertex_dtype)
-    vertices["x"] = points[:, 0].astype(np.float32, copy=False)
-    vertices["y"] = points[:, 1].astype(np.float32, copy=False)
-    vertices["z"] = points[:, 2].astype(np.float32, copy=False)
-    vertices["nx"] = normals[:, 0]
-    vertices["ny"] = normals[:, 1]
-    vertices["nz"] = normals[:, 2]
-    vertices["red"] = colors[:, 0]
-    vertices["green"] = colors[:, 1]
-    vertices["blue"] = colors[:, 2]
-    vertices["normals_red"] = normal_colors[:, 0]
-    vertices["normals_green"] = normal_colors[:, 1]
-    vertices["normals_blue"] = normal_colors[:, 2]
-
-    with path.open("wb") as ply_file:
-        ply_file.write(
-            (
-                "ply\n"
-                "format binary_little_endian 1.0\n"
-                f"element vertex {len(vertices)}\n"
-                "property float x\n"
-                "property float y\n"
-                "property float z\n"
-                "property float nx\n"
-                "property float ny\n"
-                "property float nz\n"
-                "property uchar red\n"
-                "property uchar green\n"
-                "property uchar blue\n"
-                "property uchar normals_red\n"
-                "property uchar normals_green\n"
-                "property uchar normals_blue\n"
-                "end_header\n"
-            ).encode("ascii")
-        )
-        vertices.tofile(ply_file)
