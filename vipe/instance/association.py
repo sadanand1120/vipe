@@ -59,15 +59,12 @@ def frame_coreset_poses(frames, c2w_of, move_cm, move_deg, log=print):
     return [frames[i] for i in keep]
 
 
-def build_atom_graph(pts, at, ds, log=print):
+def build_atom_graph(pts, normals, at, ds, log=print):
     """Build normal-aware atoms and their adjacency graph.
     knn/rcap_mult shape the voxel kNN graph that BOTH the Dijkstra grouping and the atom adjacency
     derive from. `acnt` = per-edge crossing-voxel-edge count, a contact-area proxy, logged only."""
     t = time.time()
     atom_cm, lam, k, rcap_mult = at["size_cm"], at["lam"], at["knn"], at["rcap_mult"]
-    normals = ATOMS.estimate_normals(pts, max(at["normal_radius_min_m"],
-                                              at["normal_radius_vox_mult"] * ds),
-                                     at["normal_max_nn"])
     atom_of, edges = ATOMS.build_atoms(
         pts,
         normals,
@@ -1162,9 +1159,6 @@ def _config_for_core(config):
             "lam": float(config["atom_normal_weight"]),
             "knn": int(config["atom_knn"]),
             "rcap_mult": float(config["atom_radius_cap_voxels"]),
-            "normal_radius_min_m": float(config["normal_radius_min_m"]),
-            "normal_radius_vox_mult": float(config["normal_radius_voxel_multiplier"]),
-            "normal_max_nn": int(config["normal_max_neighbors"]),
         },
         "verify": {
             "min_vox": int(config["candidate_min_voxels"]),
@@ -1183,7 +1177,7 @@ def _config_for_core(config):
     }
 
 
-def associate(framed, points, config, voxel_size, log=print):
+def associate(framed, points, normals, config, voxel_size, log=print):
     """Run atomization, hierarchy, evidence association, and fixed-K selection."""
     started = time.time()
     cfg = _config_for_core(config)
@@ -1191,7 +1185,7 @@ def associate(framed, points, config, voxel_size, log=print):
     timings = {}
 
     tick = time.time()
-    atom_graph = build_atom_graph(points, cfg["atoms"], voxel_size, log=log)
+    atom_graph = build_atom_graph(points, normals, cfg["atoms"], voxel_size, log=log)
     timings["atoms_s"] = round(time.time() - tick, 3)
 
     tick = time.time()

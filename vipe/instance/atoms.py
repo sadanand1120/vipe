@@ -1,17 +1,6 @@
-"""Normal-aware atomization of the instance occupancy cloud."""
+"""Normal-aware atomization of the native TSDF surface."""
 
 import numpy as np
-
-
-def estimate_normals(points: np.ndarray, radius: float, max_neighbors: int) -> np.ndarray:
-    """Estimate surface normals with the frontier's Open3D implementation."""
-    import open3d as o3d
-
-    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.astype(np.float64)))
-    cloud.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_neighbors)
-    )
-    return np.asarray(cloud.normals, np.float32)
 
 
 def _knn_graph(points: np.ndarray, k: int, radius_cap: float):

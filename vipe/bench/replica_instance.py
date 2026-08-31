@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from vipe.bench.replica import full_replica_scene_candidates
+from vipe.instance.pipeline import write_instance_ply
 from vipe.utils.data_format import frame_stem, intrinsic_matrix, read_pinhole_intrinsics, scene_frame_count
 
 
@@ -41,7 +42,7 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
     if budget <= 0:
         raise ValueError(f"Invalid membership budget: {budget}")
     if len(indices) and (indices.min() < 0 or indices.max() >= len(points)):
-        raise ValueError("Hypothesis index is outside the instance cloud")
+        raise ValueError("Hypothesis index is outside the instance surface")
 
     hypotheses = tuple(indices[start:end] for start, end in zip(offsets[:-1], offsets[1:]))
     membership = np.zeros(len(points), dtype=np.uint16)
@@ -210,6 +211,33 @@ def recall_ar(
     }
 
 
+def gt_matching_hypotheses(
+    labels: np.ndarray,
+    hypotheses: tuple[np.ndarray, ...] | list[np.ndarray],
+) -> list[np.ndarray]:
+    """Return each GT instance's unique best hypothesis when IoU is at least 0.30."""
+    labels = np.asarray(labels, dtype=np.int64)
+    gt_ids = np.unique(labels[labels >= 0])
+    gt_sizes = np.bincount(np.searchsorted(gt_ids, labels[labels >= 0]), minlength=len(gt_ids))
+    best_iou = np.zeros(len(gt_ids), dtype=np.float64)
+    best_hypothesis = np.full(len(gt_ids), -1, dtype=np.int64)
+    for hypothesis_id, hypothesis in enumerate(hypotheses):
+        hypothesis = np.asarray(hypothesis, dtype=np.int64)
+        hypothesis_labels = labels[hypothesis]
+        valid = hypothesis_labels >= 0
+        if not valid.any():
+            continue
+        intersection = np.bincount(
+            np.searchsorted(gt_ids, hypothesis_labels[valid]), minlength=len(gt_ids)
+        )
+        iou = intersection / np.maximum(gt_sizes + len(hypothesis) - intersection, 1)
+        update = iou > best_iou
+        best_iou[update] = iou[update]
+        best_hypothesis[update] = hypothesis_id
+    representatives = sorted(set(best_hypothesis[best_iou >= 0.30].tolist()) - {-1})
+    return [np.asarray(hypotheses[idx], dtype=np.int64) for idx in representatives]
+
+
 def _cache_fingerprint(scene_dir: Path, mesh_path: Path, config: dict) -> str:
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode())
     files = [scene_dir / "metadata.json", scene_dir / "intrinsic" / "intrinsic_color.json", mesh_path]
@@ -315,6 +343,11 @@ def evaluate_scene(
         2,
     )
     metrics = recall_ar(transferred, prediction.hypotheses, thresholds)
+    write_instance_ply(
+        vipe_output_dir / "pcd" / f"{scene}_instances_gtmatch.ply",
+        prediction.points,
+        gt_matching_hypotheses(transferred, prediction.hypotheses),
+    )
     metrics.update(
         {
             "membership_budget": prediction.membership_budget,

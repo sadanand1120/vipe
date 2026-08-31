@@ -15,7 +15,6 @@ import torch
 from vipe.instance.association import associate, frame_coreset_poses
 from vipe.instance.masks import generate_and_lift
 from vipe.utils.io import ArtifactPath
-from vipe.utils.logging import pbar
 
 
 logger = logging.getLogger(__name__)
@@ -39,35 +38,46 @@ def _contract_geometry(width: int, height: int, long_side: int):
     return out_width, out_height, x, y
 
 
-def _build_occupancy_cloud(
-    frame_stream,
-    poses: np.ndarray,
-    intrinsics: np.ndarray,
-    voxel_size: float,
-    min_depth: float,
-    max_depth: float,
-) -> np.ndarray:
-    """Backproject all valid sensor depths into the frontier's occupied-voxel cloud."""
-    fx, fy, cx, cy = (float(value) for value in intrinsics)
-    batches = []
-    for frame_index in pbar(range(len(poses)), desc="Stage 6 occupancy cloud"):
-        c2w = poses[frame_index]
-        depth = frame_stream._read_depth(frame_index, frame_stream.frame_size)
-        y, x = np.where(
-            np.isfinite(depth) & (depth > min_depth) & (depth < max_depth)
-        )
-        if not y.size:
-            continue
-        z = depth[y, x]
-        camera = np.stack(((x - cx) / fx * z, (y - cy) / fy * z, z), axis=1).astype(
-            np.float64
-        )
-        world = camera @ c2w[:3, :3].T + c2w[:3, 3]
-        batches.append(np.unique(np.floor(world / voxel_size).astype(np.int64), axis=0))
-    if not batches:
-        raise ValueError("No valid sensor-depth points were available for instance distillation")
-    voxels = np.unique(np.concatenate(batches), axis=0)
-    return ((voxels + 0.5) * voxel_size).astype(np.float32)
+def reduce_tsdf_surface(
+    points_tensor: torch.Tensor,
+    normals_tensor: torch.Tensor,
+    voxel_edge_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the native TSDF sample nearest each TSDF-sized cell center."""
+    if points_tensor.device.type != "cpu" or normals_tensor.device.type != "cpu":
+        raise ValueError("TSDF surface tensors must remain on CPU")
+    if points_tensor.dtype != torch.float32 or normals_tensor.dtype != torch.float32:
+        raise ValueError("TSDF surface points and normals must be float32")
+    if points_tensor.shape != normals_tensor.shape or points_tensor.ndim != 2 or points_tensor.shape[1] != 3:
+        raise ValueError("TSDF surface points and normals must have matching (N, 3) shapes")
+    if len(points_tensor) == 0 or voxel_edge_m <= 0.0:
+        raise ValueError("TSDF surface and voxel edge must be non-empty and positive")
+
+    points = points_tensor.contiguous().numpy()
+    normals = normals_tensor.contiguous().numpy()
+    cells = np.floor(points / voxel_edge_m).astype(np.int64)
+    minimum = cells.min(axis=0)
+    spans = cells.max(axis=0) - minimum + 1
+    key_space = int(spans[0]) * int(spans[1]) * int(spans[2])
+    if key_space > np.iinfo(np.int64).max:
+        raise ValueError("TSDF surface extent exceeds deterministic cell-key capacity")
+
+    keys = cells[:, 0] - minimum[0]
+    keys = keys * spans[1] + cells[:, 1] - minimum[1]
+    keys = keys * spans[2] + cells[:, 2] - minimum[2]
+    distance2 = np.zeros(len(points), np.float32)
+    for axis in range(3):
+        residual = points[:, axis] - (cells[:, axis].astype(np.float32) + 0.5) * voxel_edge_m
+        distance2 += residual * residual
+    del cells
+
+    unique_keys, inverse = np.unique(keys, return_inverse=True)
+    best_distance = np.full(len(unique_keys), np.inf, np.float32)
+    np.minimum.at(best_distance, inverse, distance2)
+    candidates = np.flatnonzero(distance2 == best_distance[inverse])
+    chosen = np.full(len(unique_keys), len(points), np.int64)
+    np.minimum.at(chosen, inverse[candidates], candidates)
+    return np.ascontiguousarray(points[chosen]), np.ascontiguousarray(normals[chosen])
 
 
 def _pack_hypotheses(hypotheses: list[np.ndarray]):
@@ -83,22 +93,66 @@ def _pack_hypotheses(hypotheses: list[np.ndarray]):
     return indices, offsets
 
 
-def _palette(count: int) -> np.ndarray:
-    colors = np.zeros((count, 3), np.uint8)
-    hue = 0.0
-    for index in range(count):
-        hue = (hue + 0.61803398875) % 1.0
-        rgb = colorsys.hsv_to_rgb(
-            hue,
-            0.55 + 0.35 * ((index % 3) / 2),
-            0.75 + 0.25 * (index % 2),
-        )
-        colors[index] = tuple(int(channel * 255) for channel in rgb)
+def _spatial_instance_colors(points: np.ndarray, owner: np.ndarray, count: int) -> np.ndarray:
+    """Assign maximally different colors to instances that touch in the output cloud."""
+    from scipy.spatial import cKDTree
+
+    palette = np.asarray(
+        [
+            tuple(
+                int(channel * 255)
+                for channel in colorsys.hsv_to_rgb(
+                    hue / 12.0,
+                    0.92 if band == 0 else 0.68,
+                    1.0 if band == 0 else 0.78,
+                )
+            )
+            for band in range(2)
+            for hue in range(12)
+        ],
+        dtype=np.uint8,
+    )
+    visible = np.unique(owner[owner >= 0])
+    colors = np.zeros((count, 3), dtype=np.uint8)
+    if not len(visible):
+        return colors
+
+    neighbor_count = min(17, len(points))
+    _, neighbors = cKDTree(points).query(points, k=neighbor_count, workers=1)
+    if neighbor_count == 1:
+        neighbors = neighbors[:, None]
+    left = np.repeat(owner, neighbor_count - 1)
+    right = owner[neighbors[:, 1:].reshape(-1)]
+    keep = (left >= 0) & (right >= 0) & (left != right)
+    lo, hi = np.minimum(left[keep], right[keep]), np.maximum(left[keep], right[keep])
+    edges = np.unique(lo.astype(np.int64) * count + hi) if len(lo) else np.empty(0, np.int64)
+    adjacency = [set() for _ in range(count)]
+    for edge in edges:
+        left_id, right_id = divmod(int(edge), count)
+        adjacency[left_id].add(right_id)
+        adjacency[right_id].add(left_id)
+
+    assigned = np.full(count, -1, dtype=np.int32)
+    usage = np.zeros(len(palette), dtype=np.int32)
+    palette_float = palette.astype(np.float64)
+    for instance_id in sorted(visible.tolist(), key=lambda value: (-len(adjacency[value]), value)):
+        neighbor_colors = [assigned[value] for value in adjacency[instance_id] if assigned[value] >= 0]
+        if neighbor_colors:
+            separation = (
+                (palette_float[:, None] - palette_float[neighbor_colors][None]) ** 2
+            ).sum(axis=2).min(axis=1)
+            best = np.flatnonzero(separation == separation.max())
+            color_id = int(best[np.argmin(usage[best])])
+        else:
+            color_id = int(np.argmin(usage))
+        assigned[instance_id] = color_id
+        usage[color_id] += 1
+        colors[instance_id] = palette[color_id]
     return colors
 
 
-def _write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndarray]) -> None:
-    """Write a smallest-hypothesis-wins visualization of the overlapping prediction."""
+def write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndarray]) -> None:
+    """Write a smallest-hypothesis-wins visualization of the TSDF surface prediction."""
     owner = np.full(len(points), -1, np.int32)
     owner_size = np.full(len(points), np.iinfo(np.int64).max, np.int64)
     for hypothesis_id, voxels in enumerate(hypotheses):
@@ -107,7 +161,7 @@ def _write_instance_ply(path: Path, points: np.ndarray, hypotheses: list[np.ndar
         owner_size[take] = len(voxels)
     colors = np.tile(np.array([60, 60, 60], np.uint8), (len(points), 1))
     assigned = owner >= 0
-    colors[assigned] = _palette(len(hypotheses))[owner[assigned]]
+    colors[assigned] = _spatial_instance_colors(points, owner, len(hypotheses))[owner[assigned]]
 
     records = np.empty(
         len(points),
@@ -160,6 +214,11 @@ class InstancePipeline:
         pose_matrices: np.ndarray,
         intrinsics: np.ndarray,
         artifact_path: ArtifactPath,
+        points: np.ndarray,
+        normals: np.ndarray,
+        tsdf_voxel_edge_m: float,
+        source_surface_points: int,
+        surface_reduce_seconds: float,
     ) -> dict:
         """Distill overlapping 3D instances and return the persisted scene summary."""
         started = time.perf_counter()
@@ -170,19 +229,15 @@ class InstancePipeline:
                 f"Expected {(len(frame_stream), 4, 4)} c2w poses, received {poses.shape}"
             )
 
-        cloud_config = self.config["cloud"]
-        logger.info("Stage 6: building the 2 cm instance occupancy cloud and frame coreset")
-        tick = time.perf_counter()
-        points = _build_occupancy_cloud(
-            frame_stream,
-            poses,
-            intrinsics,
-            float(cloud_config["voxel_m"]),
-            float(cloud_config["depth_min_m"]),
-            float(cloud_config["depth_max_m"]),
+        points = np.ascontiguousarray(points, dtype=np.float32)
+        normals = np.ascontiguousarray(normals, dtype=np.float32)
+        if points.shape != normals.shape or points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("Reduced TSDF points and normals must have matching (N, 3) shapes")
+        logger.info(
+            "Stage 6: using %d native TSDF surface representatives from %d output samples",
+            len(points),
+            source_surface_points,
         )
-        cloud_seconds = time.perf_counter() - tick
-
         frames_config = self.config["frames"]
         frame_indices = frame_coreset_poses(
             list(range(len(poses))),
@@ -235,8 +290,9 @@ class InstancePipeline:
         association_result = associate(
             framed,
             points,
+            normals,
             self.config["association"],
-            float(cloud_config["voxel_m"]),
+            tsdf_voxel_edge_m,
         )
         hypotheses = association_result["hypotheses"]
         indices, offsets = _pack_hypotheses(hypotheses)
@@ -248,15 +304,18 @@ class InstancePipeline:
             hypothesis_indices=indices,
             hypothesis_offsets=offsets,
             K=np.int32(self.config["association"]["membership_budget"]),
+            domain=np.array("tsdf_surface"),
+            voxel_edge_m=np.float32(tsdf_voxel_edge_m),
         )
-        _write_instance_ply(ply_path, points, hypotheses)
+        write_instance_ply(ply_path, points, hypotheses)
 
         summary = {
-            "schema_version": 1,
+            "schema_version": 2,
             "scene": artifact_path.artifact_name,
             "config": _plain(self.config),
             "frames": {"total": len(poses), "selected": len(frame_indices)},
             "counts": {
+                "tsdf_output_points": source_surface_points,
                 "points": len(points),
                 "lifted_frames": len(framed),
                 "lifted_masks": sum(len(frame["masks"]) for frame in framed),
@@ -264,7 +323,7 @@ class InstancePipeline:
                 **association_result["counts"],
             },
             "timings": {
-                "cloud_s": round(cloud_seconds, 3),
+                "surface_reduce_s": round(surface_reduce_seconds, 3),
                 "masks_and_lift_s": round(mask_seconds, 3),
                 **association_result["timings"],
                 "wall_s": round(time.perf_counter() - started, 3),
@@ -278,7 +337,7 @@ class InstancePipeline:
             json.dump(summary, handle, indent=2)
             handle.write("\n")
         logger.info(
-            "Instance distillation complete: %d hypotheses over %d occupancy points",
+            "Instance distillation complete: %d hypotheses over %d TSDF surface points",
             len(hypotheses),
             len(points),
         )

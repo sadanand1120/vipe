@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 import numpy as np
+import torch
 
 from vipe.utils.logging import pbar
 from vipe.utils.tsdf import TSDFVolume, write_binary_ply
@@ -105,12 +106,17 @@ def _integrate_tsdf_frame(
     )
 
 
-def _write_tsdf_pcd(out_path: ArtifactPath, volume, max_points: int) -> None:
+def _write_tsdf_pcd(
+    out_path: ArtifactPath,
+    volume,
+    max_points: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     points, colors, normals = volume.extract_point_cloud_tensors(max_points)
     if len(points) == 0:
-        return
+        return None
 
     write_binary_ply(out_path.tsdf_pcd_path, points, colors, normals)
+    return points, normals
 
 
 def save_artifacts(
@@ -123,7 +129,8 @@ def save_artifacts(
     pcd_tsdf_depth_trunc_m: float,
     pcd_tsdf_num_voxels_per_block_edge: int,
     pcd_tsdf_depth_sampling_stride: int,
-) -> None:
+    retain_tsdf_surface: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
     """
@@ -154,4 +161,5 @@ def save_artifacts(
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
         np.savez(out_path.pose_path, data=pose_matrices, inds=np.arange(n_frames, dtype=np.int64))
 
-    _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)
+    surface = _write_tsdf_pcd(out_path, tsdf_volume, max_pcd_points)
+    return surface if retain_tsdf_surface else None

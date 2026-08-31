@@ -724,7 +724,7 @@ Important output knobs in `configs/default.yaml`:
 
 When `run.py` receives `--instance-config`, Stage 5 first completes the normal pose and TSDF artifacts. The pipeline then converts no additional SLAM state: it releases the finished graph/output and CUDA cache, retains only the CPU camera-to-world poses and shared intrinsics, and synchronously runs the class-agnostic instance path before `VipePipeline.run()` returns.
 
-Stages 6-12 replay the canonical RGB-D stream lazily, build the temporary 2 cm occupancy cloud, select motion-spaced views, generate and propagate SAM masks, lift them into 3D, and select the final overlapping `K=5` hypotheses. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels and Replica exclusions are benchmark-only and never enter these runtime stages.
+Stage 6 receives native TSDF points and their TSDF-gradient normals directly from Stage 5 in memory, keeps one matched point/normal pair per native TSDF-sized cell, and selects motion-spaced views. Stages 7-12 generate and propagate SAM masks, lift them onto that surface, use the retained TSDF normals for atomization, and select the final overlapping `K=5` hypotheses. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels and Replica exclusions are benchmark-only and never enter these runtime stages.
 
 ## ScanNet Benchmark Adapter
 

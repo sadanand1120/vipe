@@ -7,7 +7,7 @@ import torch
 
 
 @torch.no_grad()
-def visible_voxels(
+def visible_points(
     points: torch.Tensor,
     c2w: np.ndarray,
     intrinsics: np.ndarray,
@@ -71,7 +71,7 @@ def lift_masks(
     for position, frame_index in enumerate(frames, 1):
         if position % 100 == 0 or position == len(frames):
             log(f"  [instance] lift {position}/{len(frames)} frames={len(lifted)}")
-        indices, u, v = visible_voxels(
+        indices, u, v = visible_points(
             points,
             c2w_of(frame_index),
             intrinsics,

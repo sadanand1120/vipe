@@ -5,43 +5,43 @@ import torch
 
 from vipe.instance.association import frame_coreset_poses
 from vipe.instance.atoms import atom_adjacency, atom_voxels
-from vipe.instance.lift import visible_voxels
+from vipe.instance.lift import visible_points
 from vipe.instance.masks import StreamingMasks, _UnionFind
 from vipe.instance.pipeline import (
-    _build_occupancy_cloud,
     _contract_geometry,
     _pack_hypotheses,
-    _write_instance_ply,
+    _spatial_instance_colors,
+    write_instance_ply,
+    reduce_tsdf_surface,
 )
 
 
-class _FrameStream:
-    frame_size = (1, 2)
-
-    def __init__(self, depths):
-        self.depths = depths
-
-    def __len__(self):
-        return len(self.depths)
-
-    def _read_depth(self, index, _shape):
-        return self.depths[index]
-
-
-def test_occupancy_cloud_matches_floor_quantization() -> None:
-    stream = _FrameStream([np.array([[1.0, 1.0]], np.float32)])
-    points = _build_occupancy_cloud(
-        stream,
-        np.eye(4, dtype=np.float32)[None],
-        np.array([1.0, 1.0, 0.0, 0.0], np.float32),
-        voxel_size=0.5,
-        min_depth=0.1,
-        max_depth=12.0,
+def test_tsdf_surface_reduction_keeps_nearest_sample_and_native_normal() -> None:
+    points = torch.tensor(
+        [
+            [0.10, 0.10, 0.10],
+            [0.49, 0.49, 0.49],
+            [-0.10, 0.10, 0.10],
+            [-0.49, 0.49, 0.49],
+            [1.25, 0.50, 0.50],
+            [1.75, 0.50, 0.50],
+        ],
+        dtype=torch.float32,
     )
+    normals = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+    reduced_points, reduced_normals = reduce_tsdf_surface(points, normals, 1.0)
     np.testing.assert_array_equal(
-        points,
-        np.array([[0.25, 0.25, 1.25], [1.25, 0.25, 1.25]], np.float32),
+        reduced_points,
+        np.array([[-0.49, 0.49, 0.49], [0.49, 0.49, 0.49], [1.25, 0.50, 0.50]], np.float32),
     )
+    np.testing.assert_array_equal(reduced_normals, normals[[3, 1, 4]].numpy())
+
+
+def test_touching_instances_receive_different_colors() -> None:
+    points = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [1.0, 0.0, 0.0]], np.float32)
+    owner = np.array([0, 1, 2], np.int32)
+    colors = _spatial_instance_colors(points, owner, 3)
+    assert not np.array_equal(colors[0], colors[1])
 
 
 def test_resolution_contract_uses_frontier_nearest_index_map() -> None:
@@ -60,7 +60,7 @@ def test_pose_coreset_references_last_kept_frame() -> None:
 
 def test_projection_is_occlusion_correct_and_ascending() -> None:
     points = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 0.0, 2.0]])
-    indices, u, v = visible_voxels(
+    indices, u, v = visible_points(
         points,
         np.eye(4, dtype=np.float32),
         np.array([1.0, 1.0, 0.0, 0.0]),
@@ -144,6 +144,6 @@ def test_hypothesis_packing_and_ply_instance_field(tmp_path: Path) -> None:
     np.testing.assert_array_equal(offsets, [0, 2, 5])
 
     path = tmp_path / "instances.ply"
-    _write_instance_ply(path, np.zeros((4, 3), np.float32), hypotheses)
+    write_instance_ply(path, np.zeros((4, 3), np.float32), hypotheses)
     header = path.read_bytes().split(b"end_header\n", 1)[0]
     assert b"property int instance" in header

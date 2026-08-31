@@ -3,6 +3,7 @@
 
 import gc
 import logging
+import time
 
 from pathlib import Path
 
@@ -51,14 +52,14 @@ class VipePipeline:
         pose_matrices,
         w2c_matrices,
         intrinsics,
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         logger.info(f"Saving artifacts to {artifact_path}")
 
         def load_frame(frame_idx: int) -> io.TSDFFrame:
             color, depth = frame_stream.artifact_arrays(frame_idx)
             return io.TSDFFrame(color, depth, w2c_matrices[frame_idx], intrinsics)
 
-        io.save_artifacts(
+        return io.save_artifacts(
             artifact_path,
             pose_matrices,
             load_frame,
@@ -68,6 +69,7 @@ class VipePipeline:
             pcd_tsdf_depth_trunc_m=self.out_cfg.pcd_tsdf_depth_trunc_m,
             pcd_tsdf_num_voxels_per_block_edge=self.out_cfg.pcd_tsdf_num_voxels_per_block_edge,
             pcd_tsdf_depth_sampling_stride=self.out_cfg.pcd_tsdf_depth_sampling_stride,
+            retain_tsdf_surface=self.instance_cfg is not None,
         )
 
     def run(self, frame_stream: FrameDir) -> None:
@@ -78,16 +80,29 @@ class VipePipeline:
         intrinsics_cpu = slam_output.intrinsics[:4].detach().cpu().numpy().astype("float32")
         pose_matrices = slam_output.trajectory.matrix().detach().cpu().numpy().astype("float32")
         w2c_matrices = slam_output.trajectory.inv().matrix().detach().cpu().numpy().astype("float32")
-        self._save_outputs(artifact_path, frame_stream, pose_matrices, w2c_matrices, intrinsics_cpu)
+        tsdf_surface = self._save_outputs(
+            artifact_path, frame_stream, pose_matrices, w2c_matrices, intrinsics_cpu
+        )
 
         if self.instance_cfg is None:
             return
+        if tsdf_surface is None:
+            raise ValueError("TSDF extraction produced no surface for instance distillation")
 
         del slam_output
         gc.collect()
         torch.cuda.empty_cache()
 
-        from vipe.instance.pipeline import InstancePipeline
+        from vipe.instance.pipeline import InstancePipeline, reduce_tsdf_surface
+
+        tick = time.perf_counter()
+        surface_points, surface_normals = reduce_tsdf_surface(
+            *tsdf_surface,
+            float(self.out_cfg.pcd_tsdf_voxel_edge_m),
+        )
+        surface_reduce_seconds = time.perf_counter() - tick
+        source_surface_points = len(tsdf_surface[0])
+        del tsdf_surface
 
         logger.info("Starting post-TSDF instance distillation for %s", frame_stream.name)
         InstancePipeline(self.instance_cfg, device=torch.device("cuda")).run(
@@ -95,4 +110,9 @@ class VipePipeline:
             pose_matrices,
             intrinsics_cpu,
             artifact_path,
+            surface_points,
+            surface_normals,
+            float(self.out_cfg.pcd_tsdf_voxel_edge_m),
+            source_surface_points,
+            surface_reduce_seconds,
         )

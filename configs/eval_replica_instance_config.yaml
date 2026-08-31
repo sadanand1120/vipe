@@ -2,7 +2,7 @@ seed: 42                                  # Seed evaluator-side NumPy/SciPy work
 temporary_determinism: true               # Match the deterministic runtime setup.
 
 cloud:
-  voxel_m: 0.02                           # GT occupancy voxel edge; must match the runtime instance cloud.
+  voxel_m: 0.02                           # Fixed GT evaluation-cloud voxel edge.
   depth_min_m: 0.1                        # Reject invalid and near-field GT depth.
   depth_max_m: 12.0                       # Replica frontier far-depth cutoff.
 

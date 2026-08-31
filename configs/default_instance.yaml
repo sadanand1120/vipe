@@ -1,9 +1,5 @@
 pipeline:
   instance:
-    cloud:
-      voxel_m: 0.02                   # Temporary frontier occupancy-cloud voxel edge length.
-      depth_min_m: 0.1                # Reject invalid or near-sensor depth below this distance.
-      depth_max_m: 12.0               # Replica frontier far-depth cutoff.
     images:
       long_side: 1024                 # SAM/lift image long side; ViPE's canonical input is unchanged.
       jpeg_quality: 95                # Temporary SAM2 chunk-frame JPEG quality.
@@ -29,7 +25,7 @@ pipeline:
         min_iou: 0.8
         margin: 1.2
     lift:
-      occlusion_tolerance_m: 0.05
+      occlusion_tolerance_m: 0.05       # Maximum TSDF-to-sensor-depth disagreement during mask lifting.
       min_voxels: 5
     association:
       membership_budget: 5
@@ -39,9 +35,6 @@ pipeline:
       atom_normal_weight: 4.0
       atom_knn: 12
       atom_radius_cap_voxels: 2.5
-      normal_radius_min_m: 0.06
-      normal_radius_voxel_multiplier: 4
-      normal_max_neighbors: 30
       candidate_min_voxels: 10
       eligible_min_voxels: 8
       eligible_fraction: 0.05

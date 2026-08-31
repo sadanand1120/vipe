@@ -72,7 +72,7 @@ python run.py --input-dir /path/to/scene --output-dir /path/to/output --instance
 
 Useful output knobs in `configs/default.yaml`:
 
-- `pipeline.output.pcd_max_points=10000000`: cap saved TSDF point cloud points.
+- `pipeline.output.pcd_max_points=10000000`: deterministic area-sample count for the saved TSDF point cloud.
 - `pipeline.output.pcd_tsdf_depth_trunc_m=5.0`: ignore sensor depth beyond 5 meters.
 - `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=8`: TSDF voxel block edge size.
 - `pipeline.output.pcd_tsdf_depth_sampling_stride=8`: sample every eighth depth pixel when opening TSDF voxel blocks.
@@ -86,9 +86,9 @@ Saved artifacts:
 
 Instance-enabled runs additionally save:
 
-- `instances/<scene>.npz`: authoritative 2 cm occupancy cloud plus packed overlapping hypotheses.
+- `instances/<scene>.npz`: authoritative native TSDF surface representatives plus packed overlapping hypotheses.
 - `instances/<scene>_summary.json`: resolved config, timings, and structural counts.
-- `pcd/<scene>_instances.ply`: smallest-hypothesis-wins visualization; evaluation uses the NPZ.
+- `pcd/<scene>_instances.ply`: smallest-hypothesis-wins visualization with contrasting colors for touching instances; evaluation uses the NPZ.
 
 The class-agnostic algorithm and its explicit relation to ViPE Stages 1-5 are documented in [`ALGORITHM.md`](ALGORITHM.md).
 
@@ -98,7 +98,7 @@ The class-agnostic algorithm and its explicit relation to ViPE Stages 1-5 are do
 python3 scripts/replica_instance_bench_evaluator.py --scenes office0 office2 room0 --work-dir workspace/evaluation_replica_instance --input-root data/replica --raw-root /robodata/smodak/datasets/Replica_full --do-final-eval
 ```
 
-The benchmark runs instance distillation inside `VipePipeline.run()`, records build timing and peak VRAM, and evaluates the overlapping hypothesis soup with fixed-`K=5` AR. Runtime parameters live in `configs/default_instance.yaml`; GT projection, metric thresholds, and audited Replica label exclusions live in `configs/eval_replica_instance_config.yaml`.
+The benchmark runs instance distillation inside `VipePipeline.run()`, records build timing and peak VRAM, and evaluates the overlapping hypothesis soup with fixed-`K=5` AR. Runtime parameters live in `configs/default_instance.yaml`; GT projection, metric thresholds, and audited Replica label exclusions live in `configs/eval_replica_instance_config.yaml`. Instance hypotheses index a deterministic native-resolution subset of the same TSDF surface written by Stage 5; no second all-frame reconstruction is built. Evaluation also writes `pcd/<scene>_instances_gtmatch.ply`, retaining the unique best predicted hypothesis for each GT instance when its IoU is at least `0.30`.
 
 ## ScanNet Benchmark
 
