@@ -61,6 +61,7 @@ def test_lift_streams_atom_csr_and_exact_track_unions() -> None:
     evidence, track_unions = lift_masks(
         points,
         np.array([0, 0, 1, 1], np.int32),
+        (np.array([0], np.int64), np.array([1], np.int64)),
         [0],
         lambda _: np.eye(4, dtype=np.float32),
         lambda _: masks,
@@ -77,8 +78,105 @@ def test_lift_streams_atom_csr_and_exact_track_unions() -> None:
     np.testing.assert_array_equal(evidence["leafI_c"], [1, 1, 1, 2])
     np.testing.assert_array_equal(evidence["leafN_ptr"], [0, 1, 2])
     np.testing.assert_array_equal(evidence["leafN_c"], [2, 2])
+    np.testing.assert_array_equal(evidence["affinity_edge"], [0])
+    np.testing.assert_allclose(evidence["affinity_num"], [3.0 / np.sqrt(20.0)])
+    np.testing.assert_array_equal(evidence["affinity_weight"], [1.0])
     np.testing.assert_array_equal(track_unions[4], [0, 2])
     np.testing.assert_array_equal(track_unions[5], [1, 2, 3])
+
+
+def test_affinity_counts_one_sided_mask_frames_as_disagreement() -> None:
+    points = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]])
+    masks = {
+        0: [(np.array([[1, 1]], bool), 0.9, 0, 0)],
+        1: [(np.array([[1, 0]], bool), 0.9, 1, 1)],
+    }
+    evidence, _ = lift_masks(
+        points,
+        np.array([0, 1], np.int32),
+        (np.array([0], np.int64), np.array([1], np.int64)),
+        [0, 1],
+        lambda _: np.eye(4, dtype=np.float32),
+        masks.__getitem__,
+        lambda _: np.ones((1, 2), np.float32),
+        np.array([1.0, 1.0, 0.0, 0.0], np.float32),
+        2,
+        1,
+        0.05,
+        1,
+        lambda _: None,
+    )
+    np.testing.assert_allclose(evidence["affinity_num"], [1.0])
+    np.testing.assert_array_equal(evidence["affinity_weight"], [2.0])
+
+
+def test_streamed_affinity_matches_sequence_wide_sparse_formula() -> None:
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(4)
+    atom_count, frame_count = 6, 4
+    points = torch.tensor([[float(index), 0.0, 1.0] for index in range(atom_count)])
+    adjacent_a, adjacent_b = np.triu_indices(atom_count, 1)
+    masks = {}
+    track_id = 0
+    for frame in range(frame_count):
+        frame_masks = []
+        for _ in range(5):
+            mask = rng.random(atom_count) > 0.45
+            mask[rng.integers(atom_count)] = True
+            frame_masks.append((mask[None], 0.9, track_id, track_id))
+            track_id += 1
+        masks[frame] = frame_masks
+    evidence, _ = lift_masks(
+        points,
+        np.arange(atom_count, dtype=np.int32),
+        (adjacent_a, adjacent_b),
+        range(frame_count),
+        lambda _: np.eye(4, dtype=np.float32),
+        masks.__getitem__,
+        lambda _: np.ones((1, atom_count), np.float32),
+        np.array([1.0, 1.0, 0.0, 0.0], np.float32),
+        atom_count,
+        1,
+        0.05,
+        1,
+        lambda _: None,
+    )
+
+    gm_frame = evidence["gm_frame"]
+    row = np.repeat(np.arange(atom_count), np.diff(evidence["leafI_ptr"]))
+    frame = gm_frame[evidence["leafI_gm"]]
+    nkey = np.repeat(np.arange(atom_count), np.diff(evidence["leafN_ptr"])) * frame_count + evidence["leafN_f"]
+    key = row * frame_count + frame
+    visible = evidence["leafN_c"][np.searchsorted(nkey, key)]
+    values = evidence["leafI_c"] / visible
+    starts = np.r_[True, (row[1:] != row[:-1]) | (frame[1:] != frame[:-1])]
+    groups = np.cumsum(starts) - 1
+    norms = np.sqrt(np.bincount(groups, weights=values * values))
+    maximum = np.maximum.reduceat(values, np.flatnonzero(starts))
+    values *= np.sqrt(np.minimum(maximum, 1.0))[groups] / norms[groups]
+    signature = sp.csr_matrix((values, (row, evidence["leafI_gm"])), shape=(atom_count, len(gm_frame)))
+    visible_matrix = sp.csr_matrix(
+        (np.ones(len(evidence["leafN_f"])),
+         (np.repeat(np.arange(atom_count), np.diff(evidence["leafN_ptr"])), evidence["leafN_f"])),
+        shape=(atom_count, frame_count),
+    )
+    masked_matrix = sp.csr_matrix(
+        (np.ones(len(row)), (row, frame)), shape=(atom_count, frame_count)
+    )
+    masked_matrix.data[:] = 1.0
+    numerator = np.asarray(
+        signature[adjacent_a].multiply(signature[adjacent_b]).sum(axis=1)
+    ).ravel()
+    weight = np.asarray(
+        (visible_matrix[adjacent_a].multiply(visible_matrix[adjacent_b])
+         .multiply(masked_matrix[adjacent_a] + masked_matrix[adjacent_b]) > 0)
+        .sum(axis=1)
+    ).ravel()
+    positive = np.flatnonzero((numerator > 0.0) & (weight > 0.0))
+    np.testing.assert_array_equal(evidence["affinity_edge"], positive)
+    np.testing.assert_allclose(evidence["affinity_num"], numerator[positive], rtol=1e-15, atol=1e-15)
+    np.testing.assert_array_equal(evidence["affinity_weight"], weight[positive])
 
 
 def test_global_track_linking_uses_minimum_id() -> None:

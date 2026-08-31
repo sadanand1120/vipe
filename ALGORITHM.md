@@ -121,6 +121,8 @@ leafN(atom, frame) = N_a,f
 
 No dense `number_of_atoms x number_of_masks` membership matrix exists. Frame provenance and chunk-local track IDs remain attached to the sparse mask records.
 
+The normalized signature for one retained frame is used immediately to add `num(a,b)` and `W(a,b)` to adjacent atom pairs, then discarded. Thus affinity accumulation keeps fixed-size edge statistics rather than sequence-wide normalized signature, visibility, or masked-frame matrices. The raw `leafI` and `leafN` counts remain available for Stages 10-11.
+
 ### Stage 8.4: Global Track Linking
 
 After every retained frame is lifted, each chunk-local track is represented by the union of all point sets claimed by that track. Candidate track pairs must share points and come from different chunks.
@@ -135,7 +137,7 @@ Accepted pairs are processed in descending IoU with union-find. A connected comp
 
 ## Stage 9: Affinity And Hierarchy
 
-For atom `a`, mask `gm`, and the mask's frame `f(gm)`, define visible claim fraction:
+Stage 9 consumes the adjacency statistics accumulated frame by frame during Stage 8. For atom `a`, mask `gm`, and the mask's frame `f(gm)`, the contributing visible claim fraction was:
 
 ```math
 x_{a,gm}=I_{a,gm}/N_{a,f(gm)}.

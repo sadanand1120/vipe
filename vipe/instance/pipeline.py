@@ -237,6 +237,7 @@ class InstancePipeline:
         lifted_evidence, mask_stats = generate_and_lift(
             points_device,
             atom_graph["atom_of"],
+            (atom_graph["aa"], atom_graph["ab"]),
             frame_indices,
             rgb_of,
             depth_of,

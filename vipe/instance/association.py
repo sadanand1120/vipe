@@ -85,7 +85,7 @@ def build_atom_graph(pts, normals, config, ds, log=print):
 
 
 def build_tree(evidence, A, mustlink=None, log=print):
-    """Stage 9: per-atom signatures -> affinity -> agglomeration.
+    """Stage 9: consume accumulated adjacency affinity and agglomerate atoms.
     A is the atom-graph output. Border weighting is count (each adjacent atom
     pair = 1; area/sqrt weights measured worse). Linkage is weighted mean over the border: dyadic
     UPGMA was measured worse (its extents kill R@0.9). Returns T: atoms + mask tables + tree.
@@ -104,85 +104,15 @@ def build_tree(evidence, A, mustlink=None, log=print):
     log(f"  [hier] {len(gm_frame)} masks | leaf sums: {len(leafI_gm)} I-rows "
         f"{len(leafN_f)} N-rows")
 
-    # ---- signatures: per-(atom, frame) L2-normalised mask membership, as a CSR over masks ----
-    #      Vectorised. The float summation order differs from a per-atom Python loop, so the last
-    #      bits of the norms move and agglomeration tie-breaks can flip -- a different-but-equally-
-    #      valid tree (measured spread +-0.016 AR, sign depending on the machine). Same math, same
-    #      filters, same edge set.
+    # Stage 8 accumulates each frame's normalised signatures into adjacency-edge statistics, then
+    # discards the frame signature. Raw leaf counts above remain available to Stages 10-11.
     t = time.time()
-    import scipy.sparse as sp
-    nfr = int(evidence["n_frames"])
-    # The CSR rows are atom-major and mask-ascending, and gm ascending implies frame ascending, so
-    # each (atom, frame) L2 block is a CONTIGUOUS RUN. That is what keeps this affordable at scale:
-    # mercedes has 810M I-rows, and materialising int64 (atom, frame) keys for a np.unique over them
-    # would cost ~40 GB of temporaries. Run boundaries cost one bool array instead.
-    rF = gm_frame.astype(np.int32)[leafI_gm]                      # frame of each (atom, mask) row
-    rA32 = np.repeat(np.arange(na, dtype=np.int32), np.diff(leafI_ptr))
-    # per-(atom, frame) visible count, from the N-side CSR. Both sides are atom-major with keys
-    # ascending inside an atom, so the N-side key array is ALREADY sorted (no argsort needed) and
-    # the I-side is searched against it in chunks, which bounds the temporaries.
-    nkey = np.repeat(np.arange(na, dtype=np.int64), np.diff(leafN_ptr)) * nfr + leafN_f
-    naf = np.empty(len(rF), np.float64)
-    _CHK = 50_000_000
-    for _c0 in range(0, len(rF), _CHK):
-        _s = slice(_c0, min(_c0 + _CHK, len(rF)))
-        k = rA32[_s].astype(np.int64) * nfr + rF[_s]
-        j = np.searchsorted(nkey, k)
-        jc = np.minimum(j, len(nkey) - 1)
-        naf[_s] = np.where((j < len(nkey)) & (nkey[jc] == k), leafN_c[jc], 0.0)
-        del k, j, jc
-    del nkey
-    keep = naf > 0
-    rA = rA32[keep]; rG = leafI_gm[keep]
-    rFk = rF[keep]
-    x = leafI_c[keep] / naf[keep]
-    del naf, rA32, rF
-    # contiguous (atom, frame) runs -> group id per row, without a key array
-    _brk = np.empty(len(x), bool); _brk[0] = True
-    np.not_equal(rA[1:], rA[:-1], out=_brk[1:])
-    _brk[1:] |= rFk[1:] != rFk[:-1]
-    ginv = np.cumsum(_brk) - 1
-    _nrm = np.sqrt(np.bincount(ginv, weights=x * x))
-    # CLAIM-WEIGHTED COSINE probe: each (atom, frame) block stays a unit vector (pattern agreement,
-    # one bounded vote per frame) but is scaled by sqrt(max single-mask claim), so a frame where an
-    # atom is only grazed votes weakly and a fully-claimed one votes at full strength. The max (not
-    # the sum) over masks keeps multi-granularity coverage from stacking into fake agreement.
-    _mx = np.maximum.reduceat(x, np.flatnonzero(np.r_[True, ginv[1:] != ginv[:-1]]))
-    x = x * (np.sqrt(np.minimum(_mx, 1.0))[ginv] / np.where(_nrm[ginv] > 0.0, _nrm[ginv], 1.0))
-    del _brk, ginv, _nrm, _mx
-    nA = np.repeat(np.arange(na, dtype=np.int32), np.diff(leafN_ptr))
-    S = sp.csr_matrix((x, (rA, rG)), shape=(na, len(gm_frame)))
-    VIS = sp.csr_matrix((np.ones(len(nA), np.float32), (nA, leafN_f)), shape=(na, nfr))
-    SF = sp.csr_matrix((np.ones(len(rA), np.float32), (rA, rFk)), shape=(na, nfr))  # atom masked in f
-    SF.data[:] = 1.0
-    del rFk, nA
-    log(f"  [hier] signatures: {S.nnz} nonzeros ({time.time()-t:.0f}s)")
-
-    # ---- affinity on adjacency edges (weighted per-frame cosine) ----
-    #      num = sum over shared masks of x_a * x_b ; W = COUNT of co-visible frames where at least
-    #      one side is masked (a co-visible frame with neither masked is not evidence).
-    t = time.time()
-    _al, _bl = A["aa"], A["ab"]
-    _nnz_a = np.diff(S.indptr)
-    ea_l, eb_l, eaff_l, enum_l, eW_l = [], [], [], [], []
-    CH = 50000                                                    # caps the gathered-row memory
-    for _c0 in range(0, len(_al), CH):
-        _sl = slice(_c0, min(_c0 + CH, len(_al)))
-        a_i, b_i = _al[_sl], _bl[_sl]
-        num = np.asarray(S[a_i].multiply(S[b_i]).sum(axis=1)).ravel()
-        covis = VIS[a_i].multiply(VIS[b_i])                       # 1 where both atoms are visible
-        either = SF[a_i] + SF[b_i]                                # >0 where either is masked
-        W = np.asarray((covis.multiply(either) > 0).sum(axis=1)).ravel().astype(np.float64)
-        ok = ((_nnz_a[a_i] > 0) & (_nnz_a[b_i] > 0)
-              & (np.asarray(covis.sum(axis=1)).ravel() > 0))
-        _m = ok & (num > 0) & (W > 0)
-        ea_l.append(a_i[_m]); eb_l.append(b_i[_m]); eaff_l.append(num[_m] / W[_m])
-        enum_l.append(num[_m]); eW_l.append(W[_m])
-        log(f"  [hier] affinity {_sl.stop}/{len(_al)} edges")
-    ea = np.concatenate(ea_l); eb = np.concatenate(eb_l); eaff = np.concatenate(eaff_l)
-    enum_ = np.concatenate(enum_l); eW_ = np.concatenate(eW_l)
-    del S, VIS, SF, rA, rG, x                                # nothing below needs these
-    log(f"  [hier] {len(eaff)} positive-affinity edges ({time.time()-t:.0f}s)")
+    edge_index = evidence.pop("affinity_edge")
+    enum_ = evidence.pop("affinity_num")
+    eW_ = evidence.pop("affinity_weight")
+    ea, eb = A["aa"][edge_index], A["ab"][edge_index]
+    eaff = enum_ / eW_
+    log(f"  [hier] {len(eaff)} accumulated positive-affinity edges ({time.time()-t:.0f}s)")
 
     # ---- MUST-LINK contraction: atoms that the masks can NEVER tell apart become one meta-atom.
     #      P(inseparable | num, W) from a two-component soft-binomial mixture over the edges (EM,

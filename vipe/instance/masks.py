@@ -334,6 +334,7 @@ class StreamingMasks:
 def generate_and_lift(
     points: torch.Tensor,
     atom_of: np.ndarray,
+    adjacency: tuple[np.ndarray, np.ndarray],
     keyframes: Sequence[int],
     rgb_of: Callable[[int], np.ndarray],
     depth_of: Callable[[int], np.ndarray],
@@ -354,6 +355,7 @@ def generate_and_lift(
     evidence, track_unions = lift_masks(
         points,
         atom_of,
+        adjacency,
         keyframes,
         c2w_of,
         masks.masks_of,
