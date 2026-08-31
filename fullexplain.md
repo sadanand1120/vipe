@@ -720,6 +720,12 @@ Important output knobs in `configs/default.yaml`:
 | `pipeline.output.pcd_tsdf_num_voxels_per_block_edge` | Number of voxels along each sparse TSDF block edge; current default is `8`. |
 | `pipeline.output.pcd_tsdf_depth_sampling_stride` | Sample every Nth depth pixel when opening TSDF blocks; current default is `8`. |
 
+## Optional Stages 6-12: Instance Distillation
+
+When `run.py` receives `--instance-config`, Stage 5 first completes the normal pose and TSDF artifacts. The pipeline then converts no additional SLAM state: it releases the finished graph/output and CUDA cache, retains only the CPU camera-to-world poses and shared intrinsics, and synchronously runs the class-agnostic instance path before `VipePipeline.run()` returns.
+
+Stages 6-12 replay the canonical RGB-D stream lazily, build the temporary 2 cm occupancy cloud, select motion-spaced views, generate and propagate SAM masks, lift them into 3D, and select the final overlapping `K=5` hypotheses. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels and Replica exclusions are benchmark-only and never enter these runtime stages.
+
 ## ScanNet Benchmark Adapter
 
 The benchmark uses the same `VipePipeline` and `FrameDir` construction as `run.py`. It adds ScanNet GT pose/mesh loading, manifest writing, metric evaluation, and optional multi-GPU worker splitting.

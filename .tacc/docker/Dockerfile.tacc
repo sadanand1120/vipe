@@ -12,22 +12,30 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash build-essential ca-certificates git libgl1 libglib2.0-0 libgomp1 \
-      openssh-client pkg-config rsync \
+      openssh-client pkg-config rsync wget \
     && rm -rf /var/lib/apt/lists/*
 
 RUN conda create -y -n vipe-manual python=3.10 pip \
     && conda clean -afy
 
 COPY .tacc/requirements-tacc.txt /tmp/requirements-tacc.txt
+# The instance pipeline does not use SAM2's optional CUDA postprocessing extension.
 RUN python -m pip install --upgrade pip==26.0.1 setuptools==70.2.0 wheel==0.47.0 \
     && python -m pip install \
       torch==2.7.0+cu128 torchvision==0.22.0+cu128 \
       --index-url https://download.pytorch.org/whl/cu128 \
-    && python -m pip install -r /tmp/requirements-tacc.txt
+    && SAM2_BUILD_CUDA=0 SAM2_BUILD_ALLOW_ERRORS=0 \
+       python -m pip install --no-build-isolation -r /tmp/requirements-tacc.txt
 
 RUN mkdir -p "${TORCH_HOME}/hub/droid_slam" \
     && python -c "import gdown; gdown.download(id='1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh', output='${TORCH_HOME}/hub/droid_slam/droid.pth')" \
     && echo "46476ef64cde45a97504910d6f3de2eef7b398ec1c6e4e668815c29076024526  ${TORCH_HOME}/hub/droid_slam/droid.pth" | sha256sum -c -
+
+RUN mkdir -p /opt/vipe/models \
+    && wget -q -O /opt/vipe/models/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth \
+    && wget -q -O /opt/vipe/models/sam2.1_hiera_small.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt \
+    && echo "a7bf3b02f3ebf1267aba913ff637d9a2d5c33d3173bb679e46d9f338c26f262e  /opt/vipe/models/sam_vit_h_4b8939.pth" | sha256sum -c - \
+    && echo "6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38  /opt/vipe/models/sam2.1_hiera_small.pt" | sha256sum -c -
 
 # Native extension rebuilds only when its build metadata or sources change.
 WORKDIR /tmp/vipe-native

@@ -20,6 +20,7 @@ tmpouts
 runs
 results
 checkpoints
+models
 wandb
 *.sif
 cloudflared

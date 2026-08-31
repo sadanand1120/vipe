@@ -1,0 +1,54 @@
+pipeline:
+  instance:
+    cloud:
+      voxel_m: 0.02                   # Temporary frontier occupancy-cloud voxel edge length.
+      depth_min_m: 0.1                # Reject invalid or near-sensor depth below this distance.
+      depth_max_m: 12.0               # Replica frontier far-depth cutoff.
+    images:
+      long_side: 1024                 # SAM/lift image long side; ViPE's canonical input is unchanged.
+      jpeg_quality: 95                # Temporary SAM2 chunk-frame JPEG quality.
+    frames:
+      move_cm: 8.0                    # Keep a frame after this translation from the last kept frame.
+      move_deg: 8.0                   # Or keep it after this optical-axis rotation.
+    masks:
+      chunk_keyframes: 4              # Motion-selected frames per SAM2 propagation chunk.
+      seed_topk: 100                  # Maximum SAM1 masks seeded into one chunk.
+      sam1:
+        model_path: models/sam_vit_h_4b8939.pth
+        points_per_side: 48
+        points_per_batch: 128
+        pred_iou_thresh: 0.6
+        stability_score_thresh: 0.9
+        stability_score_offset: 1.0
+        box_nms_thresh: 0.7
+      sam2:
+        model_path: models/sam2.1_hiera_small.pt
+        model_config: configs/sam2.1/sam2.1_hiera_s.yaml
+        threshold: -1.0
+      stitch:
+        min_iou: 0.8
+        margin: 1.2
+    lift:
+      occlusion_tolerance_m: 0.05
+      min_voxels: 5
+    association:
+      membership_budget: 5
+      mustlink_min_affinity: 0.98
+      mustlink_min_observations: 8
+      atom_size_m: 0.03
+      atom_normal_weight: 4.0
+      atom_knn: 12
+      atom_radius_cap_voxels: 2.5
+      normal_radius_min_m: 0.06
+      normal_radius_voxel_multiplier: 4
+      normal_max_neighbors: 30
+      candidate_min_voxels: 10
+      eligible_min_voxels: 8
+      eligible_fraction: 0.05
+      retained_coverage: 0.5
+      dedup_ratio: 0.95
+      max_mask_crowd: 100
+      coverage_alpha: 2.0
+      purity_beta: 2.0
+      endorsement_floor: 0.05
+      hypothesis_price: 0.5

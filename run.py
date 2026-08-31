@@ -11,12 +11,20 @@ from vipe.utils.logging import configure_logging
 
 
 DEFAULT_CONFIG_PATH = get_config_path() / "default.yaml"
+DEFAULT_INSTANCE_CONFIG_PATH = get_config_path() / "default_instance.yaml"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run ViPE on a canonical RGB-D scene directory.")
     parser.add_argument("--input-dir", required=True, type=Path, help="Canonical ViPE RGB-D scene directory")
     parser.add_argument("--output-dir", required=True, type=Path, help="Output directory for saved artifacts")
+    parser.add_argument(
+        "--instance-config",
+        nargs="?",
+        const=DEFAULT_INSTANCE_CONFIG_PATH,
+        type=Path,
+        help="Run post-TSDF instance distillation using this config (default: configs/default_instance.yaml)",
+    )
     return parser
 
 
@@ -25,10 +33,12 @@ def main() -> None:
     cfg = load_yaml_config(DEFAULT_CONFIG_PATH)
     seed_everything(cfg.seed, temporary_determinism=cfg.temporary_determinism)
     logger = configure_logging()
+    instance_cfg = load_yaml_config(cli_args.instance_config).pipeline.instance if cli_args.instance_config else None
     pipeline = VipePipeline(
         slam=cfg.pipeline.slam,
         output=cfg.pipeline.output,
         output_dir=cli_args.output_dir,
+        instance=instance_cfg,
     )
     frame_stream = FrameDir(cli_args.input_dir)
     logger.info("Processing %s (%d canonical frames)", frame_stream.name, len(frame_stream))

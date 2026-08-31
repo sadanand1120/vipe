@@ -1,11 +1,18 @@
 einops==0.8.1
 gdown==5.2.0
+hydra-core==1.3.2
 imageio==2.37.0
 imageio-ffmpeg==0.6.0
+iopath==0.1.10
 ninja==1.11.1.4
 numpy==1.26.4
 open3d==0.19.0
 opencv-python==4.11.0.86
+pillow==12.2.0
+plyfile==1.1
+pycocotools==2.0.11
 PyYAML==6.0.2
 scipy==1.15.1
 tqdm==4.66.5
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@6fdee8f2727f4506cfbbe553e23b895e27956588
+SAM-2 @ git+https://github.com/sadanand1120/sam2.git@b5df60f857f2ee5f441aefd3594102caed049182

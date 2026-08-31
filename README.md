@@ -1,6 +1,6 @@
 # ViPE: Canonical RGB-D Scene Fork
 
-This fork keeps one supported runtime path: a canonical ViPE RGB-D scene directory. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided metric depth as the dense depth source, and writes pose plus native TSDF point-cloud artifacts. Dataset-specific cleanup, synchronization, and rectification happen before runtime in `scripts/data_extract/`.
+This fork consumes one canonical ViPE RGB-D scene directory. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided metric depth as the dense depth source, and writes pose plus native TSDF point-cloud artifacts. An optional post-TSDF path distills class-agnostic 3D instance hypotheses from SAM1/SAM2 masks. Dataset-specific cleanup, synchronization, and rectification happen before runtime in `scripts/data_extract/`.
 
 ## Installation
 
@@ -14,6 +14,20 @@ pip3 install --no-build-isolation -e .
 ```
 
 The editable install builds the native ViPE extension, including the TSDF code path. The default CUDA arch list covers sm75, sm86, sm87, and sm90/PTX; rerun `pip3 install --no-build-isolation -e .` after changing `setup.py` or `csrc/`.
+
+Install the optional instance-distillation dependencies into the same environment. SAM1 and SAM2 are pinned to the revisions used by the integrated pipeline; SAM2's CUDA extension is unnecessary because its associated postprocessing path is disabled.
+
+```bash
+SAM2_BUILD_CUDA=0 SAM2_BUILD_ALLOW_ERRORS=0 pip3 install --no-build-isolation -e '.[instance]'
+```
+
+Stage the two model checkpoints once:
+
+```bash
+mkdir -p models && wget -O models/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth && wget -O models/sam2.1_hiera_small.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
+```
+
+The checkpoint locations are ordinary `model_path` values in `configs/default_instance.yaml`; no checkpoint environment variables are read by the pipeline. Change those YAML paths if the files are staged elsewhere.
 
 ## Input Layout
 
@@ -48,6 +62,14 @@ python run.py \
 
 Runtime has no raw-rate or temporal-subsampling path. SLAM, pose infill, TSDF fusion, and saved pose indices consume the complete contiguous canonical sequence produced by the extractor.
 
+To run instance distillation synchronously after pose and TSDF output:
+
+```bash
+python run.py --input-dir /path/to/scene --output-dir /path/to/output --instance-config
+```
+
+`--instance-config` without a value loads `configs/default_instance.yaml`; an explicit YAML path may be supplied instead. Model checkpoint paths are ordinary fields in that YAML.
+
 Useful output knobs in `configs/default.yaml`:
 
 - `pipeline.output.pcd_max_points=10000000`: cap saved TSDF point cloud points.
@@ -61,6 +83,22 @@ Saved artifacts:
 
 - `pose/<scene>.npz`: camera-to-world pose per canonical frame.
 - `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
+
+Instance-enabled runs additionally save:
+
+- `instances/<scene>.npz`: authoritative 2 cm occupancy cloud plus packed overlapping hypotheses.
+- `instances/<scene>_summary.json`: resolved config, timings, and structural counts.
+- `pcd/<scene>_instances.ply`: smallest-hypothesis-wins visualization; evaluation uses the NPZ.
+
+The class-agnostic algorithm and its explicit relation to ViPE Stages 1-5 are documented in [`ALGORITHM.md`](ALGORITHM.md).
+
+## Replica Instance Benchmark
+
+```bash
+python3 scripts/replica_instance_bench_evaluator.py --scenes office0 office2 room0 --work-dir workspace/evaluation_replica_instance --input-root data/replica --raw-root /robodata/smodak/datasets/Replica_full --do-final-eval
+```
+
+The benchmark runs instance distillation inside `VipePipeline.run()`, records build timing and peak VRAM, and evaluates the overlapping hypothesis soup with fixed-`K=5` AR. Runtime parameters live in `configs/default_instance.yaml`; GT projection, metric thresholds, and audited Replica label exclusions live in `configs/eval_replica_instance_config.yaml`.
 
 ## ScanNet Benchmark
 

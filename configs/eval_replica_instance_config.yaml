@@ -1,0 +1,27 @@
+seed: 42                                  # Seed evaluator-side NumPy/SciPy work.
+temporary_determinism: true               # Match the deterministic runtime setup.
+
+cloud:
+  voxel_m: 0.02                           # GT occupancy voxel edge; must match the runtime instance cloud.
+  depth_min_m: 0.1                        # Reject invalid and near-field GT depth.
+  depth_max_m: 12.0                       # Replica frontier far-depth cutoff.
+
+labels:
+  mesh_neighbors: 5                       # Triangle-centroid neighbors used for majority-vote GT labels.
+  mesh_max_distance_m: 0.10               # Reject GT cloud points farther than this from semantic mesh samples.
+
+metric:
+  iou_min: 0.50                           # Lowest recall IoU threshold.
+  iou_max: 0.95                           # Highest recall IoU threshold.
+  iou_step: 0.05                          # AR averages recall over 0.50, 0.55, ..., 0.95.
+
+# Annotation debris audited in the Replica frontier. Relabel to background; keep voxels in IoU unions.
+exclusions:
+  office0: [1, 13, 18, 26, 56, 65, 67]
+  office2: [5, 6, 7, 78, 83]
+  room0: [17, 26, 28, 29, 37, 38, 42, 52, 53, 62, 66, 82, 91]
+
+outputs:
+  metrics_filename: replica_instance.json
+  timing_filename: replica_instance_timing.json
+  gt_cache_filename: gt_occupancy_labels_2cm.npz
