@@ -14,6 +14,7 @@ import torch
 
 from vipe.instance.association import associate, build_atom_graph, frame_coreset_poses
 from vipe.instance.masks import generate_and_lift
+from vipe.instance.semantic import distill_semantic_features, write_semantic_pca_ply
 from vipe.utils.io import ArtifactPath
 
 
@@ -179,6 +180,7 @@ class InstancePipeline:
             instance_dir / f"{name}.npz",
             instance_dir / f"{name}_summary.json",
             artifact_path.base_path / "pcd" / f"{name}_instances.ply",
+            artifact_path.base_path / "pcd" / f"{name}_semantic_pca.ply",
         )
 
     def run(
@@ -279,8 +281,33 @@ class InstancePipeline:
             atom_seconds=atom_seconds,
         )
         hypotheses = association_result["hypotheses"]
+        lifted_frames = int(lifted_evidence["n_frames"])
+        lifted_masks = int(len(lifted_evidence["gm_frame"]))
+        del atom_graph, lifted_evidence
+        gc.collect()
+
+        logger.info("Stage 12: distilling semantic descriptors with %s", self.config["features"]["backbone"])
+        tick = time.perf_counter()
+        instance_features, feature_metrics = distill_semantic_features(
+            features=self.config["features"],
+            points=points,
+            normals=normals,
+            hypotheses=hypotheses,
+            frame_indices=frame_indices,
+            rgb_of=rgb_of,
+            depth_of=depth_of,
+            poses=poses,
+            intrinsics=scaled_intrinsics,
+            width=width,
+            height=height,
+            device=self.device,
+        )
+        feature_seconds = time.perf_counter() - tick
+        gc.collect()
+        torch.cuda.empty_cache()
+
         indices, offsets = _pack_hypotheses(hypotheses)
-        prediction_path, summary_path, ply_path = self._artifact_paths(artifact_path)
+        prediction_path, summary_path, ply_path, semantic_ply_path = self._artifact_paths(artifact_path)
         prediction_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             prediction_path,
@@ -290,30 +317,49 @@ class InstancePipeline:
             K=np.int32(self.config["association"]["membership_budget"]),
             domain=np.array("tsdf_surface"),
             voxel_edge_m=np.float32(tsdf_voxel_edge_m),
+            instance_features=instance_features,
+            feature_backbone=np.array(feature_metrics["backbone"]),
+            feature_grid=np.int32(feature_metrics["grid"]),
         )
         write_instance_ply(ply_path, points, hypotheses)
+        tick = time.perf_counter()
+        semantic_coverage = write_semantic_pca_ply(
+            semantic_ply_path,
+            points,
+            normals,
+            hypotheses,
+            instance_features,
+        )
+        semantic_ply_seconds = time.perf_counter() - tick
+        if not np.isclose(semantic_coverage, feature_metrics["instance_field_coverage"]):
+            raise RuntimeError("Semantic field coverage changed during artifact serialization")
 
         summary = {
-            "schema_version": 2,
+            "schema_version": 3,
             "scene": artifact_path.artifact_name,
             "config": _plain(self.config),
             "frames": {"total": len(poses), "selected": len(frame_indices)},
             "counts": {
                 "tsdf_output_points": source_surface_points,
                 "points": len(points),
-                "lifted_frames": int(lifted_evidence["n_frames"]),
-                "lifted_masks": int(len(lifted_evidence["gm_frame"])),
+                "lifted_frames": lifted_frames,
+                "lifted_masks": lifted_masks,
                 **mask_stats,
                 **association_result["counts"],
+                "semantic_descriptors": feature_metrics["valid_descriptor_count"],
             },
+            "features": feature_metrics,
             "timings": {
                 "masks_and_lift_s": round(mask_seconds, 3),
                 **association_result["timings"],
+                "semantic_features_s": round(feature_seconds, 3),
+                "semantic_visualization_s": round(semantic_ply_seconds, 3),
                 "wall_s": round(time.perf_counter() - started, 3),
             },
             "artifacts": {
                 "prediction": str(prediction_path),
                 "visualization": str(ply_path),
+                "semantic_visualization": str(semantic_ply_path),
             },
         }
         with summary_path.open("w") as handle:

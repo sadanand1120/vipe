@@ -16,3 +16,11 @@ scipy==1.15.1
 tqdm==4.66.5
 segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@6fdee8f2727f4506cfbbe553e23b895e27956588
 SAM-2 @ git+https://github.com/sadanand1120/sam2.git@b5df60f857f2ee5f441aefd3594102caed049182
+transformers==4.41.0
+tokenizers==0.19.1
+huggingface-hub==0.23.4
+sentencepiece>=0.2.0
+ftfy>=6.3.1
+regex>=2024.11.6
+torchmetrics>=1.7.0
+termcolor>=2.5.0

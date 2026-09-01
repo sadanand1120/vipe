@@ -16,11 +16,22 @@ class InstancePrediction:
     points: np.ndarray
     hypotheses: tuple[np.ndarray, ...]
     membership_budget: int
+    instance_features: np.ndarray
+    feature_backbone: str
+    feature_grid: int
 
 
 def load_instance_prediction(path: str | Path) -> InstancePrediction:
     with np.load(path) as data:
-        required = {"points", "hypothesis_indices", "hypothesis_offsets", "K"}
+        required = {
+            "points",
+            "hypothesis_indices",
+            "hypothesis_offsets",
+            "K",
+            "instance_features",
+            "feature_backbone",
+            "feature_grid",
+        }
         missing = required - set(data.files)
         if missing:
             raise ValueError(f"Missing instance artifact arrays in {path}: {sorted(missing)}")
@@ -28,6 +39,18 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
         indices = np.asarray(data["hypothesis_indices"], dtype=np.int64)
         offsets = np.asarray(data["hypothesis_offsets"], dtype=np.int64)
         budget = int(np.asarray(data["K"]).item())
+        stored_features = np.asarray(data["instance_features"])
+        stored_backbone = np.asarray(data["feature_backbone"])
+        stored_grid = np.asarray(data["feature_grid"])
+        if stored_features.dtype != np.float16:
+            raise ValueError(f"Instance features must be float16, got {stored_features.dtype}")
+        if stored_backbone.ndim != 0 or stored_backbone.dtype.kind not in "US":
+            raise ValueError("Feature backbone must be a scalar string")
+        if stored_grid.ndim != 0 or stored_grid.dtype != np.int32:
+            raise ValueError("Feature grid must be a scalar int32")
+        instance_features = np.ascontiguousarray(stored_features, dtype=np.float32)
+        feature_backbone = str(stored_backbone.item())
+        feature_grid = int(stored_grid.item())
 
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"Instance points must have shape (N,3), got {points.shape}")
@@ -37,6 +60,17 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
         raise ValueError("Invalid packed hypothesis offsets")
     if budget <= 0:
         raise ValueError(f"Invalid membership budget: {budget}")
+    if instance_features.ndim != 2 or instance_features.shape[0] != len(offsets) - 1:
+        raise ValueError(
+            f"Instance features must have one row per hypothesis, got {instance_features.shape} "
+            f"for {len(offsets) - 1} hypotheses"
+        )
+    if instance_features.shape[1] == 0 or not np.isfinite(instance_features).all():
+        raise ValueError("Instance features must have a non-empty, finite descriptor dimension")
+    if feature_backbone not in {"fgclip", "dinotxt"}:
+        raise ValueError(f"Unsupported feature backbone: {feature_backbone!r}")
+    if feature_grid <= 0:
+        raise ValueError(f"Invalid feature grid: {feature_grid}")
     if len(indices) and (indices.min() < 0 or indices.max() >= len(points)):
         raise ValueError("Hypothesis index is outside the instance surface")
 
@@ -46,7 +80,54 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
         np.add.at(membership, hypothesis, 1)
     if len(membership) and int(membership.max()) > budget:
         raise ValueError(f"Instance artifact exceeds K={budget}: max membership={int(membership.max())}")
-    return InstancePrediction(points, hypotheses, budget)
+    return InstancePrediction(points, hypotheses, budget, instance_features, feature_backbone, feature_grid)
+
+
+def _normalized_rows(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    return values / np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-8)
+
+
+def semantic_top1(
+    *,
+    labels: np.ndarray,
+    hypotheses: tuple[np.ndarray, ...],
+    instance_features: np.ndarray,
+    object_to_class: dict[int, int],
+    class_names: dict[int, str],
+    text_encoder,
+) -> tuple[float | None, int, float]:
+    """Score covered points with mapped semantic GT using overlap-averaged descriptors."""
+    from vipe.instance.semantic import OverlapField
+
+    labels = np.asarray(labels, dtype=np.int64)
+    features = np.asarray(instance_features, dtype=np.float32)
+    field = OverlapField(len(labels), hypotheses, features)
+    coverage = float(field.covered.mean()) if len(labels) else 0.0
+    semantic_labels = np.fromiter(
+        (object_to_class.get(int(object_id), -1) for object_id in labels),
+        dtype=np.int64,
+        count=len(labels),
+    )
+    valid = field.covered & np.isin(semantic_labels, np.fromiter(class_names, dtype=np.int64))
+    if not valid.any():
+        return None, 0, coverage
+
+    class_ids = sorted(set(semantic_labels[valid].tolist()))
+    names = [class_names[class_id] for class_id in class_ids]
+    encoded = text_encoder.encode_text(names, template="a photo of a {}")
+    if hasattr(encoded, "detach"):
+        encoded = encoded.detach().cpu().numpy()
+    text_features = np.asarray(encoded, dtype=np.float32)
+    if text_features.shape != (len(class_ids), features.shape[1]):
+        raise ValueError(
+            f"Text features have shape {text_features.shape}, expected {(len(class_ids), features.shape[1])}"
+        )
+
+    field_features = field.rows(np.flatnonzero(valid))
+    text_features = _normalized_rows(text_features)
+    predicted = np.asarray(class_ids, dtype=np.int64)[np.argmax(field_features @ text_features.T, axis=1)]
+    return float(np.mean(predicted == semantic_labels[valid])), int(valid.sum()), coverage
 
 
 def kabsch_se3(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -204,11 +285,25 @@ def evaluate_prediction(
     gt_points: np.ndarray,
     gt_labels: np.ndarray,
     excluded_ids: list[int] | tuple[int, ...],
+    object_to_class: dict[int, int],
+    class_names: dict[int, str],
+    feature_config,
+    text_encoder,
     config,
-) -> dict[str, float | int | list[float]]:
+) -> dict[str, object]:
     scene_dir = Path(scene_dir)
     vipe_output_dir = Path(vipe_output_dir)
     prediction = load_instance_prediction(vipe_output_dir / "instances" / f"{scene}.npz")
+    if prediction.feature_backbone != str(feature_config.backbone):
+        raise ValueError(
+            f"{scene}: artifact backbone {prediction.feature_backbone!r} does not match "
+            f"configured backbone {feature_config.backbone!r}"
+        )
+    if prediction.feature_grid != int(feature_config.grid):
+        raise ValueError(
+            f"{scene}: artifact feature grid {prediction.feature_grid} does not match "
+            f"configured grid {feature_config.grid}"
+        )
     with np.load(vipe_output_dir / "pose" / f"{scene}.npz") as pose_data:
         pred_c2w = pose_data["data"].astype(np.float64)
         indices = pose_data["inds"].astype(np.int64)
@@ -234,6 +329,14 @@ def evaluate_prediction(
         2,
     )
     metrics = recall_ar(transferred, prediction.hypotheses, thresholds)
+    semantic_accuracy, semantic_points, semantic_coverage = semantic_top1(
+        labels=transferred,
+        hypotheses=prediction.hypotheses,
+        instance_features=prediction.instance_features,
+        object_to_class=object_to_class,
+        class_names=class_names,
+        text_encoder=text_encoder,
+    )
     pcd_dir = vipe_output_dir / "pcd"
     write_labeled_instance_ply(pcd_dir / f"{scene}_instances_gt.ply", prediction.points, transferred)
     write_instance_ply(
@@ -249,6 +352,12 @@ def evaluate_prediction(
             "label_transfer_distance_p90_m": float(np.percentile(distances, 90)),
             "label_transfer_distance_p99_m": float(np.percentile(distances, 99)),
             "excluded_gt_ids": list(excluded_ids),
+            "semantic_top1": semantic_accuracy,
+            "semantic_evaluated_points": semantic_points,
+            "semantic_field_coverage": semantic_coverage,
+            "semantic_backbone": prediction.feature_backbone,
+            "semantic_dimension": int(prediction.instance_features.shape[1]),
+            "semantic_grid": prediction.feature_grid,
         }
     )
     return metrics

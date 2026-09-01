@@ -1,6 +1,6 @@
-# ViPE: Canonical RGB-D Scene Fork
+# ViPE: RGB-D Pose, Reconstruction, And 3D Distillation
 
-This fork consumes one canonical ViPE RGB-D scene directory. ViPE estimates poses with the DROID/ViPE SLAM stack, uses the provided metric depth as the dense depth source, and writes pose plus native TSDF point-cloud artifacts. An optional post-TSDF path distills class-agnostic 3D instance hypotheses from SAM1/SAM2 masks. Dataset-specific cleanup, synchronization, and rectification happen before runtime in `scripts/data_extract/`.
+ViPE consumes one canonical RGB-D scene directory, estimates camera poses with the DROID/ViPE SLAM stack, fuses the provided metric depth into a native TSDF surface, and writes pose and reconstruction artifacts. Its optional post-TSDF path distills overlapping class-agnostic 3D instance hypotheses from SAM1/SAM2 masks and attaches an open-vocabulary semantic descriptor to every finalized hypothesis. Dataset-specific cleanup, synchronization, and rectification happen before runtime in `scripts/data_extract/`.
 
 ## Installation
 
@@ -15,19 +15,32 @@ pip3 install --no-build-isolation -e .
 
 The editable install builds the native ViPE extension, including the TSDF code path. The default CUDA arch list covers sm75, sm86, sm87, and sm90/PTX; rerun `pip3 install --no-build-isolation -e .` after changing `setup.py` or `csrc/`.
 
-Install the optional instance-distillation dependencies into the same environment. SAM1 and SAM2 are pinned to the revisions used by the integrated pipeline; SAM2's CUDA extension is unnecessary because its associated postprocessing path is disabled.
+Install the 3D distillation dependencies into the same environment. This extra includes the pinned SAM implementations and the FG-CLIP/DINO-TXT runtime dependencies; SAM2's CUDA extension is unnecessary because its associated postprocessing path is disabled.
 
 ```bash
 SAM2_BUILD_CUDA=0 SAM2_BUILD_ALLOW_ERRORS=0 pip3 install --no-build-isolation -e '.[instance]'
 ```
 
-Stage the two model checkpoints once:
+Stage the SAM checkpoints once:
 
 ```bash
 mkdir -p models && wget -O models/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth && wget -O models/sam2.1_hiera_small.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
 ```
 
-The checkpoint locations are ordinary `model_path` values in `configs/default_instance.yaml`; no checkpoint environment variables are read by the pipeline. Change those YAML paths if the files are staged elsewhere.
+The default semantic backbone is FG-CLIP. It is loaded from the exact model revision in `configs/default_instance.yaml`; first use downloads it to the Hugging Face cache. To prefetch it:
+
+```bash
+python -c "from huggingface_hub import snapshot_download; snapshot_download('qihoo360/fg-clip-large', revision='5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f')"
+```
+
+DINO-TXT is the alternative with local source and checkpoint loading. Clone the audited DINOv3 source, obtain the two gated official checkpoints, and place them at the configured `models/...` paths:
+
+```bash
+git clone https://github.com/facebookresearch/dinov3.git /opt/dinov3 && git -C /opt/dinov3 checkout --detach 6876159a11b4df116f30f667f8c9888617df0751
+mkdir -p models
+```
+
+Model locations are ordinary YAML fields; the runtime does not resolve checkpoint environment variables. DINO-TXT verifies the local repository's Python sources against the pinned revision before loading. Its tokenizer vocabulary is fetched by the pinned DINOv3 implementation on first use.
 
 ## Input Layout
 
@@ -68,7 +81,20 @@ To run instance distillation synchronously after pose and TSDF output:
 python run.py --input-dir /path/to/scene --output-dir /path/to/output --instance-config
 ```
 
-`--instance-config` without a value loads `configs/default_instance.yaml`; an explicit YAML path may be supplied instead. Model checkpoint paths are ordinary fields in that YAML.
+`--instance-config` without a value loads `configs/default_instance.yaml`; an explicit YAML path may be supplied instead. Stages 6-11 select the overlapping instance hypotheses and Stage 12 distills their semantic descriptors synchronously before artifacts are written.
+
+The Stage-12 frontier is under `pipeline.instance.features`:
+
+```yaml
+features:
+  backbone: fgclip                 # fgclip or dinotxt
+  grid: 64                         # G x G dense feature map
+  weight_a: 1.0                    # projective-incidence exponent
+  weight_b: 1.0                    # inverse-depth exponent
+  occlusion_tolerance_m: 0.05
+```
+
+`fgclip` produces 768-dimensional descriptors from a `14G x 14G` input and uses its explicit `model_path` and revision. `dinotxt` produces 1024-dimensional descriptors from a `16G x 16G` input and requires explicit local repository, backbone-checkpoint, text-checkpoint, and model-name fields. Both project only depth-consistent TSDF points from the motion-selected frame coreset. See [`ALGORITHM.md`](ALGORITHM.md) for the exact visibility, weighting, fusion, and overlap equations.
 
 Useful output knobs in `configs/default.yaml`:
 
@@ -86,13 +112,14 @@ Saved artifacts:
 
 Instance-enabled runs additionally save:
 
-- `instances/<scene>.npz`: authoritative native TSDF surface representatives plus packed overlapping hypotheses.
-- `instances/<scene>_summary.json`: resolved config, timings, and structural counts.
+- `instances/<scene>.npz`: authoritative native TSDF surface representatives, packed overlapping hypotheses, and one row-aligned float16 semantic descriptor per hypothesis.
+- `instances/<scene>_summary.json`: resolved config, structural counts, feature coverage, descriptor metadata, and Stage-12 timing.
 - `pcd/<scene>_instances.ply`: smallest-hypothesis-wins visualization with contrasting colors for touching instances; evaluation uses the NPZ.
+- `pcd/<scene>_semantic_pca.ply`: deterministic PCA coloring of the overlap-averaged semantic field; gray points have no valid descriptor coverage.
 
-The class-agnostic algorithm and its explicit relation to ViPE Stages 1-5 are documented in [`ALGORITHM.md`](ALGORITHM.md).
+The complete distillation algorithm and its explicit relation to ViPE Stages 1-5 are documented in [`ALGORITHM.md`](ALGORITHM.md).
 
-## Instance Benchmarks
+## Instance And Semantic Evaluation
 
 ```bash
 python3 scripts/replica_instance_bench_evaluator.py --scenes office0 office2 room0 --work-dir workspace/evaluation_replica_instance --input-root data/replica --raw-root /robodata/smodak/datasets/Replica_full --do-final-eval
@@ -100,9 +127,13 @@ python3 scripts/replica_instance_bench_evaluator.py --scenes office0 office2 roo
 python3 scripts/scannet_instance_bench_evaluator.py --scenes scene0011_00 --work-dir workspace/evaluation_scannet_instance --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans --do-final-eval
 ```
 
-Both benchmarks run instance distillation inside `VipePipeline.run()`, record build timing and peak VRAM, and evaluate the overlapping hypothesis soup with fixed-`K=5` AR. Runtime parameters live in `configs/default_instance.yaml`; dataset-specific GT projection and metric parameters live in `configs/eval_replica_instance_config.yaml` and `configs/eval_scannet_instance_config.yaml`. Instance hypotheses index a deterministic native-resolution subset of the same TSDF surface written by Stage 5; no second all-frame reconstruction is built.
+Final evaluation aligns the predicted trajectory to GT with one SE3 transform, transfers GT object IDs to the predicted TSDF domain, and evaluates the overlapping fixed-`K=5` hypothesis soup. It reports AR over IoU thresholds `0.50:0.05:0.95`, R50/R75/R90, hypothesis and membership statistics, build timing, and peak VRAM.
 
-Evaluation writes two additional visualizations on the predicted TSDF instance domain. `pcd/<scene>_instances_gt.ply` shows the GT labels transferred to every predicted point and preserves those IDs in the `instance` property. `pcd/<scene>_instances_gtmatch.ply` retains the unique best predicted hypothesis for each GT instance when its IoU is at least `0.30`.
+Runtime parameters, including the semantic frontier, live in `configs/default_instance.yaml`; dataset-specific GT construction, label transfer, exclusions, and IoU settings live in `configs/eval_replica_instance_config.yaml` and `configs/eval_scannet_instance_config.yaml`.
+
+`semantic_top1` is a GT-only point metric, not a runtime classification output. The evaluator derives the scene vocabulary from dataset annotations, reconstructs the overlap-averaged point descriptor only where valid hypotheses provide coverage, encodes each present class as `a photo of a {class_name}` with the artifact's configured backbone, and chooses the maximum cosine-similarity class. Only points with both descriptor coverage and a mapped GT class are scored. Scene aggregation weights top-1 by `semantic_evaluated_points`; `semantic_field_coverage` is reported separately and averaged across scenes.
+
+Evaluation writes two additional visualizations on the predicted TSDF domain. `pcd/<scene>_instances_gt.ply` shows transferred GT object IDs and preserves them in the `instance` property. `pcd/<scene>_instances_gtmatch.ply` retains the unique best predicted hypothesis for each GT instance when its IoU is at least `0.30`. GT labels and class names are never consumed by runtime distillation.
 
 ## ScanNet Benchmark
 

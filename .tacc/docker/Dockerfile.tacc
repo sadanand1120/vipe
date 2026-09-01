@@ -8,6 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/conda/envs/vipe-manual/bin:${PATH} \
     PYTHONPATH=/opt/vipe \
     TORCH_HOME=/opt/vipe-cache/torch \
+    HF_HOME=/opt/vipe-cache/huggingface \
     TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.7;9.0;12.0+PTX"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,6 +27,11 @@ RUN python -m pip install --upgrade pip==26.0.1 setuptools==70.2.0 wheel==0.47.0
       --index-url https://download.pytorch.org/whl/cu128 \
     && SAM2_BUILD_CUDA=0 SAM2_BUILD_ALLOW_ERRORS=0 \
        python -m pip install --no-build-isolation -r /tmp/requirements-tacc.txt
+
+RUN git clone https://github.com/facebookresearch/dinov3.git /opt/dinov3 \
+    && git -C /opt/dinov3 checkout 6876159a11b4df116f30f667f8c9888617df0751 \
+    && rm -rf /opt/dinov3/.git \
+    && python -c "from huggingface_hub import snapshot_download; snapshot_download('qihoo360/fg-clip-large', revision='5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f')"
 
 RUN mkdir -p "${TORCH_HOME}/hub/droid_slam" \
     && python -c "import gdown; gdown.download(id='1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh', output='${TORCH_HOME}/hub/droid_slam/droid.pth')" \

@@ -6,6 +6,12 @@ export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THR
 
 export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='4,6,7' && python3 scripts/replica_vipe_bench_evaluator.py --work-dir ./workspace/evaluation_replica_default --input-root data/replica --raw-root /robodata/smodak/datasets/Replica_full
 
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='0' && python3 run.py --input-dir data/scannet/scene0011_00 --output-dir outputs/scene0011_instance --instance-config
+
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='0,1,2' && python3 scripts/replica_instance_bench_evaluator.py --scenes office0 office2 room0 --work-dir workspace/evaluation_replica_instance --input-root data/replica --raw-root /robodata/smodak/datasets/Replica_full --do-final-eval
+
+export NUMEXPR_MAX_THREADS=16 && export OMP_NUM_THREADS=16 && export MKL_NUM_THREADS=16 && export CUDA_VISIBLE_DEVICES='0' && python3 scripts/scannet_instance_bench_evaluator.py --scenes scene0011_00 --work-dir workspace/evaluation_scannet_instance --input-root data/scannet --raw-root /robodata/smodak/datasets/scannet_v2/scans --do-final-eval
+
 python3 scripts/data_extract/scannet_to_vipe.py --scans-root /robodata/smodak/datasets/scannet_v2/scans --output-root data/scannet --vipe-res 1280 --vipe-fps 5 --num-workers 4
 
 python3 scripts/data_extract/replica_niceslam_to_vipe.py --niceslam-root /robodata/smodak/datasets/Replica --full-root /robodata/smodak/datasets/Replica_full --output-root data/replica --vipe-res 1280 --vipe-fps 5 --num-workers 4

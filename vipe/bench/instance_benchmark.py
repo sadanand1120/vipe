@@ -82,6 +82,7 @@ def _instance_paths(output_dir: Path, scene: str) -> tuple[Path, ...]:
         output_dir / "instances" / f"{scene}.npz",
         output_dir / "instances" / f"{scene}_summary.json",
         output_dir / "pcd" / f"{scene}_instances.ply",
+        output_dir / "pcd" / f"{scene}_semantic_pca.ply",
     )
 
 
@@ -126,7 +127,7 @@ def _write_manifest(spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing ViPE instance artifacts:\n" + "\n".join(missing))
-    names = ("pose", "tsdf", "instances", "instance_summary", "instance_ply")
+    names = ("pose", "tsdf", "instances", "instance_summary", "instance_ply", "semantic_ply")
     _write_json(
         _manifest_path(spec, args, scene),
         {
@@ -265,7 +266,9 @@ def _timing_entry(frames: int, seconds: float, peak_vram_mb: float | None = None
     return entry
 
 
-def _evaluate(spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene: str, eval_cfg) -> dict:
+def _evaluate(
+    spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene: str, eval_cfg, feature_config, text_encoder
+) -> dict:
     cache_dir = args.work_dir / "model_results" / spec.dataset_key / scene / "instance" / "eval_cache"
     return spec.evaluate_scene(
         scene=scene,
@@ -273,12 +276,15 @@ def _evaluate(spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene: str,
         raw_root=args.raw_root,
         vipe_output_dir=_output_dir(args, scene),
         cache_dir=cache_dir,
+        feature_config=feature_config,
+        text_encoder=text_encoder,
         config=eval_cfg,
     )
 
 
-def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg) -> dict:
+def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg, instance_cfg) -> dict:
     payload = {"build": {}, "metric_eval": {}, "metrics": {}, "failures": {}}
+    completed = []
     for scene in _worker_scenes(args):
         try:
             frames = scene_frame_count(_scene_dir(args, scene))
@@ -290,12 +296,7 @@ def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg)
                 payload["build"][scene] = _timing_entry(frames, seconds, peak_vram)
             else:
                 print(f"[INFO] Reusing complete instance artifacts | {scene}", flush=True)
-
-            if args.do_final_eval:
-                start = time.perf_counter()
-                payload["metrics"][scene] = _evaluate(spec, args, scene, eval_cfg)
-                payload["metric_eval"][scene] = _timing_entry(frames, time.perf_counter() - start)
-                print(f"[INFO] Instance eval done | {scene} | {payload['metrics'][scene]}", flush=True)
+            completed.append(scene)
         except Exception as exc:
             import traceback
 
@@ -305,6 +306,30 @@ def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg)
         finally:
             _write_json(_worker_output_path(args), payload)
             _cleanup_runtime()
+
+    if args.do_final_eval and completed:
+        from vipe.instance.semantic import load_backbone
+
+        features = instance_cfg.pipeline.instance.features
+        backbone = str(features.backbone)
+        text_encoder = load_backbone(backbone, int(features.grid), features[backbone], device="cuda")
+        for scene in completed:
+            try:
+                frames = scene_frame_count(_scene_dir(args, scene))
+                start = time.perf_counter()
+                payload["metrics"][scene] = _evaluate(
+                    spec, args, scene, eval_cfg, features, text_encoder
+                )
+                payload["metric_eval"][scene] = _timing_entry(frames, time.perf_counter() - start)
+                print(f"[INFO] Instance eval done | {scene} | {payload['metrics'][scene]}", flush=True)
+            except Exception as exc:
+                import traceback
+
+                traceback.print_exc()
+                payload["failures"][scene] = repr(exc)
+                print(f"[WARN] Skipping failed {spec.dataset_label} instance eval | {scene} | {exc}", flush=True)
+            finally:
+                _write_json(_worker_output_path(args), payload)
     return payload
 
 
@@ -361,11 +386,28 @@ def _merge_payloads(payloads: list[dict]) -> dict:
 
 def _mean_metrics(scene_metrics: dict[str, dict]) -> dict[str, float]:
     keys = ("ar", "r50", "r75", "r90", "n_gt", "n_hyps", "mean_memb", "max_memb")
-    return {
+    mean = {
         key: float(np.mean([float(metrics[key]) for metrics in scene_metrics.values()]))
         for key in keys
         if scene_metrics and all(key in metrics for metrics in scene_metrics.values())
     }
+    semantic = [
+        metrics
+        for metrics in scene_metrics.values()
+        if metrics.get("semantic_top1") is not None and int(metrics.get("semantic_evaluated_points", 0)) > 0
+    ]
+    if semantic:
+        total = sum(int(metrics["semantic_evaluated_points"]) for metrics in semantic)
+        mean["semantic_top1"] = float(
+            sum(float(metrics["semantic_top1"]) * int(metrics["semantic_evaluated_points"]) for metrics in semantic)
+            / total
+        )
+        mean["semantic_evaluated_points"] = float(total)
+    if scene_metrics and all("semantic_field_coverage" in metrics for metrics in scene_metrics.values()):
+        mean["semantic_field_coverage"] = float(
+            np.mean([float(metrics["semantic_field_coverage"]) for metrics in scene_metrics.values()])
+        )
+    return mean
 
 
 def _write_results(spec: InstanceBenchmarkSpec, args: argparse.Namespace, payload: dict, eval_cfg) -> dict:
@@ -407,6 +449,8 @@ def _print_summary(spec: InstanceBenchmarkSpec, result: dict) -> None:
     print(f"{'R@0.50':<22}{mean.get('r50', float('nan')):.4f}")
     print(f"{'R@0.75':<22}{mean.get('r75', float('nan')):.4f}")
     print(f"{'R@0.90':<22}{mean.get('r90', float('nan')):.4f}")
+    print(f"{'Semantic top-1':<22}{mean.get('semantic_top1', float('nan')):.4f}")
+    print(f"{'Semantic coverage':<22}{mean.get('semantic_field_coverage', float('nan')):.4f}")
     print(f"{'Mean hypotheses':<22}{mean.get('n_hyps', float('nan')):.1f}")
     print(f"{'Build FPS':<22}{timing.get('build', {}).get('mean_fps', 0.0):.2f}")
     print(f"{'Peak VRAM (MB)':<22}{timing.get('build', {}).get('mean_peak_vram_mb', 0.0):.1f}")
@@ -458,7 +502,7 @@ def run_instance_benchmark(spec: InstanceBenchmarkSpec) -> None:
 
     spawned = _spawn_workers(spec, args)
     if spawned is None:
-        payload = _run_worker(spec, args, eval_cfg)
+        payload = _run_worker(spec, args, eval_cfg, instance_cfg)
         if os.environ.get(WORKER_ENV) == "1":
             return
     else:

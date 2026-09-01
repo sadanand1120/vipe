@@ -32,6 +32,32 @@ def semantic_mesh_path(raw_root: str | Path, scene: str) -> Path:
     raise FileNotFoundError(f"Missing Replica semantic mesh for {scene}. Checked: {checked}")
 
 
+def semantic_info_path(raw_root: str | Path, scene: str) -> Path:
+    checked = []
+    for candidate in full_replica_scene_candidates(scene):
+        path = Path(raw_root) / candidate / "habitat" / "info_semantic.json"
+        checked.append(str(path))
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"Missing Replica semantic info for {scene}. Checked: {checked}")
+
+
+def load_semantic_classes(raw_root: str | Path, scene: str) -> tuple[dict[int, int], dict[int, str]]:
+    info = json.loads(semantic_info_path(raw_root, scene).read_text(encoding="utf-8"))
+    object_to_class: dict[int, int] = {}
+    class_names: dict[int, str] = {}
+    for entry in info.get("objects", []):
+        class_id = int(entry.get("class_id", -1))
+        class_name = " ".join(str(entry.get("class_name", "")).strip().lower().split())
+        if class_id <= 0 or not class_name or class_name == "?":
+            continue
+        previous = class_names.setdefault(class_id, class_name)
+        if previous != class_name:
+            raise ValueError(f"{scene}: Replica class {class_id} has conflicting names {previous!r} and {class_name!r}")
+        object_to_class[int(entry["id"])] = class_id
+    return object_to_class, class_names
+
+
 def label_points_from_semantic_mesh(
     mesh_path: str | Path,
     points: np.ndarray,
@@ -138,8 +164,10 @@ def evaluate_scene(
     raw_root: str | Path,
     vipe_output_dir: str | Path,
     cache_dir: str | Path,
+    feature_config,
+    text_encoder,
     config,
-) -> dict[str, float | int | list[float]]:
+) -> dict[str, object]:
     scene_dir = Path(scene_dir)
     gt_c2w = np.stack(
         [
@@ -155,6 +183,7 @@ def evaluate_scene(
         gt_c2w,
         config,
     )
+    object_to_class, class_names = load_semantic_classes(raw_root, scene)
     return evaluate_prediction(
         scene=scene,
         scene_dir=scene_dir,
@@ -162,5 +191,9 @@ def evaluate_scene(
         gt_points=gt_points,
         gt_labels=gt_labels,
         excluded_ids=[int(value) for value in config.exclusions.get(scene, [])],
+        object_to_class=object_to_class,
+        class_names=class_names,
+        feature_config=feature_config,
+        text_encoder=text_encoder,
         config=config,
     )

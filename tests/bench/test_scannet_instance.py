@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vipe.bench.scannet_instance import load_annotated_mesh
+from vipe.bench.scannet_instance import load_annotated_mesh, load_semantic_classes
 
 
 def test_load_annotated_scannet_mesh_maps_segments_to_instances(tmp_path: Path) -> None:
@@ -37,6 +37,10 @@ def test_load_annotated_scannet_mesh_maps_segments_to_instances(tmp_path: Path) 
     )
 
     points, labels = load_annotated_mesh(tmp_path, scene)
+    object_to_class, class_names = load_semantic_classes(tmp_path, scene)
 
     assert points.shape == (4, 3)
     np.testing.assert_array_equal(labels, np.array([0, 0, 7, -1], dtype=np.int32))
+    assert {class_names[class_id] for class_id in object_to_class.values()} == {"floor", "chair"}
+    assert class_names[object_to_class[0]] == "floor"
+    assert class_names[object_to_class[7]] == "chair"

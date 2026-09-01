@@ -45,3 +45,17 @@ pipeline:
       purity_beta: 2.0
       endorsement_floor: 0.05
       hypothesis_price: 0.5
+    features:
+      backbone: fgclip                  # Dense semantic backbone: fgclip or dinotxt.
+      grid: 64                          # Frontier G x G dense feature grid per selected frame.
+      weight_a: 1.0                     # View-incidence score exponent.
+      weight_b: 1.0                     # Inverse-depth view-weight exponent.
+      occlusion_tolerance_m: 0.05       # Maximum TSDF-point to sensor-depth disagreement.
+      fgclip:
+        model_path: qihoo360/fg-clip-large # Hugging Face model ID or local snapshot path.
+        revision: 5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f # Audited remote-code/model revision.
+      dinotxt:
+        repo_path: /opt/dinov3          # Local DINOv3 source at the audited revision.
+        model_name: dinov3_vitl16_dinotxt_tet1280d20h24l # Local torch-hub entry point.
+        backbone_model_path: models/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth # ViT-L/16 checkpoint.
+        text_model_path: models/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth # dino.txt head/text checkpoint.

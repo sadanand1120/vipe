@@ -37,6 +37,9 @@ def test_instance_artifact_loading_and_membership_budget(tmp_path: Path) -> None
         hypothesis_indices=np.array([0, 1, 1, 2], dtype=np.int32),
         hypothesis_offsets=np.array([0, 2, 4], dtype=np.int64),
         K=np.array(2, dtype=np.int32),
+        instance_features=np.array([[1, 0], [0, 1]], dtype=np.float16),
+        feature_backbone=np.array("fgclip"),
+        feature_grid=np.int32(64),
     )
 
     prediction = load_instance_prediction(path)
@@ -146,12 +149,28 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
         hypothesis_indices=np.arange(4, dtype=np.int32),
         hypothesis_offsets=np.array([0, 2, 4]),
         K=np.array(1),
+        instance_features=np.array([[1, 0], [0, 1]], dtype=np.float16),
+        feature_backbone=np.array("fgclip"),
+        feature_grid=np.int32(64),
     )
     monkeypatch.setattr(
         replica_instance,
         "load_or_build_gt_cache",
         lambda *args, **kwargs: (gt_points, np.array([1, 1, 2, 2], dtype=np.int32)),
     )
+    monkeypatch.setattr(
+        replica_instance,
+        "load_semantic_classes",
+        lambda *args, **kwargs: ({1: 10, 2: 20}, {10: "chair", 20: "table"}),
+    )
+
+    class TextEncoder:
+        @staticmethod
+        def encode_text(names, template=None):
+            assert names == ["chair", "table"]
+            assert template == "a photo of a {}"
+            return np.eye(2, dtype=np.float32)
+
     config = AttrDict(
         outputs=AttrDict(gt_cache_filename="unused.npz"),
         exclusions=AttrDict(),
@@ -164,6 +183,8 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
         raw_root=tmp_path / "raw",
         vipe_output_dir=output_dir,
         cache_dir=tmp_path / "cache",
+        feature_config=AttrDict(backbone="fgclip", grid=64),
+        text_encoder=TextEncoder(),
         config=config,
     )
 
@@ -171,5 +192,6 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
     assert result["r90"] == 1.0
     assert result["n_hyps"] == 2
     assert result["ate_se3_m"] < 1e-12
+    assert result["semantic_top1"] == 1.0
     assert (output_dir / "pcd" / f"{scene}_instances_gt.ply").is_file()
     assert (output_dir / "pcd" / f"{scene}_instances_gtmatch.ply").is_file()
