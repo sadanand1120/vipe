@@ -17,7 +17,6 @@ class InstancePrediction:
     hypotheses: tuple[np.ndarray, ...]
     membership_budget: int
     instance_features: np.ndarray
-    feature_backbone: str
     feature_grid: int
 
 
@@ -29,7 +28,6 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
             "hypothesis_offsets",
             "K",
             "instance_features",
-            "feature_backbone",
             "feature_grid",
         }
         missing = required - set(data.files)
@@ -40,16 +38,12 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
         offsets = np.asarray(data["hypothesis_offsets"], dtype=np.int64)
         budget = int(np.asarray(data["K"]).item())
         stored_features = np.asarray(data["instance_features"])
-        stored_backbone = np.asarray(data["feature_backbone"])
         stored_grid = np.asarray(data["feature_grid"])
         if stored_features.dtype != np.float16:
             raise ValueError(f"Instance features must be float16, got {stored_features.dtype}")
-        if stored_backbone.ndim != 0 or stored_backbone.dtype.kind not in "US":
-            raise ValueError("Feature backbone must be a scalar string")
         if stored_grid.ndim != 0 or stored_grid.dtype != np.int32:
             raise ValueError("Feature grid must be a scalar int32")
         instance_features = np.ascontiguousarray(stored_features, dtype=np.float32)
-        feature_backbone = str(stored_backbone.item())
         feature_grid = int(stored_grid.item())
 
     if points.ndim != 2 or points.shape[1] != 3:
@@ -67,8 +61,6 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
         )
     if instance_features.shape[1] == 0 or not np.isfinite(instance_features).all():
         raise ValueError("Instance features must have a non-empty, finite descriptor dimension")
-    if feature_backbone not in {"fgclip", "dinotxt"}:
-        raise ValueError(f"Unsupported feature backbone: {feature_backbone!r}")
     if feature_grid <= 0:
         raise ValueError(f"Invalid feature grid: {feature_grid}")
     if len(indices) and (indices.min() < 0 or indices.max() >= len(points)):
@@ -80,7 +72,7 @@ def load_instance_prediction(path: str | Path) -> InstancePrediction:
         np.add.at(membership, hypothesis, 1)
     if len(membership) and int(membership.max()) > budget:
         raise ValueError(f"Instance artifact exceeds K={budget}: max membership={int(membership.max())}")
-    return InstancePrediction(points, hypotheses, budget, instance_features, feature_backbone, feature_grid)
+    return InstancePrediction(points, hypotheses, budget, instance_features, feature_grid)
 
 
 def _normalized_rows(values: np.ndarray) -> np.ndarray:
@@ -294,11 +286,6 @@ def evaluate_prediction(
     scene_dir = Path(scene_dir)
     vipe_output_dir = Path(vipe_output_dir)
     prediction = load_instance_prediction(vipe_output_dir / "instances" / f"{scene}.npz")
-    if prediction.feature_backbone != str(feature_config.backbone):
-        raise ValueError(
-            f"{scene}: artifact backbone {prediction.feature_backbone!r} does not match "
-            f"configured backbone {feature_config.backbone!r}"
-        )
     if prediction.feature_grid != int(feature_config.grid):
         raise ValueError(
             f"{scene}: artifact feature grid {prediction.feature_grid} does not match "
@@ -355,7 +342,6 @@ def evaluate_prediction(
             "semantic_top1": semantic_accuracy,
             "semantic_evaluated_points": semantic_points,
             "semantic_field_coverage": semantic_coverage,
-            "semantic_backbone": prediction.feature_backbone,
             "semantic_dimension": int(prediction.instance_features.shape[1]),
             "semantic_grid": prediction.feature_grid,
         }

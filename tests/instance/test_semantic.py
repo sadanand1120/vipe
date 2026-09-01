@@ -1,14 +1,15 @@
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 import vipe.instance.semantic as semantic
 from vipe.instance.semantic import (
+    CANONICAL_NEGATIVES,
     OverlapField,
     ProjectiveFeatureAccumulator,
     pool_instance_descriptors,
+    text_scores,
     write_semantic_pca_ply,
 )
 
@@ -24,17 +25,17 @@ def test_distillation_interface_uses_selected_config_and_ascending_frames(monkey
             return torch.tensor([[[1.0, 0.0]]])
 
     features = {
-        "backbone": "fgclip",
         "grid": 1,
         "weight_a": 1.0,
         "weight_b": 1.0,
         "occlusion_tolerance_m": 0.05,
-        "fgclip": {"model_path": "model", "revision": "revision"},
+        "model_path": "model",
+        "revision": "revision",
     }
     monkeypatch.setattr(
         semantic,
-        "load_backbone",
-        lambda name, grid, config, device: Backbone(),
+        "FGCLIPBackbone",
+        lambda **_: Backbone(),
     )
     monkeypatch.setattr(semantic, "pbar", lambda frames, **_: frames)
 
@@ -56,7 +57,6 @@ def test_distillation_interface_uses_selected_config_and_ascending_frames(monkey
     assert seen == [0, 1]
     np.testing.assert_array_equal(descriptors, [[1.0, 0.0]])
     assert metrics == {
-        "backbone": "fgclip",
         "grid": 1,
         "descriptor_dimension": 2,
         "selected_frames": 2,
@@ -91,66 +91,33 @@ def test_projective_fusion_uses_dense_depth_and_frontier_weight() -> None:
     )
 
 
-def test_dinotxt_checkpoint_paths_resolve_from_vipe_root(tmp_path: Path, monkeypatch) -> None:
-    repo = tmp_path / "dinov3"
-    repo.mkdir()
-    monkeypatch.setattr(semantic, "_verify_local_revision", lambda _: None)
+def test_frontier_text_scores_use_learned_temperature_and_canonical_negatives() -> None:
+    class Backbone:
+        temperature = 0.5
 
-    with pytest.raises(FileNotFoundError, match=str(semantic._REPO_ROOT / "models" / "backbone.pth")):
-        semantic.DINOTextBackbone(
-            grid=64,
-            repo_path=repo,
-            model_name="dinov3_vitl16_dinotxt_tet1280d20h24l",
-            backbone_model_path="models/backbone.pth",
-            text_model_path="models/text.pth",
-            device="cpu",
-        )
+        @staticmethod
+        def encode_text(names, template):
+            assert names == ["chair", "table", *CANONICAL_NEGATIVES]
+            assert template == "a photo of a {}"
+            return torch.tensor(
+                [[1.0, 0.0], [0.8, 0.6], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0], [0.6, 0.8]]
+            )
+
+    features = np.array([[1.0, 0.0]], np.float32)
+    scores = text_scores(Backbone(), features, ["chair", "table"])
+    similarities = np.array([[1.0, 0.8, 0.0, -1.0, 0.0, 0.6]], np.float32)
+    exponentials = np.exp((similarities - similarities.max()) / 0.5)
+    negative_sum = exponentials[:, 2:].sum(1, keepdims=True)
+    expected = exponentials[:, :2] / (exponentials[:, :2] + negative_sum)
+
+    np.testing.assert_allclose(scores, expected, rtol=1e-6)
 
 
-def test_dinotxt_loads_checkpoints_directly(tmp_path: Path, monkeypatch) -> None:
-    repo = tmp_path / "dinov3"
-    repo.mkdir()
-    backbone_path = tmp_path / "backbone.pth"
-    text_path = tmp_path / "text.pth"
-    backbone_path.touch()
-    text_path.touch()
-    monkeypatch.setattr(semantic, "_verify_local_revision", lambda _: None)
+def test_fgclip_temperature_comes_from_learned_logit_scale() -> None:
+    model = torch.nn.Module()
+    model.logit_scale = torch.nn.Parameter(torch.tensor(np.log(4.0), dtype=torch.float32))
 
-    calls = []
-
-    class StateTarget:
-        def load_state_dict(self, state, *, strict):
-            calls.append((state, strict))
-
-    class Model(StateTarget):
-        visual_model = type("Visual", (), {"backbone": StateTarget()})()
-
-        def to(self, _):
-            return self
-
-        def eval(self):
-            return self
-
-    hub_kwargs = {}
-    monkeypatch.setattr(
-        torch.hub,
-        "load",
-        lambda *args, **kwargs: (hub_kwargs.update(kwargs) or Model(), object()),
-    )
-    monkeypatch.setattr(torch, "load", lambda path, **_: {"path": Path(path).name})
-
-    semantic.DINOTextBackbone(
-        grid=64,
-        repo_path=repo,
-        model_name="dinov3_vitl16_dinotxt_tet1280d20h24l",
-        backbone_model_path=backbone_path,
-        text_model_path=text_path,
-        device="cpu",
-    )
-
-    assert hub_kwargs["pretrained"] is False
-    assert "weights" not in hub_kwargs and "backbone_weights" not in hub_kwargs
-    assert calls == [({"path": "backbone.pth"}, True), ({"path": "text.pth"}, False)]
+    assert semantic._learned_temperature(model) == 0.25
 
 
 def test_descriptor_pooling_and_overlap_field_match_frontier() -> None:

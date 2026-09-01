@@ -1,10 +1,7 @@
-"""Runtime semantic descriptors for finalized 3D instance hypotheses."""
-
-import hashlib
+"""Runtime FG-CLIP descriptors for finalized 3D instance hypotheses."""
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol
 
 import numpy as np
 import torch
@@ -14,12 +11,8 @@ from vipe.utils.logging import pbar
 
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
 _FGCLIP_REVISION = "5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f"
-_DINOV3_REVISION = "6876159a11b4df116f30f667f8c9888617df0751"
-_DINOV3_PYTHON_SHA256 = "ee449d34d006cced0cc252e9e8a4a8c7dc312fb567bb23d7ae0259b510940611"
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+CANONICAL_NEGATIVES = ("object", "things", "stuff", "texture")
 
 
 def _l2_torch(values: torch.Tensor) -> torch.Tensor:
@@ -30,14 +23,14 @@ def _l2_numpy(values: np.ndarray) -> np.ndarray:
     return values / np.linalg.norm(values, axis=-1, keepdims=True).clip(1e-8)
 
 
-def _image_tensor(image, size: int, mean, std, device: torch.device) -> torch.Tensor:
+def _image_tensor(image, size: int, device: torch.device) -> torch.Tensor:
     from PIL import Image
 
     pixels = torch.from_numpy(
         np.array(image.convert("RGB").resize((size, size), Image.Resampling.BICUBIC))
     ).float()
     pixels = pixels.permute(2, 0, 1) / 255.0
-    pixels = (pixels - torch.tensor(mean)[:, None, None]) / torch.tensor(std)[:, None, None]
+    pixels = (pixels - torch.tensor(_CLIP_MEAN)[:, None, None]) / torch.tensor(_CLIP_STD)[:, None, None]
     return pixels.unsqueeze(0).to(device)
 
 
@@ -45,19 +38,12 @@ def _prompts(names: Sequence[str], template: str | None) -> list[str]:
     return [template.format(name) if template else name for name in names]
 
 
-def _resolved_path(path: str | Path, base: Path = _REPO_ROOT) -> Path:
-    path = Path(path)
-    return (path if path.is_absolute() else base / path).resolve()
-
-
-class DenseSemanticBackbone(Protocol):
-    """Shared interface for dense image features and aligned text features."""
-
-    dimension: int
-
-    def dense_features(self, image) -> torch.Tensor: ...
-
-    def encode_text(self, names: Sequence[str], template: str | None = None) -> torch.Tensor: ...
+def _learned_temperature(module, default: float = 0.01) -> float:
+    """Return the contrastive softmax temperature encoded by FG-CLIP."""
+    for name, value in list(module.named_parameters()) + list(module.named_buffers()):
+        if name.endswith("logit_scale") and value.numel() == 1:
+            return float(1.0 / value.exp().item())
+    return default
 
 
 class FGCLIPBackbone:
@@ -96,16 +82,11 @@ class FGCLIPBackbone:
         }
         self.model = AutoModelForCausalLM.from_pretrained(**load_args).to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(**load_args)
+        self.temperature = _learned_temperature(self.model)
 
     @torch.no_grad()
     def dense_features(self, image) -> torch.Tensor:
-        pixels = _image_tensor(
-            image,
-            self.grid * self.patch_size,
-            _CLIP_MEAN,
-            _CLIP_STD,
-            self.device,
-        )
+        pixels = _image_tensor(image, self.grid * self.patch_size, self.device)
         dense = self.model.get_image_dense_features(pixels, interpolate_pos_encoding=True)
         dense = dense.reshape(self.grid, self.grid, -1).float()
         if dense.shape[-1] != self.dimension:
@@ -127,124 +108,34 @@ class FGCLIPBackbone:
         return _l2_torch(features)
 
 
-def _verify_local_revision(repo_path: Path) -> None:
-    if not repo_path.is_dir():
-        raise FileNotFoundError(f"Missing DINOv3 repository: {repo_path}")
-    digest = hashlib.sha256()
-    source_files = sorted(repo_path.rglob("*.py"))
-    for source_path in source_files:
-        if ".git" in source_path.parts or "__pycache__" in source_path.parts:
-            continue
-        digest.update(source_path.relative_to(repo_path).as_posix().encode())
-        digest.update(b"\0")
-        digest.update(source_path.read_bytes())
-        digest.update(b"\0")
-    actual = digest.hexdigest()
-    if actual != _DINOV3_PYTHON_SHA256:
-        raise RuntimeError(
-            f"DINOv3 source does not match pinned revision {_DINOV3_REVISION}: {repo_path}"
-        )
-
-
-class DINOTextBackbone:
-    """DINOv3 ViT-L/16+dino.txt loaded only from pinned local sources and checkpoints."""
-
-    patch_size = 16
-    dimension = 1024
-
-    def __init__(
-        self,
-        *,
-        grid: int,
-        repo_path: str | Path,
-        model_name: str,
-        backbone_model_path: str | Path,
-        text_model_path: str | Path,
-        device: str | torch.device = "cuda",
-    ) -> None:
-        if not model_name:
-            raise ValueError("DINO-TXT requires an explicit model_name")
-        repo_path = _resolved_path(repo_path)
-        backbone_model_path = _resolved_path(backbone_model_path)
-        text_model_path = _resolved_path(text_model_path)
-        _verify_local_revision(repo_path)
-        for label, path in (
-            ("DINOv3 backbone checkpoint", backbone_model_path),
-            ("DINO-TXT checkpoint", text_model_path),
-        ):
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing {label}: {path}")
-
-        self.grid = int(grid)
-        self.device = torch.device(device)
-        self.model, self.tokenizer = torch.hub.load(
-            str(repo_path),
-            model_name,
-            source="local",
-            trust_repo=True,
-            skip_validation=True,
-            pretrained=False,
-        )
-        backbone_state = torch.load(backbone_model_path, map_location="cpu", weights_only=True)
-        self.model.visual_model.backbone.load_state_dict(backbone_state, strict=True)
-        text_state = torch.load(text_model_path, map_location="cpu", weights_only=True)
-        self.model.load_state_dict(text_state, strict=False)
-        self.model = self.model.to(self.device).eval()
-
-    @torch.no_grad()
-    def dense_features(self, image) -> torch.Tensor:
-        pixels = _image_tensor(
-            image,
-            self.grid * self.patch_size,
-            _IMAGENET_MEAN,
-            _IMAGENET_STD,
-            self.device,
-        )
-        _, patch_tokens, _ = self.model.encode_image_with_patch_tokens(pixels, normalize=True)
-        dense = patch_tokens.float().reshape(self.grid, self.grid, -1)
-        if dense.shape[-1] != self.dimension:
-            raise RuntimeError(f"DINO-TXT returned D={dense.shape[-1]}, expected {self.dimension}")
-        return _l2_torch(dense)
-
-    @torch.no_grad()
-    def encode_text(self, names: Sequence[str], template: str | None = None) -> torch.Tensor:
-        tokens = self.tokenizer.tokenize(_prompts(names, template))
-        if hasattr(tokens, "to"):
-            tokens = tokens.to(self.device)
-        features = self.model.encode_text(tokens).float().to(self.device)
-        features = features[:, features.shape[-1] // 2 :]
-        if features.shape[-1] != self.dimension:
-            raise RuntimeError(f"DINO-TXT returned text D={features.shape[-1]}, expected {self.dimension}")
-        return _l2_torch(features)
-
-
-def load_backbone(
-    name: str,
-    grid: int,
-    config: Mapping,
-    device: str | torch.device = "cuda",
-) -> DenseSemanticBackbone:
-    """Load exactly the configured semantic backbone without environment-based resolution."""
-    try:
-        if name == "fgclip":
-            return FGCLIPBackbone(
-                grid=grid,
-                model_path=config["model_path"],
-                revision=config["revision"],
-                device=device,
-            )
-        if name == "dinotxt":
-            return DINOTextBackbone(
-                grid=grid,
-                repo_path=config["repo_path"],
-                model_name=config["model_name"],
-                backbone_model_path=config["backbone_model_path"],
-                text_model_path=config["text_model_path"],
-                device=device,
-            )
-    except KeyError as error:
-        raise ValueError(f"Missing {name} semantic setting: {error.args[0]}") from error
-    raise ValueError(f"Unknown semantic backbone: {name}")
+def text_scores(
+    backbone: FGCLIPBackbone,
+    features: np.ndarray,
+    prompts: Sequence[str],
+    *,
+    template: str | None = "a photo of a {}",
+    negatives: Sequence[str] = CANONICAL_NEGATIVES,
+    temperature: float | None = None,
+) -> np.ndarray:
+    """Return each query's softmax probability against the canonical negatives."""
+    query_count = len(prompts)
+    text = (
+        backbone.encode_text([*prompts, *negatives], template)
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+    similarities = np.asarray(features, dtype=np.float32) @ text.T
+    scaled = (similarities - similarities.max(axis=1, keepdims=True)) / float(
+        backbone.temperature if temperature is None else temperature
+    )
+    exponentials = np.exp(scaled)
+    negative_sum = exponentials[:, query_count:].sum(axis=1, keepdims=True)
+    probabilities = exponentials[:, :query_count] / (
+        exponentials[:, :query_count] + negative_sum
+    )
+    return probabilities.astype(np.float32)
 
 
 class ProjectiveFeatureAccumulator:
@@ -388,17 +279,9 @@ def distill_semantic_features(
     device: str | torch.device = "cuda",
 ) -> tuple[np.ndarray, dict]:
     """Return row-aligned float16 hypothesis descriptors and compact runtime metrics."""
-    required = (
-        "backbone",
-        "grid",
-        "weight_a",
-        "weight_b",
-        "occlusion_tolerance_m",
-    )
+    required = ("grid", "weight_a", "weight_b", "occlusion_tolerance_m", "model_path", "revision")
     try:
-        backbone_name = str(features["backbone"])
-        values = {key: features[key] for key in required[1:]}
-        backbone_config = features[backbone_name]
+        values = {key: features[key] for key in required}
     except KeyError as error:
         raise ValueError(f"Missing semantic setting: {error.args[0]}") from error
 
@@ -409,11 +292,11 @@ def distill_semantic_features(
     if selected_frames and (selected_frames[0] < 0 or selected_frames[-1] >= len(poses)):
         raise ValueError("Selected semantic frame index is out of range")
 
-    backbone = load_backbone(
-        backbone_name,
-        int(values["grid"]),
-        backbone_config,
-        device,
+    backbone = FGCLIPBackbone(
+        grid=int(values["grid"]),
+        model_path=values["model_path"],
+        revision=values["revision"],
+        device=device,
     )
     accumulator = ProjectiveFeatureAccumulator(
         points,
@@ -443,7 +326,6 @@ def distill_semantic_features(
     hit_fraction = float(accumulator.hit.float().mean().item()) if len(points) else 0.0
     field = OverlapField(len(points), hypotheses, instance_features)
     metrics = {
-        "backbone": backbone_name,
         "grid": int(values["grid"]),
         "descriptor_dimension": backbone.dimension,
         "selected_frames": len(selected_frames),

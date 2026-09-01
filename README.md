@@ -15,7 +15,7 @@ pip3 install --no-build-isolation -e .
 
 The editable install builds the native ViPE extension, including the TSDF code path. The default CUDA arch list covers sm75, sm86, sm87, and sm90/PTX; rerun `pip3 install --no-build-isolation -e .` after changing `setup.py` or `csrc/`.
 
-Install the 3D distillation dependencies into the same environment. This extra includes the pinned SAM implementations and the FG-CLIP/DINO-TXT runtime dependencies; SAM2's CUDA extension is unnecessary because its associated postprocessing path is disabled.
+Install the 3D distillation dependencies into the same environment. This extra includes the pinned SAM implementations and FG-CLIP runtime dependencies; SAM2's CUDA extension is unnecessary because its associated postprocessing path is disabled.
 
 ```bash
 SAM2_BUILD_CUDA=0 SAM2_BUILD_ALLOW_ERRORS=0 pip3 install --no-build-isolation -e '.[instance]'
@@ -27,20 +27,11 @@ Stage the SAM checkpoints once:
 mkdir -p models && wget -O models/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth && wget -O models/sam2.1_hiera_small.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
 ```
 
-The default semantic backbone is FG-CLIP. It is loaded from the exact model revision in `configs/default_instance.yaml`; first use downloads it to the Hugging Face cache. To prefetch it:
+Semantic descriptors use FG-CLIP at the exact model revision in `configs/default_instance.yaml`; first use downloads it to the Hugging Face cache. To prefetch it:
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download('qihoo360/fg-clip-large', revision='5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f')"
 ```
-
-DINO-TXT is the alternative with local source and checkpoint loading. Clone the audited DINOv3 source, obtain the two gated official checkpoints, and place them at the configured `models/...` paths:
-
-```bash
-git clone https://github.com/facebookresearch/dinov3.git /opt/dinov3 && git -C /opt/dinov3 checkout --detach 6876159a11b4df116f30f667f8c9888617df0751
-mkdir -p models
-```
-
-Model locations are ordinary YAML fields; the runtime does not resolve checkpoint environment variables. DINO-TXT verifies the local repository's Python sources against the pinned revision before loading. Its tokenizer vocabulary is fetched by the pinned DINOv3 implementation on first use.
 
 ## Input Layout
 
@@ -87,14 +78,15 @@ The Stage-12 frontier is under `pipeline.instance.features`:
 
 ```yaml
 features:
-  backbone: fgclip                 # fgclip or dinotxt
   grid: 64                         # G x G dense feature map
   weight_a: 1.0                    # projective-incidence exponent
   weight_b: 1.0                    # inverse-depth exponent
   occlusion_tolerance_m: 0.05
+  model_path: qihoo360/fg-clip-large
+  revision: 5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f
 ```
 
-`fgclip` produces 768-dimensional descriptors from a `14G x 14G` input and uses its explicit `model_path` and revision. `dinotxt` produces 1024-dimensional descriptors from a `16G x 16G` input and requires explicit local repository, backbone-checkpoint, text-checkpoint, and model-name fields. Both project only depth-consistent TSDF points from the motion-selected frame coreset. See [`ALGORITHM.md`](ALGORITHM.md) for the exact visibility, weighting, fusion, and overlap equations.
+FG-CLIP produces 768-dimensional descriptors from a `14G x 14G` input and projects only depth-consistent TSDF points from the motion-selected frame coreset. See [`ALGORITHM.md`](ALGORITHM.md) for the exact visibility, weighting, fusion, and overlap equations.
 
 Useful output knobs in `configs/default.yaml`:
 
@@ -131,7 +123,7 @@ Final evaluation aligns the predicted trajectory to GT with one SE3 transform, t
 
 Runtime parameters, including the semantic frontier, live in `configs/default_instance.yaml`; dataset-specific GT construction, label transfer, exclusions, and IoU settings live in `configs/eval_replica_instance_config.yaml` and `configs/eval_scannet_instance_config.yaml`.
 
-`semantic_top1` is a GT-only point metric, not a runtime classification output. The evaluator derives the scene vocabulary from dataset annotations, reconstructs the overlap-averaged point descriptor only where valid hypotheses provide coverage, encodes each present class as `a photo of a {class_name}` with the artifact's configured backbone, and chooses the maximum cosine-similarity class. Only points with both descriptor coverage and a mapped GT class are scored. Scene aggregation weights top-1 by `semantic_evaluated_points`; `semantic_field_coverage` is reported separately and averaged across scenes.
+`semantic_top1` is a GT-only point metric, not a runtime classification output. The evaluator derives the scene vocabulary from dataset annotations, reconstructs the overlap-averaged point descriptor only where valid hypotheses provide coverage, encodes each present class as `a photo of a {class_name}` with FG-CLIP, and chooses the maximum cosine-similarity class. Only points with both descriptor coverage and a mapped GT class are scored. Scene aggregation weights top-1 by `semantic_evaluated_points`; `semantic_field_coverage` is reported separately and averaged across scenes.
 
 Evaluation writes two additional visualizations on the predicted TSDF domain. `pcd/<scene>_instances_gt.ply` shows transferred GT object IDs and preserves them in the `instance` property. `pcd/<scene>_instances_gtmatch.ply` retains the unique best predicted hypothesis for each GT instance when its IoU is at least `0.30`. GT labels and class names are never consumed by runtime distillation.
 

@@ -246,7 +246,7 @@ Accept only `loss <= 0`. Process larger ancestors first and repeat to a fixed po
 
 Stage 12 runs only after the hypothesis set is final. It reuses the Stage-6 frame coreset, resized RGB and nearest-neighbor depth, scaled intrinsics, retained TSDF points and normals, and final camera poses. It does not rerun mask generation, alter hypothesis membership, or classify hypotheses.
 
-Let `N` be the number of retained TSDF points, `M` the number of selected hypotheses, `G` the configured square feature grid, and `D` the backbone descriptor dimension. The runtime has three distinct semantic representations:
+Let `N` be the number of retained TSDF points, `M` the number of selected hypotheses, `G` the configured square feature grid, and `D=768` the FG-CLIP descriptor dimension. The runtime has three distinct semantic representations:
 
 | Field | Shape and dtype | Meaning | Lifetime |
 | --- | --- | --- | --- |
@@ -256,14 +256,14 @@ Let `N` be the number of retained TSDF points, `M` the number of selected hypoth
 
 ### Stage 12.1: Dense Image Features
 
-For each selected frame `f`, the configured backbone emits a row-wise L2-normalized map
+For each selected frame `f`, FG-CLIP emits a row-wise L2-normalized map
 
 ```math
 F_f \in \mathbb{R}^{G\times G\times D},
 \qquad \lVert F_f[r,c]\rVert_2=1.
 ```
 
-The already aspect-preserving instance RGB is resized to the backbone's square input. FG-CLIP uses `14G x 14G`, CLIP normalization, and `D=768`; DINO-TXT uses `16G x 16G`, ImageNet normalization, and `D=1024`. Projection below maps the original resized-image coordinates to this square grid, so the feature lookup follows the same deterministic stretch.
+The already aspect-preserving instance RGB is resized to FG-CLIP's `14G x 14G` square input and CLIP-normalized. Projection below maps the original resized-image coordinates to this square grid, so the feature lookup follows the same deterministic stretch.
 
 For point `X_i`, pose `T_{c2w,f}=[R_f,t_f]`, and scaled intrinsics `(f_x,f_y,c_x,c_y)`:
 
@@ -378,30 +378,28 @@ C_i=\begin{cases}
 
 Thus every valid overlapping hypothesis contributes equally; there is no smallest-owner rule and no size or confidence weight. A compact point-to-valid-hypothesis membership index has `N+1` int64 offsets and one int32 member ID per valid membership. Consumers reconstruct only requested rows or bounded chunks. `instance_field_coverage` is the fraction of the `N` points for which `H_i^+` is nonempty; it differs from `direct_point_hit_fraction`, because a valid hypothesis descriptor propagates to all points in that hypothesis.
 
-### Stage 12.5: Backbones And Configuration
+### Stage 12.5: FG-CLIP Configuration
 
-`features.backbone` selects exactly one audited implementation:
+`model_path` and the pinned revision are loaded through Transformers with remote model code; Transformers major version 5 or newer is rejected. Dense and text features are 768-dimensional. Text prompts use a 77-token maximum and the model's short-position walk.
 
-- `fgclip`: `model_path` and the pinned revision are loaded through Transformers with remote model code; Transformers major version 5 or newer is rejected. Dense and text features are 768-dimensional. Text prompts use a 77-token maximum and the model's short-position walk.
-- `dinotxt`: the local DINOv3 repository, model name, ViT-L/16 backbone checkpoint, and DINO-TXT vision-head/text-encoder checkpoint are explicit paths. The repository's Python-source digest must match pinned DINOv3 revision `6876159a11b4df116f30f667f8c9888617df0751`. Dense features and the retained second half of text features are 1024-dimensional.
+For open-vocabulary confidence queries, `text_scores()` compares each unit descriptor against the query prompts and the canonical negatives `object`, `things`, `stuff`, and `texture`. It uses FG-CLIP's learned contrastive temperature. If `s_q` is one query similarity, `N` is the four-negative set, and `tau` is that temperature, the returned confidence is
+
+```math
+p(q)=\frac{\exp(s_q/\tau)}{\exp(s_q/\tau)+\sum_{n\in N}\exp(s_n/\tau)}.
+```
+
+Queries do not compete with one another in this denominator. This scorer is available to consumers but is not used by the temperature-free semantic top-1 benchmark.
 
 The default frontier is:
 
 ```yaml
 features:
-  backbone: fgclip
   grid: 64
   weight_a: 1.0
   weight_b: 1.0
   occlusion_tolerance_m: 0.05
-  fgclip:
-    model_path: qihoo360/fg-clip-large
-    revision: 5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f
-  dinotxt:
-    repo_path: /opt/dinov3
-    model_name: dinov3_vitl16_dinotxt_tet1280d20h24l
-    backbone_model_path: models/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
-    text_model_path: models/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth
+  model_path: qihoo360/fg-clip-large
+  revision: 5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f
 ```
 
 ## Runtime Artifacts
@@ -417,9 +415,9 @@ pcd/<scene>_instances.ply       smallest-hypothesis-wins visualization
 pcd/<scene>_semantic_pca.ply    PCA-colored on-demand overlap field
 ```
 
-The NPZ is authoritative. For `L` total packed memberships it stores `points` (`N x 3`, float32), `hypothesis_indices` (`L`, int32), `hypothesis_offsets` (`M+1`, int64), scalar `K` (int32), scalar `domain="tsdf_surface"`, scalar `voxel_edge_m` (float32), `instance_features=B` (`M x D`, float16), scalar `feature_backbone` (string), and scalar `feature_grid` (int32).
+The NPZ is authoritative. For `L` total packed memberships it stores `points` (`N x 3`, float32), `hypothesis_indices` (`L`, int32), `hypothesis_offsets` (`M+1`, int64), scalar `K` (int32), scalar `domain="tsdf_surface"`, scalar `voxel_edge_m` (float32), `instance_features=B` (`M x 768`, float16), and scalar `feature_grid` (int32).
 
-The summary uses schema version 3. Its `features` block records backbone, grid, descriptor dimension, selected-frame count, nonzero descriptor count, direct point-hit fraction, and overlap-field coverage. `timings.semantic_features_s` measures backbone loading, fusion, and descriptor pooling; `timings.semantic_visualization_s` measures bounded overlap reconstruction and PCA PLY writing. The instance PLY is not used by the algorithm or metrics.
+The summary uses schema version 3. Its `features` block records grid, descriptor dimension, selected-frame count, nonzero descriptor count, direct point-hit fraction, and overlap-field coverage. `timings.semantic_features_s` measures FG-CLIP loading, fusion, and descriptor pooling; `timings.semantic_visualization_s` measures bounded overlap reconstruction and PCA PLY writing. The instance PLY is not used by the algorithm or metrics.
 
 The semantic PLY evaluates `C` in bounded chunks. It centers covered rows, fits three PCA axes by SVD on at most 100,000 covered points sampled with RNG seed 0, and maps the sampled 2nd and 98th projection percentiles to RGB. Uncovered points are gray. This is a deterministic descriptor visualization, not a class prediction, and is not an evaluator input.
 
@@ -441,13 +439,13 @@ For each GT instance `g`, evaluation computes the best point-set IoU over all hy
 
 Semantic top-1 is a GT-only evaluator operation. Runtime does not select classes. After GT object IDs have been transferred to the predicted TSDF points, the evaluator maps them to dataset-provided class names. Replica uses valid class IDs and normalized names from `info_semantic.json`; ScanNet uses normalized aggregation labels. Only points that both have a mapped class and are covered by `C` are scored.
 
-For the set of mapped classes present on those valid points, the evaluator uses the same configured backbone to encode prompts `"a photo of a {class_name}"`. If `T_c` is the unit text descriptor for class `c`, the point prediction is
+For the set of mapped classes present on those valid points, the evaluator uses FG-CLIP to encode prompts `"a photo of a {class_name}"`. If `T_c` is the unit text descriptor for class `c`, the point prediction is
 
 ```math
 \hat y_i=\underset{c}{\arg\max}\;C_i^T T_c.
 ```
 
-`semantic_top1` is point accuracy over the valid set, `semantic_evaluated_points` is that set's size, and `semantic_field_coverage` is the fraction of all predicted TSDF points covered by `C` before class filtering. A scene with no valid points reports no top-1 value. The aggregate top-1 is weighted by evaluated point count; aggregate field coverage is the unweighted mean over scenes. Evaluation also verifies that the artifact backbone and grid match the active feature configuration.
+`semantic_top1` is point accuracy over the valid set, `semantic_evaluated_points` is that set's size, and `semantic_field_coverage` is the fraction of all predicted TSDF points covered by `C` before class filtering. A scene with no valid points reports no top-1 value. The aggregate top-1 is weighted by evaluated point count; aggregate field coverage is the unweighted mean over scenes. Evaluation also verifies that the artifact grid matches the active feature configuration.
 
 Evaluation writes `pcd/<scene>_instances_gt.ply`, which colors the predicted TSDF domain by transferred GT instance ID, and `pcd/<scene>_instances_gtmatch.ply`, which keeps the unique best predicted hypothesis for every GT instance whose best IoU is at least `0.30`. Both use spatially contrasting colors. These are benchmark visualizations only: GT labels never enter instance distillation.
 
@@ -455,4 +453,4 @@ Evaluation writes `pcd/<scene>_instances_gt.ply`, which colors the predicted TSD
 
 Ordering is part of the algorithm: frames and chunks are ascending, SAM top-k sorting is stable, track IDs are monotonic, union-find keeps the minimum representative, Stage-12 frames are sorted, and projection uses explicit elementwise arithmetic. Semantic PCA uses a fixed RNG seed. TF32 remains disabled and deterministic ViPE settings remain active.
 
-Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction streams the dense PLY in bounded chunks and returns only the compact Stage-6 surface domain. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Stage 12 loads one semantic backbone after association state is released, processes one selected frame at a time, pools `A` into `B`, and then releases the accumulator and GPU cache. Artifact writing retains only the TSDF surface, packed hypotheses, and `B`; each `C` consumer builds and releases its own compact overlap index.
+Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction streams the dense PLY in bounded chunks and returns only the compact Stage-6 surface domain. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Stage 12 loads FG-CLIP after association state is released, processes one selected frame at a time, pools `A` into `B`, and then releases the accumulator and GPU cache. Artifact writing retains only the TSDF surface, packed hypotheses, and `B`; each `C` consumer builds and releases its own compact overlap index.

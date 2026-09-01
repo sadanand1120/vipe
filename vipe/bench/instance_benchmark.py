@@ -308,11 +308,15 @@ def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg,
             _cleanup_runtime()
 
     if args.do_final_eval and completed:
-        from vipe.instance.semantic import load_backbone
+        from vipe.instance.semantic import FGCLIPBackbone
 
         features = instance_cfg.pipeline.instance.features
-        backbone = str(features.backbone)
-        text_encoder = load_backbone(backbone, int(features.grid), features[backbone], device="cuda")
+        text_encoder = FGCLIPBackbone(
+            grid=int(features.grid),
+            model_path=features.model_path,
+            revision=features.revision,
+            device="cuda",
+        )
         for scene in completed:
             try:
                 frames = scene_frame_count(_scene_dir(args, scene))

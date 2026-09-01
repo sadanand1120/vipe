@@ -286,7 +286,7 @@ class InstancePipeline:
         del atom_graph, lifted_evidence
         gc.collect()
 
-        logger.info("Stage 12: distilling semantic descriptors with %s", self.config["features"]["backbone"])
+        logger.info("Stage 12: distilling FG-CLIP semantic descriptors")
         tick = time.perf_counter()
         instance_features, feature_metrics = distill_semantic_features(
             features=self.config["features"],
@@ -318,7 +318,6 @@ class InstancePipeline:
             domain=np.array("tsdf_surface"),
             voxel_edge_m=np.float32(tsdf_voxel_edge_m),
             instance_features=instance_features,
-            feature_backbone=np.array(feature_metrics["backbone"]),
             feature_grid=np.int32(feature_metrics["grid"]),
         )
         write_instance_ply(ply_path, points, hypotheses)
