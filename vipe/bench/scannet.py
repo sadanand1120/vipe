@@ -691,9 +691,9 @@ class ScanNetDataset:
         )
         return str(aligned_path), scale_diagnostic
 
-    def _artifact_sample_count(self, result_path: str) -> int:
+    def _artifact_point_count(self, result_path: str) -> int:
         manifest = self._load_vipe_manifest(result_path)
-        return int(manifest["output"]["pcd_max_points"])
+        return int(manifest["output"]["pcd_point_count"])
 
     def eval3d(self, scene: str, result_path: str) -> dict[str, float]:
         start_eval = time.perf_counter()
@@ -702,7 +702,7 @@ class ScanNetDataset:
         method_name = str(self.config.outputs.reconstruction_method_name)
         eval_cache_dir = Path(result_path).parents[2] / "eval_cache"
         tqdm.write(f"[{self.DATASET_LABEL}] eval3d start | {scene} | {pcd_path}")
-        sample_count = self._artifact_sample_count(result_path)
+        sample_count = self._artifact_point_count(result_path)
         gt_cache_path = eval_cache_dir / f"gt_sample_{sample_count}.npz"
         start_gt = time.perf_counter()
         gt_pcd = _load_cached_point_cloud(gt_cache_path)

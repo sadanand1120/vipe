@@ -696,21 +696,17 @@ C
 w \leftarrow w+1.
 ```
 
-After all frames, the extension extracts the zero-crossing surface directly as a point cloud. It scans neighboring voxel samples, keeps cubes whose eight corners are observed and contain both negative and nonnegative TSDF values, decomposes each cube into tetrahedra, linearly interpolates zero-crossing vertices, colors, and TSDF-gradient normals, builds surface triangles, and deterministically samples the resulting triangles by area.
+After all frames, the extension extracts the zero-crossing surface directly as a compact point cloud. It scans neighboring voxel samples, keeps each native TSDF cell whose eight corners are observed and contain both negative and nonnegative TSDF values, decomposes that cell into tetrahedra, and linearly interpolates its local zero-crossing triangles. It then retains the actual point on those triangles nearest the cell center. Thus every sign-changing 2 cm TSDF cell contributes exactly one point; the point count follows reconstructed surface extent rather than an arbitrary output budget.
 
-Normals are computed from the fused implicit surface, not from per-frame depth maps. At each voxel corner, the extension estimates the TSDF gradient with central differences when both neighbors exist and one-sided differences near sparse-volume boundaries. A zero-crossing vertex interpolates endpoint gradients along the crossing edge and normalizes the result. A sampled point interpolates its triangle vertex normals barycentrically and normalizes again. This writes smooth surface normals tied to the fused TSDF geometry.
+Normals are computed from the fused implicit surface, not from per-frame depth maps. At each voxel corner, the extension estimates the TSDF gradient with central differences when both neighbors exist and one-sided differences near sparse-volume boundaries. A zero-crossing vertex interpolates endpoint gradients along the crossing edge and normalizes the result. The retained point interpolates its triangle vertex normals barycentrically and normalizes again. This writes smooth surface normals tied to the fused TSDF geometry.
 
 ```python
-instance_surface = volume.write_point_cloud(
-    pcd_path,
-    pcd_max_points,
-    select_representatives=instance_distillation_enabled,
-)
+surface_points, surface_normals = volume.write_point_cloud(pcd_path)
 ```
 
-The native extension streams PLY vertices in bounded chunks. When instance distillation is enabled, that same extraction pass also retains the nearest actual zero-surface sample to each native TSDF-cell center and returns only those compact point/normal tensors to Python. The full dense output is never materialized as Python tensors or reread from the PLY.
+The native extension writes these compact vertices to PLY and returns the same point/normal tensors to Python. Instance and semantic distillation therefore operate on exactly the saved reconstruction domain. There is no dense intermediate point cloud, global point cap, PLY reread, or second spatial reduction.
 
-So the saved reconstruction artifact is the sampled colored point cloud, plus per-point normals, extracted from the final native sparse TSDF volume. The binary PLY vertex schema is `x y z nx ny nz red green blue normals_red normals_green normals_blue`.
+The saved reconstruction artifact is this compact colored zero-surface point cloud plus per-point normals, extracted from the final native sparse TSDF volume. The binary PLY vertex schema is `x y z nx ny nz red green blue normals_red normals_green normals_blue`.
 
 The `red/green/blue` properties store the fused RGB color. The `normals_red/normals_green/normals_blue` properties store the normal vector mapped from `[-1,1]` to `[0,255]`, so `quick-tools ply-viewer` can visualize normals as a selectable RGB color set while preserving the actual metric normal vector in `nx/ny/nz`.
 
@@ -718,7 +714,6 @@ Important output knobs in `configs/default.yaml`:
 
 | Config | Meaning |
 | --- | --- |
-| `pipeline.output.pcd_max_points` | Maximum sampled TSDF point-cloud points. |
 | `pipeline.output.pcd_tsdf_voxel_edge_m` | TSDF voxel edge length in meters. |
 | `pipeline.output.pcd_tsdf_sdf_trunc_m` | Signed-distance truncation band in meters. |
 | `pipeline.output.pcd_tsdf_depth_trunc_m` | Ignore depth samples beyond this many meters. |
@@ -729,7 +724,7 @@ Important output knobs in `configs/default.yaml`:
 
 When `run.py` receives `--instance-config`, Stage 5 first completes the normal pose and TSDF artifacts. The pipeline then converts no additional SLAM state: it releases the finished graph/output and CUDA cache, retains only the CPU camera-to-world poses and shared intrinsics, and synchronously runs instance and semantic-feature distillation before `VipePipeline.run()` returns.
 
-Stage 6 receives the compact native TSDF point/normal pairs selected during Stage 5 and chooses motion-spaced views. Stage 7 builds normal-aware surface atoms. Stage 8 generates and propagates SAM masks, projects the compact surface into each retained frame, directly accumulates sparse atom-mask and atom-frame count tables plus fixed-size adjacency affinity statistics, and discards each normalized frame signature. Stages 9-11 build the hierarchy, form evidence candidates, and select the final overlapping `K=5` hypotheses. Stage 12 reuses the selected views to fuse dense open-vocabulary image features onto the TSDF surface and stores one descriptor per finalized hypothesis. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels, class names, and dataset-specific exclusions are benchmark-only and never enter these runtime stages.
+Stage 6 receives the same compact native TSDF point/normal pairs written by Stage 5 and chooses motion-spaced views. Stage 7 builds normal-aware surface atoms. Stage 8 generates and propagates SAM masks, projects the compact surface into each retained frame, directly accumulates sparse atom-mask and atom-frame count tables plus fixed-size adjacency affinity statistics, and discards each normalized frame signature. Stages 9-11 build the hierarchy, form evidence candidates, and select the final overlapping `K=5` hypotheses. Stage 12 reuses the selected views to fuse dense open-vocabulary image features onto the TSDF surface and stores one descriptor per finalized hypothesis. Their full computation and artifacts are specified in [`ALGORITHM.md`](ALGORITHM.md). Ground-truth labels, class names, and dataset-specific exclusions are benchmark-only and never enter these runtime stages.
 
 ## ScanNet Benchmark Adapter
 

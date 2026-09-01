@@ -40,18 +40,15 @@ The final geometric output is a hypothesis soup with at most `K=5` hypotheses co
 
 ## Stage 6: TSDF Surface And Frame Coreset
 
-Stage 5 extracts the fused TSDF zero surface once. The native extension writes the full RGB+normal PLY in bounded chunks while simultaneously retaining the compact surface domain needed by Stage 6. Python receives only those retained point/normal pairs, not the dense output sample tensors. There is no PLY reread and no second all-frame backprojection.
-
-The saved PLY contains a dense deterministic area sample. Running association over all ten million output samples would make point count depend on an output-density knob rather than TSDF resolution. During that same native extraction stream, Stage 5 retains one original TSDF sample per native TSDF-sized cell for Stage 6. For TSDF voxel edge `s`, sample `p_i`, and cell index `c_i`:
+Stage 5 extracts the fused TSDF zero surface once. For each native TSDF cell whose eight observed corners straddle zero, marching tetrahedra constructs the local zero-crossing triangles. If `q_c` is the center of cell `c` and `S_c` is the union of those triangles, the extension retains
 
 ```math
-c_i = \left\lfloor p_i/s \right\rfloor,
-\qquad
-i_c = \underset{i:\,c_i=c}{\arg\min}\;
-\left\|p_i-(c+\tfrac{1}{2})s\right\|_2^2.
+p_c = \underset{p\in S_c}{\arg\min}\;\lVert p-q_c\rVert_2^2.
 ```
 
-Equal-distance ties select the lower original extraction index. The retained point is an actual zero-surface sample, not a cell centroid. Cell keys are sorted deterministically, so every hypothesis index has a stable surface-point meaning. The cell edge comes from `pipeline.output.pcd_tsdf_voxel_edge_m`; it is not duplicated in the instance config.
+The retained point is the closest actual point on the interpolated surface, not the cell center. Its RGB and normal are barycentrically interpolated from the same triangle. Cells are visited in deterministic block and voxel order. The cell edge is exactly `pipeline.output.pcd_tsdf_voxel_edge_m`; it is not duplicated in the instance config.
+
+These points form the only extracted surface cloud. The extension writes them directly as the RGB+normal `*_tsdf.ply` and returns the same point/normal tensors to Stage 6. There is no dense point cloud, fixed point budget, PLY reread, spatial downsampling pass, or second all-frame backprojection. Cloud size therefore scales with the number of reconstructed sign-changing TSDF cells.
 
 The frame coreset walks final poses in sequence order. Frame `f` is retained when, relative to the last retained frame, either:
 
@@ -453,4 +450,4 @@ Evaluation writes `pcd/<scene>_instances_gt.ply`, which colors the predicted TSD
 
 Ordering is part of the algorithm: frames and chunks are ascending, SAM top-k sorting is stable, track IDs are monotonic, union-find keeps the minimum representative, Stage-12 frames are sorted, and projection uses explicit elementwise arithmetic. Semantic PCA uses a fixed RNG seed. TF32 remains disabled and deterministic ViPE settings remain active.
 
-Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction streams the dense PLY in bounded chunks and returns only the compact Stage-6 surface domain. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Stage 12 loads FG-CLIP after association state is released, processes one selected frame at a time, pools `A` into `B`, and then releases the accumulator and GPU cache. Artifact writing retains only the TSDF surface, packed hypotheses, and `B`; each `C` consumer builds and releases its own compact overlap index.
+Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction emits only the compact Stage-6 surface domain and writes that same domain to PLY. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Stage 12 loads FG-CLIP after association state is released, processes one selected frame at a time, pools `A` into `B`, and then releases the accumulator and GPU cache. Artifact writing retains only the TSDF surface, packed hypotheses, and `B`; each `C` consumer builds and releases its own compact overlap index.

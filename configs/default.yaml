@@ -34,7 +34,6 @@ pipeline:
     dense_disp_alpha: 0.001              # Weight for external sensor-depth regularization in BA.
 
   output:
-    pcd_max_points: 10000000             # Max saved TSDF PCD points.
     pcd_tsdf_voxel_edge_m: 0.02          # TSDF voxel edge length in meters.
     pcd_tsdf_sdf_trunc_m: 0.15           # TSDF signed-distance truncation distance in meters.
     pcd_tsdf_depth_trunc_m: 5.0          # Ignore TSDF depth samples beyond this distance in meters.

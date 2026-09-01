@@ -52,6 +52,18 @@ class TSDFFrame:
     intrinsics: np.ndarray
 
 
+def ply_vertex_count(path: Path) -> int:
+    with path.open("rb") as handle:
+        if handle.readline() != b"ply\n":
+            raise ValueError(f"Not a PLY file: {path}")
+        for line in handle:
+            if line.startswith(b"element vertex "):
+                return int(line.split()[2])
+            if line == b"end_header\n":
+                break
+    raise ValueError(f"PLY has no vertex count: {path}")
+
+
 def _prefetch_frames(
     load_frame: Callable[[int], TSDFFrame],
     n_frames: int,
@@ -109,28 +121,20 @@ def _integrate_tsdf_frame(
 def _write_tsdf_pcd(
     out_path: ArtifactPath,
     volume,
-    max_points: int,
-    select_representatives: bool,
-) -> tuple[torch.Tensor, torch.Tensor, int] | None:
-    return volume.write_point_cloud(
-        out_path.tsdf_pcd_path,
-        max_points,
-        select_representatives=select_representatives,
-    )
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return volume.write_point_cloud(out_path.tsdf_pcd_path)
 
 
 def save_artifacts(
     out_path: ArtifactPath,
     pose_matrices: np.ndarray,
     load_frame: Callable[[int], TSDFFrame],
-    max_pcd_points: int,
     pcd_tsdf_voxel_edge_m: float,
     pcd_tsdf_sdf_trunc_m: float,
     pcd_tsdf_depth_trunc_m: float,
     pcd_tsdf_num_voxels_per_block_edge: int,
     pcd_tsdf_depth_sampling_stride: int,
-    retain_tsdf_surface: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Save artifacts in a single streaming pass to avoid retaining the full sequence in RAM.
     """
@@ -161,9 +165,4 @@ def save_artifacts(
         out_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
         np.savez(out_path.pose_path, data=pose_matrices, inds=np.arange(n_frames, dtype=np.int64))
 
-    return _write_tsdf_pcd(
-        out_path,
-        tsdf_volume,
-        max_pcd_points,
-        select_representatives=retain_tsdf_surface,
-    )
+    return _write_tsdf_pcd(out_path, tsdf_volume)

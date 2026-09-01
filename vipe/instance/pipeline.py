@@ -192,7 +192,6 @@ class InstancePipeline:
         points: np.ndarray,
         normals: np.ndarray,
         tsdf_voxel_edge_m: float,
-        source_surface_points: int,
     ) -> dict:
         """Distill overlapping 3D instances and return the persisted scene summary."""
         started = time.perf_counter()
@@ -207,11 +206,7 @@ class InstancePipeline:
         normals = np.ascontiguousarray(normals, dtype=np.float32)
         if points.shape != normals.shape or points.ndim != 2 or points.shape[1] != 3:
             raise ValueError("Reduced TSDF points and normals must have matching (N, 3) shapes")
-        logger.info(
-            "Stage 6: using %d native TSDF surface representatives from %d output samples",
-            len(points),
-            source_surface_points,
-        )
+        logger.info("Stage 6: using %d native TSDF surface points", len(points))
         frames_config = self.config["frames"]
         frame_indices = frame_coreset_poses(
             list(range(len(poses))),
@@ -339,7 +334,6 @@ class InstancePipeline:
             "config": _plain(self.config),
             "frames": {"total": len(poses), "selected": len(frame_indices)},
             "counts": {
-                "tsdf_output_points": source_surface_points,
                 "points": len(points),
                 "lifted_frames": lifted_frames,
                 "lifted_masks": lifted_masks,

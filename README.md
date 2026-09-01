@@ -90,7 +90,6 @@ FG-CLIP produces 768-dimensional descriptors from its native `336 x 336` input (
 
 Useful output knobs in `configs/default.yaml`:
 
-- `pipeline.output.pcd_max_points=10000000`: deterministic area-sample count for the saved TSDF point cloud.
 - `pipeline.output.pcd_tsdf_depth_trunc_m=5.0`: ignore sensor depth beyond 5 meters.
 - `pipeline.output.pcd_tsdf_num_voxels_per_block_edge=8`: TSDF voxel block edge size.
 - `pipeline.output.pcd_tsdf_depth_sampling_stride=8`: sample every eighth depth pixel when opening TSDF voxel blocks.
@@ -100,7 +99,7 @@ TSDF fusion uses the provided sensor depth directly and bilinearly samples RGB a
 Saved artifacts:
 
 - `pose/<scene>.npz`: camera-to-world pose per canonical frame.
-- `pcd/<scene>_tsdf.ply`: native TSDF-fused sampled point cloud with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
+- `pcd/<scene>_tsdf.ply`: one native zero-surface point per occupied TSDF surface cell, with true RGB, `nx/ny/nz` normals, and `normals_red/green/blue` normal colors for `quick-tools ply-viewer`.
 
 Instance-enabled runs additionally save:
 

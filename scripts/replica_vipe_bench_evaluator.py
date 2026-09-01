@@ -20,6 +20,7 @@ from vipe.bench.replica import ReplicaEvaluator
 from vipe.utils.config import load_yaml_config
 from vipe.utils.data_format import scene_frame_count
 from vipe.utils.determinism import seed_everything
+from vipe.utils.io import ply_vertex_count
 
 
 WORKER_ENV = "_VIPE_REPLICA_BENCH_WORKER"
@@ -108,7 +109,7 @@ def _write_vipe_manifest(
         "pose_path": str(pose_path.resolve()),
         "tsdf_pcd_path": str(tsdf_pcd_path.resolve()),
         "output": {
-            "pcd_max_points": int(pipeline_cfg.pipeline.output.pcd_max_points),
+            "pcd_point_count": ply_vertex_count(tsdf_pcd_path),
             "pcd_tsdf_voxel_edge_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_voxel_edge_m),
             "pcd_tsdf_sdf_trunc_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_sdf_trunc_m),
             "pcd_tsdf_depth_trunc_m": float(pipeline_cfg.pipeline.output.pcd_tsdf_depth_trunc_m),

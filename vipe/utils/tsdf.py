@@ -44,18 +44,9 @@ class TSDFVolume:
     def write_point_cloud(
         self,
         path: Path,
-        max_points: int,
-        select_representatives: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         path.parent.mkdir(exist_ok=True, parents=True)
-        points, normals, source_count = self.volume.write_point_cloud(
-            str(path),
-            int(max_points),
-            bool(select_representatives),
-        )
-        if source_count == 0 or not select_representatives:
-            return None
-        return points, normals, int(source_count)
+        return self.volume.write_point_cloud(str(path))
 
 
 def _cpu_tensor(value: np.ndarray | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
