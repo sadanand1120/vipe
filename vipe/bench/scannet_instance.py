@@ -129,7 +129,6 @@ def evaluate_scene(
     raw_root: str | Path,
     vipe_output_dir: str | Path,
     cache_dir: str | Path,
-    feature_config,
     text_encoder,
     config,
 ) -> dict[str, object]:
@@ -158,7 +157,6 @@ def evaluate_scene(
         excluded_ids=(),
         object_to_class=object_to_class,
         class_names=class_names,
-        feature_config=feature_config,
         text_encoder=text_encoder,
         config=config,
     )

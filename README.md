@@ -86,7 +86,7 @@ features:
   revision: 5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f
 ```
 
-FG-CLIP produces 768-dimensional descriptors from a `14G x 14G` input and projects only depth-consistent TSDF points from the motion-selected frame coreset. See [`ALGORITHM.md`](ALGORITHM.md) for the exact visibility, weighting, fusion, and overlap equations.
+FG-CLIP produces 768-dimensional descriptors from its native `336 x 336` input (`24 x 24` patch grid) and projects only depth-consistent TSDF points from the motion-selected frame coreset. See [`ALGORITHM.md`](ALGORITHM.md) for the exact visibility, weighting, fusion, and overlap equations.
 
 Useful output knobs in `configs/default.yaml`:
 

@@ -18,6 +18,7 @@ def test_distillation_interface_uses_selected_config_and_ascending_frames(monkey
     seen = []
 
     class Backbone:
+        grid = 24
         dimension = 2
 
         @staticmethod
@@ -25,7 +26,6 @@ def test_distillation_interface_uses_selected_config_and_ascending_frames(monkey
             return torch.tensor([[[1.0, 0.0]]])
 
     features = {
-        "grid": 1,
         "weight_a": 1.0,
         "weight_b": 1.0,
         "occlusion_tolerance_m": 0.05,
@@ -57,7 +57,7 @@ def test_distillation_interface_uses_selected_config_and_ascending_frames(monkey
     assert seen == [0, 1]
     np.testing.assert_array_equal(descriptors, [[1.0, 0.0]])
     assert metrics == {
-        "grid": 1,
+        "grid": 24,
         "descriptor_dimension": 2,
         "selected_frames": 2,
         "valid_descriptor_count": 1,

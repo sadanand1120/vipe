@@ -46,7 +46,6 @@ pipeline:
       endorsement_floor: 0.05
       hypothesis_price: 0.5
     features:
-      grid: 64                          # Frontier G x G dense feature grid per selected frame.
       weight_a: 1.0                     # View-incidence score exponent.
       weight_b: 1.0                     # Inverse-depth view-weight exponent.
       occlusion_tolerance_m: 0.05       # Maximum TSDF-point to sensor-depth disagreement.

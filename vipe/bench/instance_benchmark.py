@@ -266,9 +266,7 @@ def _timing_entry(frames: int, seconds: float, peak_vram_mb: float | None = None
     return entry
 
 
-def _evaluate(
-    spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene: str, eval_cfg, feature_config, text_encoder
-) -> dict:
+def _evaluate(spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene: str, eval_cfg, text_encoder) -> dict:
     cache_dir = args.work_dir / "model_results" / spec.dataset_key / scene / "instance" / "eval_cache"
     return spec.evaluate_scene(
         scene=scene,
@@ -276,7 +274,6 @@ def _evaluate(
         raw_root=args.raw_root,
         vipe_output_dir=_output_dir(args, scene),
         cache_dir=cache_dir,
-        feature_config=feature_config,
         text_encoder=text_encoder,
         config=eval_cfg,
     )
@@ -312,7 +309,6 @@ def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg,
 
         features = instance_cfg.pipeline.instance.features
         text_encoder = FGCLIPBackbone(
-            grid=int(features.grid),
             model_path=features.model_path,
             revision=features.revision,
             device="cuda",
@@ -322,7 +318,7 @@ def _run_worker(spec: InstanceBenchmarkSpec, args: argparse.Namespace, eval_cfg,
                 frames = scene_frame_count(_scene_dir(args, scene))
                 start = time.perf_counter()
                 payload["metrics"][scene] = _evaluate(
-                    spec, args, scene, eval_cfg, features, text_encoder
+                    spec, args, scene, eval_cfg, text_encoder
                 )
                 payload["metric_eval"][scene] = _timing_entry(frames, time.perf_counter() - start)
                 print(f"[INFO] Instance eval done | {scene} | {payload['metrics'][scene]}", flush=True)

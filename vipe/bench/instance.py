@@ -8,6 +8,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from vipe.instance.pipeline import write_instance_ply, write_labeled_instance_ply
+from vipe.instance.semantic import FGCLIP_GRID
 from vipe.utils.data_format import frame_stem, intrinsic_matrix, read_pinhole_intrinsics, scene_frame_count
 
 
@@ -279,17 +280,16 @@ def evaluate_prediction(
     excluded_ids: list[int] | tuple[int, ...],
     object_to_class: dict[int, int],
     class_names: dict[int, str],
-    feature_config,
     text_encoder,
     config,
 ) -> dict[str, object]:
     scene_dir = Path(scene_dir)
     vipe_output_dir = Path(vipe_output_dir)
     prediction = load_instance_prediction(vipe_output_dir / "instances" / f"{scene}.npz")
-    if prediction.feature_grid != int(feature_config.grid):
+    if prediction.feature_grid != FGCLIP_GRID:
         raise ValueError(
             f"{scene}: artifact feature grid {prediction.feature_grid} does not match "
-            f"configured grid {feature_config.grid}"
+            f"the native FG-CLIP grid {FGCLIP_GRID}"
         )
     with np.load(vipe_output_dir / "pose" / f"{scene}.npz") as pose_data:
         pred_c2w = pose_data["data"].astype(np.float64)

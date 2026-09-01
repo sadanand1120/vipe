@@ -38,7 +38,7 @@ def test_instance_artifact_loading_and_membership_budget(tmp_path: Path) -> None
         hypothesis_offsets=np.array([0, 2, 4], dtype=np.int64),
         K=np.array(2, dtype=np.int32),
         instance_features=np.array([[1, 0], [0, 1]], dtype=np.float16),
-        feature_grid=np.int32(64),
+        feature_grid=np.int32(24),
     )
 
     prediction = load_instance_prediction(path)
@@ -149,7 +149,7 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
         hypothesis_offsets=np.array([0, 2, 4]),
         K=np.array(1),
         instance_features=np.array([[1, 0], [0, 1]], dtype=np.float16),
-        feature_grid=np.int32(64),
+        feature_grid=np.int32(24),
     )
     monkeypatch.setattr(
         replica_instance,
@@ -181,7 +181,6 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
         raw_root=tmp_path / "raw",
         vipe_output_dir=output_dir,
         cache_dir=tmp_path / "cache",
-        feature_config=AttrDict(grid=64),
         text_encoder=TextEncoder(),
         config=config,
     )

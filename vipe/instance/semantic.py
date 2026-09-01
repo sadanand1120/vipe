@@ -12,6 +12,7 @@ from vipe.utils.logging import pbar
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 _FGCLIP_REVISION = "5a8f0f23b5a06dc92310e907599b2a0c2d58fe6f"
+FGCLIP_GRID = 24
 CANONICAL_NEGATIVES = ("object", "things", "stuff", "texture")
 
 
@@ -23,15 +24,21 @@ def _l2_numpy(values: np.ndarray) -> np.ndarray:
     return values / np.linalg.norm(values, axis=-1, keepdims=True).clip(1e-8)
 
 
-def _image_tensor(image, size: int, device: torch.device) -> torch.Tensor:
+def _image_tensor(
+    image,
+    size: int,
+    device: torch.device,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
     from PIL import Image
 
     pixels = torch.from_numpy(
         np.array(image.convert("RGB").resize((size, size), Image.Resampling.BICUBIC))
     ).float()
     pixels = pixels.permute(2, 0, 1) / 255.0
-    pixels = (pixels - torch.tensor(_CLIP_MEAN)[:, None, None]) / torch.tensor(_CLIP_STD)[:, None, None]
-    return pixels.unsqueeze(0).to(device)
+    pixels = pixels.unsqueeze(0).to(device)
+    return (pixels - mean) / std
 
 
 def _prompts(names: Sequence[str], template: str | None) -> list[str]:
@@ -50,12 +57,12 @@ class FGCLIPBackbone:
     """FG-CLIP dense features loaded from one explicitly pinned model revision."""
 
     patch_size = 14
+    grid = FGCLIP_GRID
     dimension = 768
 
     def __init__(
         self,
         *,
-        grid: int,
         model_path: str | Path,
         revision: str,
         device: str | torch.device = "cuda",
@@ -73,7 +80,6 @@ class FGCLIPBackbone:
             raise RuntimeError(f"FG-CLIP requires transformers<5, found {transformers.__version__}")
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self.grid = int(grid)
         self.device = torch.device(device)
         load_args = {
             "pretrained_model_name_or_path": str(model_path),
@@ -83,10 +89,13 @@ class FGCLIPBackbone:
         self.model = AutoModelForCausalLM.from_pretrained(**load_args).to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(**load_args)
         self.temperature = _learned_temperature(self.model)
+        self.mean = torch.tensor(_CLIP_MEAN, device=self.device)[None, :, None, None]
+        self.std = torch.tensor(_CLIP_STD, device=self.device)[None, :, None, None]
 
     @torch.no_grad()
     def dense_features(self, image) -> torch.Tensor:
-        pixels = _image_tensor(image, self.grid * self.patch_size, self.device)
+        size = self.grid * self.patch_size
+        pixels = _image_tensor(image, size, self.device, self.mean, self.std)
         dense = self.model.get_image_dense_features(pixels, interpolate_pos_encoding=True)
         dense = dense.reshape(self.grid, self.grid, -1).float()
         if dense.shape[-1] != self.dimension:
@@ -279,7 +288,7 @@ def distill_semantic_features(
     device: str | torch.device = "cuda",
 ) -> tuple[np.ndarray, dict]:
     """Return row-aligned float16 hypothesis descriptors and compact runtime metrics."""
-    required = ("grid", "weight_a", "weight_b", "occlusion_tolerance_m", "model_path", "revision")
+    required = ("weight_a", "weight_b", "occlusion_tolerance_m", "model_path", "revision")
     try:
         values = {key: features[key] for key in required}
     except KeyError as error:
@@ -293,7 +302,6 @@ def distill_semantic_features(
         raise ValueError("Selected semantic frame index is out of range")
 
     backbone = FGCLIPBackbone(
-        grid=int(values["grid"]),
         model_path=values["model_path"],
         revision=values["revision"],
         device=device,
@@ -326,7 +334,7 @@ def distill_semantic_features(
     hit_fraction = float(accumulator.hit.float().mean().item()) if len(points) else 0.0
     field = OverlapField(len(points), hypotheses, instance_features)
     metrics = {
-        "grid": int(values["grid"]),
+        "grid": backbone.grid,
         "descriptor_dimension": backbone.dimension,
         "selected_frames": len(selected_frames),
         "valid_descriptor_count": int(

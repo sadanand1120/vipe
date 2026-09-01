@@ -246,7 +246,7 @@ Accept only `loss <= 0`. Process larger ancestors first and repeat to a fixed po
 
 Stage 12 runs only after the hypothesis set is final. It reuses the Stage-6 frame coreset, resized RGB and nearest-neighbor depth, scaled intrinsics, retained TSDF points and normals, and final camera poses. It does not rerun mask generation, alter hypothesis membership, or classify hypotheses.
 
-Let `N` be the number of retained TSDF points, `M` the number of selected hypotheses, `G` the configured square feature grid, and `D=768` the FG-CLIP descriptor dimension. The runtime has three distinct semantic representations:
+Let `N` be the number of retained TSDF points, `M` the number of selected hypotheses, `G=24` the native square feature grid, and `D=768` the FG-CLIP descriptor dimension. The runtime has three distinct semantic representations:
 
 | Field | Shape and dtype | Meaning | Lifetime |
 | --- | --- | --- | --- |
@@ -263,7 +263,7 @@ F_f \in \mathbb{R}^{G\times G\times D},
 \qquad \lVert F_f[r,c]\rVert_2=1.
 ```
 
-The already aspect-preserving instance RGB is resized to FG-CLIP's `14G x 14G` square input and CLIP-normalized. Projection below maps the original resized-image coordinates to this square grid, so the feature lookup follows the same deterministic stretch.
+The already aspect-preserving instance RGB is resized to FG-CLIP's native `336 x 336` square input and CLIP-normalized. Projection below maps the original resized-image coordinates to its fixed `24 x 24` grid, so the feature lookup follows the same deterministic stretch.
 
 For point `X_i`, pose `T_{c2w,f}=[R_f,t_f]`, and scaled intrinsics `(f_x,f_y,c_x,c_y)`:
 
@@ -380,7 +380,7 @@ Thus every valid overlapping hypothesis contributes equally; there is no smalles
 
 ### Stage 12.5: FG-CLIP Configuration
 
-`model_path` and the pinned revision are loaded through Transformers with remote model code; Transformers major version 5 or newer is rejected. Dense and text features are 768-dimensional. Text prompts use a 77-token maximum and the model's short-position walk.
+`model_path` and the pinned revision are loaded through Transformers with remote model code; Transformers major version 5 or newer is rejected. FP32 dense features use FG-CLIP-Large's native `336 x 336` input and `24 x 24` patch grid. Dense and text features are 768-dimensional. Text prompts use a 77-token maximum and the model's short-position walk.
 
 For open-vocabulary confidence queries, `text_scores()` compares each unit descriptor against the query prompts and the canonical negatives `object`, `things`, `stuff`, and `texture`. It uses FG-CLIP's learned contrastive temperature. If `s_q` is one query similarity, `N` is the four-negative set, and `tau` is that temperature, the returned confidence is
 
