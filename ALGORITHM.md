@@ -72,7 +72,7 @@ Seed one surface point in each occupied 3 cm cell. Multi-source Dijkstra assigns
 
 ## Stage 8: Masks, Lift, And Global Track Linking
 
-Retained frames are processed in consecutive chunks of four. Mask generation and lifting are interleaved one chunk at a time.
+Retained frames are processed in consecutive chunks of eight. Mask generation and lifting are interleaved one chunk at a time.
 
 ### Stage 8.1: SAM1 AMG Seeds
 

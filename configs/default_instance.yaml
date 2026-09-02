@@ -7,7 +7,7 @@ pipeline:
       move_cm: 8.0                    # Keep a frame after this translation from the last kept frame.
       move_deg: 8.0                   # Or keep it after this optical-axis rotation.
     masks:
-      chunk_keyframes: 4              # Motion-selected frames per SAM2 propagation chunk.
+      chunk_keyframes: 8              # Motion-selected frames per SAM2 propagation chunk.
       seed_topk: 100                  # Maximum SAM1 masks seeded into one chunk.
       sam1:
         model_path: models/sam_vit_h_4b8939.pth
