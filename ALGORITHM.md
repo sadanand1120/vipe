@@ -247,8 +247,8 @@ Let `N` be the number of retained TSDF points, `M` the number of selected hypoth
 
 | Field | Shape and dtype | Meaning | Lifetime |
 | --- | --- | --- | --- |
-| `A` | `N x D`, float32 | Temporarily fused descriptor at each directly observed TSDF point. | Stage 12 only; represented by float32 weighted sums and materialized only as needed for pooling. |
-| `B` | `M x D`, float16 in the NPZ | One row-aligned unit descriptor per finalized hypothesis; an unobserved hypothesis has a zero row. | Persisted runtime output. |
+| `A` | `N x D`, float32 | Fused descriptor at each directly observed TSDF point. | Authoritative persisted semantic representation. |
+| `B` | `M x D`, float32 | One row-aligned unit descriptor per finalized hypothesis; an unobserved hypothesis has a zero row. | Derived from `A` and the packed hypotheses when needed; never persisted. |
 | `C` | requested rows or chunks of `N x D`, float32 | Unit mean of valid descriptors from every hypothesis covering a point. | Reconstructed on demand for visualization or GT-only evaluation; never persisted as a dense field. |
 
 ### Stage 12.1: Dense Image Features
@@ -328,9 +328,9 @@ S_i/q_i,&q_i>0,\\
 \end{cases}
 ```
 
-`A_i` is a weighted mean and is not assumed to have unit norm. Only one frame feature map is needed at a time. The feature maps, `S`, `q`, and any materialized `A` rows are released after hypothesis pooling.
+`A_i` is a weighted mean and is not assumed to have unit norm. Only one frame feature map is needed at a time. After the final frame, `S` is divided in place by `q`, unobserved rows remain zero, and the resulting float32 `A` is copied to CPU and persisted.
 
-### Stage 12.3: Stored Hypothesis Descriptors `B`
+### Stage 12.3: On-Demand Hypothesis Descriptors `B`
 
 For hypothesis `h`, let `H_h` be its TSDF point-index set and
 
@@ -353,11 +353,11 @@ B_h=\begin{cases}
 \end{cases}
 ```
 
-where `norm(x)=x/max(||x||_2,10^-8)`. Pooling visits hypothesis indices in bounded chunks. `B` is converted from float32 to float16 and stored as `instance_features`; row `h` corresponds exactly to packed hypothesis `h`. The number of nonzero rows is reported as `valid_descriptor_count`.
+where `norm(x)=x/max(||x||_2,10^-8)`. Pooling visits hypothesis indices in bounded chunks. Row `h` corresponds exactly to packed hypothesis `h`. Runtime derives `B` once for the `C` visualization and discards it; evaluation independently derives the same `B` from persisted `A`.
 
 ### Stage 12.4: On-Demand Overlap Field `C`
 
-No dense semantic point field is stored. When a consumer requests point `i`, let
+No dense hypothesis-averaged field `C` is stored. When a consumer requests point `i`, let
 
 ```math
 \mathcal H_i^+=\{h:i\in H_h\ \land\ \lVert B_h\rVert_2>0\}.
@@ -391,7 +391,6 @@ The default frontier is:
 
 ```yaml
 features:
-  grid: 64
   weight_a: 1.0
   weight_b: 1.0
   occlusion_tolerance_m: 0.05
@@ -406,17 +405,18 @@ Runtime writes descriptors but no GT labels, class names, or semantic prediction
 ```text
 pose/<scene>.npz                 final ViPE camera-to-world trajectory
 pcd/<scene>_tsdf.ply            native ViPE RGB+normal TSDF surface
-instances/<scene>.npz           TSDF points, packed hypotheses, and row-aligned descriptors
+instances/<scene>.npz           TSDF points, packed hypotheses, and dense point field A
 instances/<scene>_summary.json  resolved config, timings, and structural counts
 pcd/<scene>_instances.ply       smallest-hypothesis-wins visualization
-pcd/<scene>_semantic_pca.ply    PCA-colored on-demand overlap field
+pcd/<scene>_semantic_pca_A_dense.ply    PCA-colored persisted point field A
+pcd/<scene>_semantic_pca_C_hypavg.ply   PCA-colored on-demand overlap field C
 ```
 
-The NPZ is authoritative. For `L` total packed memberships it stores `points` (`N x 3`, float32), `hypothesis_indices` (`L`, int32), `hypothesis_offsets` (`M+1`, int64), scalar `K` (int32), scalar `domain="tsdf_surface"`, scalar `voxel_edge_m` (float32), `instance_features=B` (`M x 768`, float16), and scalar `feature_grid` (int32).
+The NPZ is authoritative. For `L` total packed memberships it stores `points` (`N x 3`, float32), `hypothesis_indices` (`L`, int32), `hypothesis_offsets` (`M+1`, int64), scalar `K` (int32), scalar `domain="tsdf_surface"`, scalar `voxel_edge_m` (float32), `point_features=A` (`N x 768`, float32), and scalar `feature_grid` (int32). Neither `B` nor `C` is persisted.
 
-The summary uses schema version 3. Its `features` block records grid, descriptor dimension, selected-frame count, nonzero descriptor count, direct point-hit fraction, and overlap-field coverage. `timings.semantic_features_s` measures FG-CLIP loading, fusion, and descriptor pooling; `timings.semantic_visualization_s` measures bounded overlap reconstruction and PCA PLY writing. The instance PLY is not used by the algorithm or metrics.
+The summary uses schema version 4. Its `features` block records grid, descriptor dimension, selected-frame count, nonzero point and hypothesis descriptor counts, direct point-hit fraction, and overlap-field coverage. `timings.semantic_features_s` measures FG-CLIP loading and fusion. Separate visualization timings cover PCA of `A` and derivation plus PCA of `C`. The instance and semantic PLYs are not used by the algorithm or metrics.
 
-The semantic PLY evaluates `C` in bounded chunks. It centers covered rows, fits three PCA axes by SVD on at most 100,000 covered points sampled with RNG seed 0, and maps the sampled 2nd and 98th projection percentiles to RGB. Uncovered points are gray. This is a deterministic descriptor visualization, not a class prediction, and is not an evaluator input.
+Each semantic PLY centers covered rows, fits three PCA axes by SVD on at most 100,000 covered points sampled with RNG seed 0, and maps the sampled 2nd and 98th projection percentiles to RGB. The `A_dense` PLY uses raw directly fused `A` rows. The `C_hypavg` PLY derives `B`, reconstructs `C` in bounded chunks, and colors hypothesis-covered rows. Uncovered points are gray. These are deterministic descriptor visualizations, not class predictions, and are not evaluator inputs.
 
 ## Instance Evaluation Boundary
 
@@ -434,7 +434,7 @@ Excluded labels remain represented on the prediction surface as background, so t
 
 For each GT instance `g`, evaluation computes the best point-set IoU over all hypotheses. Average Recall is the mean recall over IoU thresholds `0.50, 0.55, ..., 0.95`. R50, R75, R90, hypothesis count, and mean/max point membership are reported alongside AR.
 
-Semantic top-1 is a GT-only evaluator operation. Runtime does not select classes. After GT object IDs have been transferred to the predicted TSDF points, the evaluator maps them to dataset-provided class names. Replica uses valid class IDs and normalized names from `info_semantic.json`; ScanNet uses normalized aggregation labels. Only points that both have a mapped class and are covered by `C` are scored.
+Semantic top-1 is a GT-only evaluator operation. Runtime does not select classes. After GT object IDs have been transferred to the predicted TSDF points, the evaluator maps them to dataset-provided class names. Replica uses valid class IDs and normalized names from `info_semantic.json`; ScanNet uses normalized aggregation labels. Evaluation derives `B` and queried `C` rows from persisted `A` and the packed hypotheses. Only points that both have a mapped class and are covered by `C` are scored.
 
 For the set of mapped classes present on those valid points, the evaluator uses FG-CLIP to encode prompts `"a photo of a {class_name}"`. If `T_c` is the unit text descriptor for class `c`, the point prediction is
 
@@ -450,4 +450,4 @@ Evaluation writes `pcd/<scene>_instances_gt.ply`, which colors the predicted TSD
 
 Ordering is part of the algorithm: frames and chunks are ascending, SAM top-k sorting is stable, track IDs are monotonic, union-find keeps the minimum representative, Stage-12 frames are sorted, and projection uses explicit elementwise arithmetic. Semantic PCA uses a fixed RNG seed. TF32 remains disabled and deterministic ViPE settings remain active.
 
-Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction emits only the compact Stage-6 surface domain and writes that same domain to PLY. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Stage 12 loads FG-CLIP after association state is released, processes one selected frame at a time, pools `A` into `B`, and then releases the accumulator and GPU cache. Artifact writing retains only the TSDF surface, packed hypotheses, and `B`; each `C` consumer builds and releases its own compact overlap index.
+Stage 5 releases SLAM GPU state before SAM models are built. Native TSDF extraction emits only the compact Stage-6 surface domain and writes that same domain to PLY. Stage 8 retains one mask chunk at a time and converts each lifted mask directly into sparse atom counts. Mask tensors, SAM2 state, temporary JPEGs, exact track unions, sparse evidence, and hierarchy tables are released after their last consumer. Stage 12 loads FG-CLIP after association state is released, processes one selected frame at a time, converts its weighted sums into persisted `A`, and releases the accumulator and GPU cache. Artifact writing retains only the TSDF surface, packed hypotheses, and `A`; each `B`/`C` consumer derives and releases its own temporary descriptors and overlap index.

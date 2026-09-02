@@ -258,18 +258,11 @@ class ProjectiveFeatureAccumulator:
     def hit(self) -> torch.Tensor:
         return self.sum_w > 0
 
-    def pool_descriptors(
-        self,
-        hypotheses: Sequence[np.ndarray],
-        *,
-        chunk_size: int = 65536,
-    ) -> np.ndarray:
-        return pool_instance_descriptors(
-            self.sum_wf,
-            self.sum_w,
-            hypotheses,
-            chunk_size=chunk_size,
-        )
+    @torch.no_grad()
+    def point_features(self) -> np.ndarray:
+        """Materialize the fused per-point field A and release no semantic information."""
+        self.sum_wf.div_(self.sum_w.clamp_min(1e-8)[:, None])
+        return self.sum_wf.cpu().numpy()
 
 
 def distill_semantic_features(
@@ -277,7 +270,6 @@ def distill_semantic_features(
     features: Mapping,
     points: np.ndarray,
     normals: np.ndarray,
-    hypotheses: Sequence[np.ndarray],
     frame_indices: Sequence[int],
     rgb_of: Callable[[int], np.ndarray],
     depth_of: Callable[[int], np.ndarray],
@@ -287,7 +279,7 @@ def distill_semantic_features(
     height: int,
     device: str | torch.device = "cuda",
 ) -> tuple[np.ndarray, dict]:
-    """Return row-aligned float16 hypothesis descriptors and compact runtime metrics."""
+    """Return the float32 per-point semantic field A and compact runtime metrics."""
     required = ("weight_a", "weight_b", "occlusion_tolerance_m", "model_path", "revision")
     try:
         values = {key: features[key] for key in required}
@@ -330,59 +322,57 @@ def distill_semantic_features(
             depth_of(frame_index),
         )
 
-    instance_features = accumulator.pool_descriptors(hypotheses)
     hit_fraction = float(accumulator.hit.float().mean().item()) if len(points) else 0.0
-    field = OverlapField(len(points), hypotheses, instance_features)
+    point_features = accumulator.point_features()
     metrics = {
         "grid": backbone.grid,
         "descriptor_dimension": backbone.dimension,
         "selected_frames": len(selected_frames),
-        "valid_descriptor_count": int(
-            np.linalg.norm(instance_features, axis=1).astype(bool).sum()
-        ),
+        "valid_point_descriptor_count": int(np.count_nonzero(np.linalg.norm(point_features, axis=1))),
         "direct_point_hit_fraction": hit_fraction,
-        "instance_field_coverage": float(field.covered.mean()) if len(points) else 0.0,
     }
-    return instance_features, metrics
+    return point_features, metrics
 
 
 @torch.no_grad()
-def pool_instance_descriptors(
-    sum_wf: torch.Tensor,
-    sum_w: torch.Tensor,
+def pool_hypothesis_descriptors(
+    point_features: np.ndarray,
     hypotheses: Sequence[np.ndarray],
     *,
+    device: str | torch.device = "cpu",
     chunk_size: int = 65536,
 ) -> np.ndarray:
-    """Return one float16 unit descriptor per hypothesis, or a zero row when unobserved."""
-    if sum_wf.ndim != 2 or sum_w.shape != (sum_wf.shape[0],):
-        raise ValueError("Expected sum_wf (N, D) and sum_w (N,)")
+    """Derive one float32 unit descriptor B per hypothesis from the persisted field A."""
+    point_features = np.asarray(point_features, dtype=np.float32)
+    if point_features.ndim != 2 or point_features.shape[1] == 0:
+        raise ValueError("Expected point_features with shape (N, D)")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
 
+    features = torch.as_tensor(point_features, dtype=torch.float32, device=device)
+    observed = features.norm(dim=1) > 0
     descriptors = torch.zeros(
-        len(hypotheses), sum_wf.shape[1], dtype=torch.float32, device=sum_wf.device
+        len(hypotheses), features.shape[1], dtype=torch.float32, device=features.device
     )
-    point_count = sum_wf.shape[0]
+    point_count = features.shape[0]
     for hypothesis_id, hypothesis in enumerate(hypotheses):
         hypothesis = np.asarray(hypothesis, dtype=np.int64)
         if hypothesis.ndim != 1 or ((hypothesis < 0) | (hypothesis >= point_count)).any():
             raise ValueError(f"Hypothesis {hypothesis_id} contains invalid point indices")
-        feature_sum = torch.zeros(sum_wf.shape[1], dtype=torch.float32, device=sum_wf.device)
+        feature_sum = torch.zeros(features.shape[1], dtype=torch.float32, device=features.device)
         observed_count = 0
         for start in range(0, len(hypothesis), chunk_size):
             indices = torch.as_tensor(
-                hypothesis[start : start + chunk_size], dtype=torch.long, device=sum_wf.device
+                hypothesis[start : start + chunk_size], dtype=torch.long, device=features.device
             )
-            indices = indices[sum_w[indices] > 0]
+            indices = indices[observed[indices]]
             if not indices.numel():
                 continue
-            point_features = sum_wf[indices] / sum_w[indices, None]
-            feature_sum += _l2_torch(point_features).sum(0)
+            feature_sum += _l2_torch(features[indices]).sum(0)
             observed_count += indices.numel()
         if observed_count:
             descriptors[hypothesis_id] = _l2_torch(feature_sum / observed_count)
-    return descriptors.to(torch.float16).cpu().numpy()
+    return descriptors.cpu().numpy()
 
 
 class OverlapField:
@@ -460,38 +450,41 @@ class OverlapField:
             yield slice(start, stop), values, covered
 
 
-def write_semantic_pca_ply(
+def _write_semantic_pca_ply(
     path: str | Path,
     points: np.ndarray,
     normals: np.ndarray,
-    hypotheses: Sequence[np.ndarray],
-    descriptors: np.ndarray,
+    covered: np.ndarray,
+    dimension: int,
+    rows_of: Callable[[np.ndarray], np.ndarray],
+    chunks_of: Callable[[], Iterator[tuple[slice, np.ndarray, np.ndarray]]],
     *,
-    chunk_size: int = 65536,
     max_pca_samples: int = 100000,
 ) -> float:
-    """Write a deterministic PCA-colored overlap field and return its point coverage."""
+    """Write one deterministic PCA-colored point field."""
     points = np.asarray(points, dtype=np.float32)
     normals = np.asarray(normals, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3 or normals.shape != points.shape:
         raise ValueError("Points and normals must have matching (N, 3) shapes")
+    covered = np.asarray(covered, dtype=bool)
+    if covered.shape != (len(points),):
+        raise ValueError("Semantic coverage must have one value per point")
     if max_pca_samples <= 0:
         raise ValueError("max_pca_samples must be positive")
 
-    field = OverlapField(len(points), hypotheses, descriptors)
-    covered_indices = np.flatnonzero(field.covered)
+    covered_indices = np.flatnonzero(covered)
     covered_count = len(covered_indices)
-    mean = np.zeros(field.descriptors.shape[1], np.float64)
-    for _, values, covered in field.chunks(chunk_size):
-        mean += values[covered].sum(0, dtype=np.float64)
+    mean = np.zeros(dimension, np.float64)
+    for _, values, chunk_covered in chunks_of():
+        mean += values[chunk_covered].sum(0, dtype=np.float64)
     if covered_count:
         mean = (mean / covered_count).astype(np.float32)
         sample_indices = np.random.default_rng(0).choice(
             covered_indices, min(covered_count, max_pca_samples), replace=False
         )
-        sample = field.rows(sample_indices)
+        sample = rows_of(sample_indices)
         _, _, right = np.linalg.svd(sample - mean, full_matrices=False)
-        components = np.zeros((3, field.descriptors.shape[1]), np.float32)
+        components = np.zeros((3, dimension), np.float32)
         components[: min(3, len(right))] = right[:3]
         projected_sample = (sample - mean) @ components.T
         low = np.percentile(projected_sample, 2, axis=0)
@@ -524,16 +517,77 @@ def write_semantic_pca_ply(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as handle:
         handle.write(header)
-        for point_slice, values, covered in field.chunks(chunk_size):
+        for point_slice, values, chunk_covered in chunks_of():
             records = np.empty(point_slice.stop - point_slice.start, record_dtype)
             records["x"], records["y"], records["z"] = points[point_slice].T
             records["nx"], records["ny"], records["nz"] = normals[point_slice].T
             colors = np.full((len(records), 3), 128, np.uint8)
-            if covered.any():
-                projection = (values[covered] - mean) @ components.T
-                colors[covered] = (
+            if chunk_covered.any():
+                projection = (values[chunk_covered] - mean) @ components.T
+                colors[chunk_covered] = (
                     np.clip((projection - low) / (high - low + 1e-8), 0, 1) * 255
                 ).astype(np.uint8)
             records["red"], records["green"], records["blue"] = colors.T
             handle.write(records.tobytes())
     return covered_count / len(points) if len(points) else 0.0
+
+
+def write_point_semantic_pca_ply(
+    path: str | Path,
+    points: np.ndarray,
+    normals: np.ndarray,
+    point_features: np.ndarray,
+    *,
+    chunk_size: int = 65536,
+    max_pca_samples: int = 100000,
+) -> float:
+    """Write PCA colors for the directly fused per-point field A."""
+    point_features = np.asarray(point_features, dtype=np.float32)
+    if point_features.ndim != 2 or point_features.shape[0] != len(points):
+        raise ValueError("Point features must have shape (N, D)")
+    covered = np.linalg.norm(point_features, axis=1) > 0
+
+    def chunks():
+        for start in range(0, len(points), chunk_size):
+            stop = min(start + chunk_size, len(points))
+            point_slice = slice(start, stop)
+            yield point_slice, point_features[point_slice], covered[point_slice]
+
+    return _write_semantic_pca_ply(
+        path,
+        points,
+        normals,
+        covered,
+        point_features.shape[1],
+        lambda indices: point_features[indices],
+        chunks,
+        max_pca_samples=max_pca_samples,
+    )
+
+
+def write_hypothesis_average_semantic_pca_ply(
+    path: str | Path,
+    points: np.ndarray,
+    normals: np.ndarray,
+    point_features: np.ndarray,
+    hypotheses: Sequence[np.ndarray],
+    *,
+    device: str | torch.device = "cpu",
+    chunk_size: int = 65536,
+    max_pca_samples: int = 100000,
+) -> tuple[float, int]:
+    """Derive B and write PCA colors for the hypothesis-averaged point field C."""
+    descriptors = pool_hypothesis_descriptors(point_features, hypotheses, device=device)
+    field = OverlapField(len(points), hypotheses, descriptors)
+    coverage = _write_semantic_pca_ply(
+        path,
+        points,
+        normals,
+        field.covered,
+        descriptors.shape[1],
+        field.rows,
+        lambda: field.chunks(chunk_size),
+        max_pca_samples=max_pca_samples,
+    )
+    valid_count = int(np.count_nonzero(np.linalg.norm(descriptors, axis=1)))
+    return coverage, valid_count

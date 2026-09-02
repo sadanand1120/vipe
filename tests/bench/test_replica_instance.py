@@ -37,7 +37,7 @@ def test_instance_artifact_loading_and_membership_budget(tmp_path: Path) -> None
         hypothesis_indices=np.array([0, 1, 1, 2], dtype=np.int32),
         hypothesis_offsets=np.array([0, 2, 4], dtype=np.int64),
         K=np.array(2, dtype=np.int32),
-        instance_features=np.array([[1, 0], [0, 1]], dtype=np.float16),
+        point_features=np.array([[1, 0], [1, 0], [0, 1], [0, 0]], dtype=np.float32),
         feature_grid=np.int32(24),
     )
 
@@ -148,7 +148,7 @@ def test_evaluate_scene_aligns_cloud_then_transfers_gt_labels(tmp_path: Path, mo
         hypothesis_indices=np.arange(4, dtype=np.int32),
         hypothesis_offsets=np.array([0, 2, 4]),
         K=np.array(1),
-        instance_features=np.array([[1, 0], [0, 1]], dtype=np.float16),
+        point_features=np.array([[1, 0], [1, 0], [0, 1], [0, 1]], dtype=np.float32),
         feature_grid=np.int32(24),
     )
     monkeypatch.setattr(

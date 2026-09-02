@@ -82,7 +82,8 @@ def _instance_paths(output_dir: Path, scene: str) -> tuple[Path, ...]:
         output_dir / "instances" / f"{scene}.npz",
         output_dir / "instances" / f"{scene}_summary.json",
         output_dir / "pcd" / f"{scene}_instances.ply",
-        output_dir / "pcd" / f"{scene}_semantic_pca.ply",
+        output_dir / "pcd" / f"{scene}_semantic_pca_A_dense.ply",
+        output_dir / "pcd" / f"{scene}_semantic_pca_C_hypavg.ply",
     )
 
 
@@ -127,7 +128,15 @@ def _write_manifest(spec: InstanceBenchmarkSpec, args: argparse.Namespace, scene
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing ViPE instance artifacts:\n" + "\n".join(missing))
-    names = ("pose", "tsdf", "instances", "instance_summary", "instance_ply", "semantic_ply")
+    names = (
+        "pose",
+        "tsdf",
+        "instances",
+        "instance_summary",
+        "instance_ply",
+        "semantic_A_dense_ply",
+        "semantic_C_hypavg_ply",
+    )
     _write_json(
         _manifest_path(spec, args, scene),
         {
