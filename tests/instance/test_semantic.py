@@ -102,7 +102,7 @@ def test_frontier_text_scores_use_learned_temperature_and_canonical_negatives() 
                 [[1.0, 0.0], [0.8, 0.6], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0], [0.6, 0.8]]
             )
 
-    features = np.array([[1.0, 0.0]], np.float32)
+    features = np.array([[3.0, 0.0]], np.float32)
     scores = text_scores(Backbone(), features, ["chair", "table"])
     similarities = np.array([[1.0, 0.8, 0.0, -1.0, 0.0, 0.6]], np.float32)
     exponentials = np.exp((similarities - similarities.max()) / 0.5)
@@ -126,15 +126,14 @@ def test_descriptor_pooling_and_overlap_field_match_frontier() -> None:
     descriptors = pool_hypothesis_descriptors(point_features, hypotheses, chunk_size=1)
 
     assert descriptors.dtype == np.float32
-    np.testing.assert_allclose(descriptors[0], np.sqrt(0.5), atol=5e-4)
+    np.testing.assert_array_equal(descriptors[0], [0.5, 1.5])
     np.testing.assert_array_equal(descriptors[1], 0.0)
-    np.testing.assert_array_equal(descriptors[2], [0.0, 1.0])
+    np.testing.assert_array_equal(descriptors[2], [0.0, 3.0])
     field = OverlapField(4, hypotheses, descriptors)
     np.testing.assert_array_equal(field.covered, [True, True, True, False])
     np.testing.assert_allclose(
         field.rows(np.arange(4)),
-        [[np.sqrt(0.5), np.sqrt(0.5)], [0.382683, 0.92388], [np.sqrt(0.5), np.sqrt(0.5)], [0, 0]],
-        atol=5e-4,
+        [[0.5, 1.5], [0.25, 2.25], [0.5, 1.5], [0, 0]],
     )
 
 

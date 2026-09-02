@@ -16,10 +16,6 @@ FGCLIP_GRID = 24
 CANONICAL_NEGATIVES = ("object", "things", "stuff", "texture")
 
 
-def _l2_torch(values: torch.Tensor) -> torch.Tensor:
-    return values / values.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-
-
 def _l2_numpy(values: np.ndarray) -> np.ndarray:
     return values / np.linalg.norm(values, axis=-1, keepdims=True).clip(1e-8)
 
@@ -100,7 +96,7 @@ class FGCLIPBackbone:
         dense = dense.reshape(self.grid, self.grid, -1).float()
         if dense.shape[-1] != self.dimension:
             raise RuntimeError(f"FG-CLIP returned D={dense.shape[-1]}, expected {self.dimension}")
-        return _l2_torch(dense)
+        return dense
 
     @torch.no_grad()
     def encode_text(self, names: Sequence[str], template: str | None = None) -> torch.Tensor:
@@ -114,7 +110,7 @@ class FGCLIPBackbone:
         features = self.model.get_text_features(tokens, walk_short_pos=True).float()
         if features.shape[-1] != self.dimension:
             raise RuntimeError(f"FG-CLIP returned text D={features.shape[-1]}, expected {self.dimension}")
-        return _l2_torch(features)
+        return features
 
 
 def text_scores(
@@ -128,14 +124,14 @@ def text_scores(
 ) -> np.ndarray:
     """Return each query's softmax probability against the canonical negatives."""
     query_count = len(prompts)
-    text = (
+    text = _l2_numpy(
         backbone.encode_text([*prompts, *negatives], template)
         .detach()
         .cpu()
         .numpy()
         .astype(np.float32)
     )
-    similarities = np.asarray(features, dtype=np.float32) @ text.T
+    similarities = _l2_numpy(np.asarray(features, dtype=np.float32)) @ text.T
     scaled = (similarities - similarities.max(axis=1, keepdims=True)) / float(
         backbone.temperature if temperature is None else temperature
     )
@@ -342,7 +338,7 @@ def pool_hypothesis_descriptors(
     device: str | torch.device = "cpu",
     chunk_size: int = 65536,
 ) -> np.ndarray:
-    """Derive one float32 unit descriptor B per hypothesis from the persisted field A."""
+    """Derive one float32 arithmetic-mean descriptor B per hypothesis from field A."""
     point_features = np.asarray(point_features, dtype=np.float32)
     if point_features.ndim != 2 or point_features.shape[1] == 0:
         raise ValueError("Expected point_features with shape (N, D)")
@@ -368,15 +364,15 @@ def pool_hypothesis_descriptors(
             indices = indices[observed[indices]]
             if not indices.numel():
                 continue
-            feature_sum += _l2_torch(features[indices]).sum(0)
+            feature_sum += features[indices].sum(0)
             observed_count += indices.numel()
         if observed_count:
-            descriptors[hypothesis_id] = _l2_torch(feature_sum / observed_count)
+            descriptors[hypothesis_id] = feature_sum / observed_count
     return descriptors.cpu().numpy()
 
 
 class OverlapField:
-    """Bounded reconstruction of the normalized mean descriptor at each covered point."""
+    """Bounded reconstruction of the arithmetic-mean descriptor at each covered point."""
 
     def __init__(
         self,
@@ -434,7 +430,6 @@ class OverlapField:
         np.add.at(result, rows, self.descriptors[descriptor_ids])
         observed = counts > 0
         result[observed] /= counts[observed, None]
-        result[observed] = _l2_numpy(result[observed])
         return result
 
     def chunks(self, chunk_size: int = 65536) -> Iterator[tuple[slice, np.ndarray, np.ndarray]]:

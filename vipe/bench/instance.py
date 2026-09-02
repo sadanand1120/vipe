@@ -124,6 +124,7 @@ def semantic_top1(
         )
 
     field_features = field.rows(np.flatnonzero(valid))
+    field_features = _normalized_rows(field_features)
     text_features = _normalized_rows(text_features)
     predicted = np.asarray(class_ids, dtype=np.int64)[np.argmax(field_features @ text_features.T, axis=1)]
     return float(np.mean(predicted == semantic_labels[valid])), int(valid.sum()), coverage

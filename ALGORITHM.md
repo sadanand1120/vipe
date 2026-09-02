@@ -2,7 +2,7 @@
 
 This document specifies the 3D instance and semantic-feature distillation pipeline that runs inside ViPE after the existing pose and reconstruction pipeline. ViPE Stages 1-5 are documented in [`fullexplain.md`](fullexplain.md). The distillation path starts only after Stage 5 has successfully written the final pose and TSDF artifacts.
 
-The runtime consumes the native TSDF surface, RGB, sensor depth, shared pinhole intrinsics, and final ViPE camera-to-world poses. It first constructs an overlapping, K-capped set of class-agnostic 3D hypotheses, then distills a vision-language descriptor onto each finalized hypothesis. Runtime never consumes GT labels, GT poses, class names, or a fixed class vocabulary.
+The runtime consumes the native TSDF surface, RGB, sensor depth, shared pinhole intrinsics, and final ViPE camera-to-world poses. It first constructs an overlapping, K-capped set of class-agnostic 3D hypotheses, then distills a dense vision-language descriptor field onto the TSDF surface. Runtime never consumes GT labels, GT poses, class names, or a fixed class vocabulary.
 
 ```mermaid
 flowchart LR
@@ -248,19 +248,18 @@ Let `N` be the number of retained TSDF points, `M` the number of selected hypoth
 | Field | Shape and dtype | Meaning | Lifetime |
 | --- | --- | --- | --- |
 | `A` | `N x D`, float32 | Fused descriptor at each directly observed TSDF point. | Authoritative persisted semantic representation. |
-| `B` | `M x D`, float32 | One row-aligned unit descriptor per finalized hypothesis; an unobserved hypothesis has a zero row. | Derived from `A` and the packed hypotheses when needed; never persisted. |
-| `C` | requested rows or chunks of `N x D`, float32 | Unit mean of valid descriptors from every hypothesis covering a point. | Reconstructed on demand for visualization or GT-only evaluation; never persisted as a dense field. |
+| `B` | `M x D`, float32 | Arithmetic mean of the observed `A` rows in each finalized hypothesis; an unobserved hypothesis has a zero row. | Derived from `A` and the packed hypotheses when needed; never persisted. |
+| `C` | requested rows or chunks of `N x D`, float32 | Arithmetic mean of valid `B` rows from every hypothesis covering a point. | Reconstructed on demand for visualization or GT-only evaluation; never persisted as a dense field. |
 
 ### Stage 12.1: Dense Image Features
 
-For each selected frame `f`, FG-CLIP emits a row-wise L2-normalized map
+For each selected frame `f`, FG-CLIP emits its raw dense feature map
 
 ```math
-F_f \in \mathbb{R}^{G\times G\times D},
-\qquad \lVert F_f[r,c]\rVert_2=1.
+F_f \in \mathbb{R}^{G\times G\times D}.
 ```
 
-The already aspect-preserving instance RGB is resized to FG-CLIP's native `336 x 336` square input and CLIP-normalized. Projection below maps the original resized-image coordinates to its fixed `24 x 24` grid, so the feature lookup follows the same deterministic stretch.
+The already aspect-preserving instance RGB is resized to FG-CLIP's native `336 x 336` square input and normalized by CLIP's pixel mean and standard deviation. Projection below maps the original resized-image coordinates to its fixed `24 x 24` grid, so the feature lookup follows the same deterministic stretch.
 
 For point `X_i`, pose `T_{c2w,f}=[R_f,t_f]`, and scaled intrinsics `(f_x,f_y,c_x,c_y)`:
 
@@ -338,22 +337,16 @@ For hypothesis `h`, let `H_h` be its TSDF point-index set and
 O_h=\{i\in H_h:q_i>0\}.
 ```
 
-Normalize each observed point descriptor before pooling:
-
-```math
-\hat A_i=A_i/\max(\lVert A_i\rVert_2,10^{-8}).
-```
-
-Then compute
+Compute the plain arithmetic mean without normalization:
 
 ```math
 B_h=\begin{cases}
-\operatorname{norm}\left(\dfrac{1}{|O_h|}\displaystyle\sum_{i\in O_h}\hat A_i\right),&|O_h|>0,\\
+\dfrac{1}{|O_h|}\displaystyle\sum_{i\in O_h}A_i,&|O_h|>0,\\
 0,&|O_h|=0,
 \end{cases}
 ```
 
-where `norm(x)=x/max(||x||_2,10^-8)`. Pooling visits hypothesis indices in bounded chunks. Row `h` corresponds exactly to packed hypothesis `h`. Runtime derives `B` once for the `C` visualization and discards it; evaluation independently derives the same `B` from persisted `A`.
+Pooling visits hypothesis indices in bounded chunks. Row `h` corresponds exactly to packed hypothesis `h`. Runtime derives `B` once for the `C` visualization and discards it; evaluation independently derives the same `B` from persisted `A`.
 
 ### Stage 12.4: On-Demand Overlap Field `C`
 
@@ -367,19 +360,18 @@ The overlap field is reconstructed as
 
 ```math
 C_i=\begin{cases}
-\operatorname{norm}\left(\dfrac{1}{|\mathcal H_i^+|}
-\displaystyle\sum_{h\in\mathcal H_i^+}B_h\right),&|\mathcal H_i^+|>0,\\
+\dfrac{1}{|\mathcal H_i^+|}\displaystyle\sum_{h\in\mathcal H_i^+}B_h,&|\mathcal H_i^+|>0,\\
 0,&|\mathcal H_i^+|=0.
 \end{cases}
 ```
 
-Thus every valid overlapping hypothesis contributes equally; there is no smallest-owner rule and no size or confidence weight. A compact point-to-valid-hypothesis membership index has `N+1` int64 offsets and one int32 member ID per valid membership. Consumers reconstruct only requested rows or bounded chunks. `instance_field_coverage` is the fraction of the `N` points for which `H_i^+` is nonempty; it differs from `direct_point_hit_fraction`, because a valid hypothesis descriptor propagates to all points in that hypothesis.
+There is no smallest-owner rule or additional size/confidence weight. A compact point-to-valid-hypothesis membership index has `N+1` int64 offsets and one int32 member ID per valid membership. Consumers reconstruct only requested rows or bounded chunks. `instance_field_coverage` is the fraction of the `N` points for which `H_i^+` is nonempty; it differs from `direct_point_hit_fraction`, because a valid hypothesis descriptor propagates to all points in that hypothesis.
 
 ### Stage 12.5: FG-CLIP Configuration
 
 `model_path` and the pinned revision are loaded through Transformers with remote model code; Transformers major version 5 or newer is rejected. FP32 dense features use FG-CLIP-Large's native `336 x 336` input and `24 x 24` patch grid. Dense and text features are 768-dimensional. Text prompts use a 77-token maximum and the model's short-position walk.
 
-For open-vocabulary confidence queries, `text_scores()` compares each unit descriptor against the query prompts and the canonical negatives `object`, `things`, `stuff`, and `texture`. It uses FG-CLIP's learned contrastive temperature. If `s_q` is one query similarity, `N` is the four-negative set, and `tau` is that temperature, the returned confidence is
+Image and text descriptors remain unnormalized through fusion and pooling. Immediately before text matching, the query descriptor and every text descriptor are independently L2-normalized, so their dot products are cosine similarities. For open-vocabulary confidence queries, `text_scores()` compares against the query prompts and the canonical negatives `object`, `things`, `stuff`, and `texture`. It uses FG-CLIP's learned contrastive temperature. If `s_q` is one cosine similarity, `N` is the four-negative set, and `tau` is that temperature, the returned confidence is
 
 ```math
 p(q)=\frac{\exp(s_q/\tau)}{\exp(s_q/\tau)+\sum_{n\in N}\exp(s_n/\tau)}.
@@ -436,10 +428,10 @@ For each GT instance `g`, evaluation computes the best point-set IoU over all hy
 
 Semantic top-1 is a GT-only evaluator operation. Runtime does not select classes. After GT object IDs have been transferred to the predicted TSDF points, the evaluator maps them to dataset-provided class names. Replica uses valid class IDs and normalized names from `info_semantic.json`; ScanNet uses normalized aggregation labels. Evaluation derives `B` and queried `C` rows from persisted `A` and the packed hypotheses. Only points that both have a mapped class and are covered by `C` are scored.
 
-For the set of mapped classes present on those valid points, the evaluator uses FG-CLIP to encode prompts `"a photo of a {class_name}"`. If `T_c` is the unit text descriptor for class `c`, the point prediction is
+For the set of mapped classes present on those valid points, the evaluator uses FG-CLIP to encode prompts `"a photo of a {class_name}"`. It unit-normalizes `C_i` and each raw text descriptor `T_c` immediately before matching:
 
 ```math
-\hat y_i=\underset{c}{\arg\max}\;C_i^T T_c.
+\hat y_i=\underset{c}{\arg\max}\;\operatorname{norm}(C_i)^T\operatorname{norm}(T_c).
 ```
 
 `semantic_top1` is point accuracy over the valid set, `semantic_evaluated_points` is that set's size, and `semantic_field_coverage` is the fraction of all predicted TSDF points covered by `C` before class filtering. A scene with no valid points reports no top-1 value. The aggregate top-1 is weighted by evaluated point count; aggregate field coverage is the unweighted mean over scenes. Evaluation also verifies that the artifact grid matches the active feature configuration.
