@@ -228,7 +228,7 @@ Weights below `0.05` are omitted as a compute guard. Clients are global tracks w
 
 Lazy greedy selection uses hypothesis size only as a tie-break and stops when marginal gain falls below the `0.5` hypothesis price. It also enforces at most one variant of a node and the per-atom K cap.
 
-Finally, if two or more selected hypotheses lie inside one tree ancestor, replace the group with that ancestor only when total evidence does not decrease and the K cap remains satisfied:
+Finally, if two or more selected hypotheses lie inside one tree ancestor, replace the group with that ancestor only when total evidence does not decrease and the K cap remains satisfied. Only ancestors containing multiple selected hypotheses are scored. Their evidence is accumulated once bottom-up from sparse child counts, and consumed raw summaries are released instead of gathering every ancestor from all descendant atoms:
 
 ```math
 \operatorname{loss}=\sum_g\left[

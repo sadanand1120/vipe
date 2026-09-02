@@ -39,6 +39,67 @@ def build_tables(T, log=print):
             }
 
 
+def _merge_sparse_counts(k1, v1, k2, v2):
+    """Add two sorted sparse count vectors without allocating a dense key space."""
+    if not len(k1):
+        return k2, np.asarray(v2, np.float64)
+    if not len(k2):
+        return k1, np.asarray(v1, np.float64)
+    keys = np.union1d(k1, k2)
+    values = np.zeros(len(keys), np.float64)
+    values[np.searchsorted(keys, k1)] = v1
+    values[np.searchsorted(keys, k2)] += v2
+    return keys, values
+
+
+def _tree_evidence(T, tables, targets):
+    """Yield exact evidence for target tree nodes using one bounded-memory post-order pass."""
+    targets = {int(node) for node in targets}
+    if not targets:
+        return
+
+    na = T["na"]
+    children = T["children"]
+    offI, gI, vI = tables["rI"]
+    offN, fN, vN = tables["rN"]
+
+    needed = np.zeros(T["n_nodes"], bool)
+    stack = list(targets)
+    while stack:
+        node = stack.pop()
+        if needed[node]:
+            continue
+        needed[node] = True
+        if node >= na:
+            stack.extend(children[node])
+
+    raw = {}
+    for node in T["order_nodes"]:
+        if not needed[node]:
+            continue
+        if node < na:
+            evidence = (
+                gI[offI[node]:offI[node + 1]],
+                np.asarray(vI[offI[node]:offI[node + 1]], np.float64),
+                fN[offN[node]:offN[node + 1]],
+                np.asarray(vN[offN[node]:offN[node + 1]], np.float64),
+            )
+        else:
+            left, right = children[node]
+            left_evidence = raw.pop(left)
+            right_evidence = raw.pop(right)
+            evidence = (
+                *_merge_sparse_counts(*left_evidence[:2], *right_evidence[:2]),
+                *_merge_sparse_counts(*left_evidence[2:], *right_evidence[2:]),
+            )
+        raw[node] = evidence
+        if node in targets:
+            yield node, evidence if len(evidence[0]) else None
+        parent = T["parent_of"].get(node)
+        if parent is None or not needed[parent]:
+            raw.pop(node)
+
+
 def frame_coreset_poses(frames, c2w_of, move_cm, move_deg, log=print):
     """Stage 6 frame coreset: walk the trajectory in order and keep a frame once
     the camera has moved > move_cm or turned > move_deg since the last KEPT one, which then becomes the
@@ -692,7 +753,7 @@ def evidence_link_candidates(V, pool, T, lk, sel, gm_gid, max_vox, mech_sink, me
     return out
 
 
-def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS, log=print):
+def compact_output(T, phi_by_node, phi_of_tree_nodes, vox_by_k, selected_by_k, KS, log=print):
     """Stage 11: zero-loss ancestor replacement, per budget K: the exchange move.
 
     Where >=2 surviving hypotheses sit inside one tree ancestor,
@@ -703,7 +764,7 @@ def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS
 
     This is the exchange move on stage 11's greedy cover: greedy can fragment an object across
     children when the parent alone would cover the same evidence. Also returns the per-hypothesis
-    `phi_by_node` carries per-mask evidence for selected candidates; `phi_of_tree_node` scores
+    `phi_by_node` carries per-mask evidence for selected candidates; `phi_of_tree_nodes` scores
     ancestors that the replacement pass needs and selection never evaluated."""
     from collections import defaultdict as _dd
     na = T["na"]; nn = T["n_nodes"]
@@ -729,8 +790,29 @@ def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS
             _cc[key] = nd
         return nd
 
-    vb2, sb2 = {}, {}
-    stats = {}
+    def _targets(S):
+        """Ancestors containing at least two current hypotheses; other swaps are impossible."""
+        anc = set()
+        for h in S:
+            p = int(par[h["id"]]) if h["id"] < nn else _contain(h["pl"], h["ph"])
+            while p >= 0:
+                anc.add(p)
+                p = int(par[p])
+        if not anc:
+            return set()
+        pl = np.fromiter((h["pl"] for h in S), np.int64, len(S))
+        ph = np.fromiter((h["ph"] for h in S), np.int64, len(S))
+        order = np.argsort(pl, kind="stable")
+        pls, phs = pl[order], ph[order]
+        targets = set()
+        for p in anc:
+            start = int(np.searchsorted(pls, node_lo[p]))
+            if np.count_nonzero(phs[start:] <= node_hi[p]) >= 2:
+                targets.add(p)
+        return targets
+
+    prepared = {}
+    all_targets = set()
     for k in KS:
         hyps = []
         for (nd, vox) in selected_by_k[k]:
@@ -739,6 +821,16 @@ def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS
             hyps.append({"id": nd, "A": A, "vox": vox, "phi": phi_by_node[nd],
                          "synth": nd >= nn, "pl": int(posmap[A].min()),
                          "ph": int(posmap[A].max())})
+        prepared[k] = hyps
+        all_targets.update(_targets(hyps))
+
+    ancestor_phi = {node: phi_by_node[node] for node in all_targets if node in phi_by_node}
+    ancestor_phi.update(phi_of_tree_nodes(all_targets - ancestor_phi.keys()))
+
+    vb2, sb2 = {}, {}
+    stats = {}
+    for k in KS:
+        hyps = prepared[k]
         S = list(hyps)                          # lam-priced selection already did the filtering
         # ---- zero-loss ancestor replacement (exchange move on the selected cover) ----
         cov = np.zeros(na, np.int32)
@@ -767,14 +859,8 @@ def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS
                     inv[g].append(h)
             b1v.clear(); b1o.clear(); b2v.clear(); b2o.clear()
             _top2(inv.keys(), inv)
-            anc = set()
-            for h in S:
-                p = int(par[h["id"]]) if h["id"] < nn else _contain(h["pl"], h["ph"])
-                while p >= 0:
-                    anc.add(p)
-                    p = int(par[p])
             changed = False; _dirty = True
-            _anc_sorted = sorted(anc, key=lambda x: -node_size[x])
+            _anc_sorted = sorted(_targets(S), key=lambda x: -node_size[x])
             _t_rep = time.time(); _t_log = _t_rep
             for _ai, p in enumerate(_anc_sorted):
                 if time.time() - _t_log > 60:                  # phi gathers make this the silent block
@@ -799,7 +885,7 @@ def compact_output(T, phi_by_node, phi_of_tree_node, vox_by_k, selected_by_k, KS
                     loc[posmap[h["A"]] - lo] += 1
                 if (cov[pA] - loc + 1 > k).any():             # the swap would breach the K cap
                     continue
-                php = phi_of_tree_node(p)
+                php = ancestor_phi[p]
                 dset = {id(h) for h in Dp}
                 affected = set(php)
                 for h in Dp:
@@ -914,10 +1000,9 @@ def cover_select(flat, T, tables, KS, vf, sel, gm_gid, members_of, log=print):
         if ev is None:
             return {}, np.empty(0, np.int64)
         gms, I2, frs, Nv = ev
-        Nf = np.zeros(nf); Nf[frs] = Nv
         thr = max(float(e_vox), e_frac * sz)
         elig = frs[Nv >= thr].astype(np.int64)
-        NfI = Nf[gm_frame[gms]]
+        NfI = Nv[np.searchsorted(frs, gm_frame[gms])]
         ok = NfI >= thr
         gms, NfI, I2 = gms[ok], NfI[ok], I2[ok]
         w = (I2 / NfI) ** alpha * (I2 / gm_vsz[gms]) ** beta
@@ -938,14 +1023,13 @@ def cover_select(flat, T, tables, KS, vf, sel, gm_gid, members_of, log=print):
 
     _pn_cache = {}
 
-    def phi_of_tree_node(nd):
-        """Per-mask phi for any tree node, not just candidates; the replacement pass
-        has to score ancestors that were never candidates. Same weighting, same tables, cached."""
-        v = _pn_cache.get(nd)
-        if v is None:
-            v = phi_from_evidence(evidence_of_node(nd), int(T["node_size"][nd]))[0]
-            _pn_cache[nd] = v
-        return v
+    def phi_of_tree_nodes(nodes):
+        """Score exchange ancestors from one bottom-up sparse evidence pass."""
+        nodes = [int(node) for node in nodes]
+        missing = [node for node in nodes if node not in _pn_cache]
+        for node, evidence in _tree_evidence(T, tb, missing):
+            _pn_cache[node] = phi_from_evidence(evidence, int(T["node_size"][node]))[0]
+        return {node: _pn_cache[node] for node in nodes}
 
     def evidence_of_union(members):
         """Evidence for a union, from its members' cached evidence. Members are mutually non-nested
@@ -1044,7 +1128,7 @@ def cover_select(flat, T, tables, KS, vf, sel, gm_gid, members_of, log=print):
         vox_by_k[K] = list(_vcache)
         selected_by_k[K] = [(sel_nd[j], _vcache[j]) for j in range(len(sel_ats))]
     phi_by_node = {flat[i][0]: phi_mask[i] for i in range(len(flat)) if flat[i][0] in used}
-    return vox_by_k, selected_by_k, cover_ids, phi_by_node, phi_of_tree_node
+    return vox_by_k, selected_by_k, cover_ids, phi_by_node, phi_of_tree_nodes
 
 
 

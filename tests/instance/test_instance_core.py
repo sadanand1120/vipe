@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vipe.instance.association import frame_coreset_poses
+from vipe.instance.association import _tree_evidence, frame_coreset_poses
 from vipe.instance.atoms import atom_adjacency, atom_voxels
 from vipe.instance.lift import lift_masks, visible_points
 from vipe.instance.masks import StreamingMasks, _UnionFind
@@ -236,6 +236,40 @@ def test_atom_grouping_and_adjacency_are_stably_ordered() -> None:
     np.testing.assert_array_equal(left, [0, 1])
     np.testing.assert_array_equal(right, [1, 2])
     np.testing.assert_array_equal(counts, [2, 1])
+
+
+def test_tree_evidence_matches_direct_descendant_gather() -> None:
+    tree = {
+        "na": 4,
+        "n_nodes": 7,
+        "children": {4: (0, 1), 5: (2, 3), 6: (4, 5)},
+        "parent_of": {0: 4, 1: 4, 2: 5, 3: 5, 4: 6, 5: 6},
+        "order_nodes": [0, 1, 4, 2, 3, 5, 6],
+    }
+    tables = {
+        "rI": (
+            np.array([0, 2, 2, 4, 5]),
+            np.array([0, 2, 1, 2, 0]),
+            np.array([2, 1, 3, 4, 5], np.float32),
+        ),
+        "rN": (
+            np.array([0, 1, 2, 4, 5]),
+            np.array([0, 0, 0, 1, 1]),
+            np.array([2, 3, 4, 5, 6], np.float32),
+        ),
+    }
+    actual = dict(_tree_evidence(tree, tables, [4, 5, 6]))
+    expected = {
+        4: (np.array([0, 2]), np.array([2.0, 1.0]),
+            np.array([0]), np.array([5.0])),
+        5: (np.array([0, 1, 2]), np.array([5.0, 3.0, 4.0]),
+            np.array([0, 1]), np.array([4.0, 11.0])),
+        6: (np.array([0, 1, 2]), np.array([7.0, 3.0, 5.0]),
+            np.array([0, 1]), np.array([9.0, 11.0])),
+    }
+    for node, evidence in expected.items():
+        for observed, wanted in zip(actual[node], evidence):
+            np.testing.assert_array_equal(observed, wanted)
 
 
 def test_hypothesis_packing_and_ply_instance_field(tmp_path: Path) -> None:
